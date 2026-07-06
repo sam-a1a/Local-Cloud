@@ -1,6 +1,7 @@
 pub mod crypto;
 pub mod db;
 pub mod discovery;
+pub mod server;
 
 pub use db::Database;
 pub use crypto::DeviceIdentity;

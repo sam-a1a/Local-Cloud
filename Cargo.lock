@@ -414,6 +414,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hyper",
+ "hyper-util",
  "mdns-sd",
  "rand",
  "rcgen",
