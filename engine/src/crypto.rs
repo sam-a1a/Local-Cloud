@@ -26,7 +26,6 @@ impl DeviceIdentity {
         let cert_key = rcgen::generate_simple_self_signed(vec![device_id.clone()])?;
         let cert_pem = cert_key.cert.pem();
         
-        // rcgen 0.14+ uses `signing_key` instead of `key_pair`
         let key_pem = cert_key.signing_key.serialize_pem();
 
         Ok(Self {
