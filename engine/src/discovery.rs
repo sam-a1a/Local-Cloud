@@ -2,6 +2,7 @@ use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
 use std::net::UdpSocket;
+use tokio::runtime::Handle;
 
 const SERVICE_TYPE: &str = "_local-cloud._tcp.local.";
 
@@ -11,7 +12,7 @@ fn get_local_ip() -> String {
     socket.local_addr().unwrap().ip().to_string()
 }
 
-pub fn start_discovery(device_id: String, port: u16) -> Result<ServiceDaemon> {
+pub fn start_discovery(device_id: String, port: u16, handle: Handle) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
     let short_id = &device_id[..8];
@@ -43,7 +44,31 @@ pub fn start_discovery(device_id: String, port: u16) -> Result<ServiceDaemon> {
                 if peer_name.starts_with(&my_short_id) {
                     continue;
                 }
-                println!("[Discovery] Found peer: {}", peer_name);
+
+                let peer_id = info
+                    .get_property("device_id")
+                    .map(|p| p.val_str().to_string());
+                let peer_port = info.get_port();
+
+                if let Some(peer_ip) = info.get_addresses().iter().next() {
+                    if let Some(peer_id) = peer_id {
+                        println!("[Discovery] Found peer: {} at {}:{}", peer_id, peer_ip, peer_port);
+
+                        let url = format!("https://{}:{}/ping", peer_ip, peer_port);
+                        handle.spawn(async move {
+                            let client = reqwest::Client::builder()
+                                .danger_accept_invalid_certs(true)
+                                .build()
+                                .unwrap();
+
+                            if let Ok(res) = client.get(&url).send().await {
+                                if let Ok(text) = res.text().await {
+                                    println!("[Network] Peer {} responded: {}", peer_id, text);
+                                }
+                            }
+                        });
+                    }
+                }
             }
         }
     });

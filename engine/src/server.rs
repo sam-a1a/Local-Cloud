@@ -1,8 +1,8 @@
 use anyhow::Result;
 use axum::{routing::get, Router};
-use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
+use std::io::Cursor;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -10,12 +10,14 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use tower::ServiceExt;
 
-pub async fn start_server(identity: crate::crypto::DeviceIdentity) -> Result<()> {
-    let certs: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_slice_iter(identity.cert_pem.as_bytes())
-            .collect::<Result<Vec<_>, _>>()?;
+pub async fn start_server(listener: TcpListener, identity: crate::crypto::DeviceIdentity) -> Result<()> {
+    let mut cert_cursor = Cursor::new(identity.cert_pem.as_bytes());
+    let mut key_cursor = Cursor::new(identity.key_pem.as_bytes());
 
-    let key = PrivateKeyDer::from_pem_slice(identity.key_pem.as_bytes())?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_cursor)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let key = PrivateKeyDer::from(rustls_pemfile::private_key(&mut key_cursor)?.unwrap());
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -26,8 +28,6 @@ pub async fn start_server(identity: crate::crypto::DeviceIdentity) -> Result<()>
 
     let app = Router::new()
         .route("/ping", get(move || async move { format!("pong: {}", device_id) }));
-
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
 
     loop {
         let (stream, _addr) = listener.accept().await?;
