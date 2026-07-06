@@ -14,17 +14,17 @@ fn get_local_ip() -> String {
 pub fn start_discovery(device_id: String, port: u16) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
-    let host_name = format!("{}.local.", &device_id[..8]);
+    let short_id = &device_id[..8];
+    let host_name = format!("{}.local.", short_id);
     let mut properties = HashMap::new();
     properties.insert("device_id".to_string(), device_id.clone());
 
     let local_ip = get_local_ip();
-
     let my_properties = Some(properties);
 
     let service_info = ServiceInfo::new(
         SERVICE_TYPE,
-        &device_id,
+        short_id,
         &host_name,
         &local_ip,
         port,
@@ -34,10 +34,16 @@ pub fn start_discovery(device_id: String, port: u16) -> Result<ServiceDaemon> {
     daemon.register(service_info)?;
 
     let receiver = daemon.browse(SERVICE_TYPE)?;
+    let my_short_id = short_id.to_string();
+
     std::thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
             if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
-                println!("[Discovery] Found peer: {}", info.get_fullname());
+                let peer_name = info.get_fullname();
+                if peer_name.starts_with(&my_short_id) {
+                    continue;
+                }
+                println!("[Discovery] Found peer: {}", peer_name);
             }
         }
     });
