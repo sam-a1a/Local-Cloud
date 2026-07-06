@@ -45,16 +45,14 @@ pub fn start_discovery(device_id: String, port: u16, handle: Handle) -> Result<S
                     continue;
                 }
 
-                let peer_id = info
-                    .get_property("device_id")
-                    .map(|p| p.val_str().to_string());
+                let peer_id = info.get_property("device_id").map(|p| p.val_str().to_string());
                 let peer_port = info.get_port();
 
                 if let Some(peer_ip) = info.get_addresses().iter().next() {
                     if let Some(peer_id) = peer_id {
                         println!("[Discovery] Found peer: {} at {}:{}", peer_id, peer_ip, peer_port);
 
-                        let url = format!("https://{}:{}/ping", peer_ip, peer_port);
+                        let url = format!("https://{}:{}/metadata", peer_ip, peer_port);
                         handle.spawn(async move {
                             let client = reqwest::Client::builder()
                                 .danger_accept_invalid_certs(true)
@@ -63,7 +61,7 @@ pub fn start_discovery(device_id: String, port: u16, handle: Handle) -> Result<S
 
                             if let Ok(res) = client.get(&url).send().await {
                                 if let Ok(text) = res.text().await {
-                                    println!("[Network] Peer {} responded: {}", peer_id, text);
+                                    println!("[Sync] Peer {} metadata: {}", peer_id, text);
                                 }
                             }
                         });

@@ -1,16 +1,22 @@
 use anyhow::Result;
-use axum::{routing::get, Router};
+use axum::{routing::get, Router, Json, extract::State};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use tower::ServiceExt;
+use crate::db::Database;
 
-pub async fn start_server(listener: TcpListener, identity: crate::crypto::DeviceIdentity) -> Result<()> {
+#[derive(Clone)]
+struct AppState {
+    db: Arc<Mutex<Database>>,
+}
+
+pub async fn start_server(listener: TcpListener, identity: crate::crypto::DeviceIdentity, db: Database) -> Result<()> {
     let mut cert_cursor = Cursor::new(identity.cert_pem.as_bytes());
     let mut key_cursor = Cursor::new(identity.key_pem.as_bytes());
 
@@ -26,8 +32,12 @@ pub async fn start_server(listener: TcpListener, identity: crate::crypto::Device
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let device_id = identity.device_id.clone();
 
+    let state = AppState { db: Arc::new(Mutex::new(db)) };
+
     let app = Router::new()
-        .route("/ping", get(move || async move { format!("pong: {}", device_id) }));
+        .route("/ping", get(move || async move { format!("pong: {}", device_id) }))
+        .route("/metadata", get(get_metadata))
+        .with_state(state);
 
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -49,4 +59,10 @@ pub async fn start_server(listener: TcpListener, identity: crate::crypto::Device
                 .await;
         });
     }
+}
+
+async fn get_metadata(State(state): State<AppState>) -> Json<Vec<crate::FileMetadata>> {
+    let db = state.db.lock().unwrap();
+    let files = db.get_all_files().unwrap_or_default();
+    Json(files)
 }
