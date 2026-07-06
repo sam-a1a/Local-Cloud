@@ -246,6 +246,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "engine",
+ "tokio",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,6 +402,29 @@ dependencies = [
  "sha2",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hyper",
+ "mdns-sd",
+ "rand",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tower",
 ]
 
 [[package]]
@@ -754,29 +786,6 @@ dependencies = [
  "cc",
  "pkg-config",
  "vcpkg",
-]
-
-[[package]]
-name = "local-cloud-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chacha20poly1305",
- "ed25519-dalek",
- "hyper",
- "mdns-sd",
- "rand",
- "rcgen",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tower",
 ]
 
 [[package]]
