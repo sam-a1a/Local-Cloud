@@ -16,7 +16,7 @@ struct AppState {
     db: Arc<Mutex<Database>>,
 }
 
-pub async fn start_server(listener: TcpListener, identity: crate::crypto::DeviceIdentity, db: Database) -> Result<()> {
+pub async fn start_server(listener: TcpListener, identity: crate::crypto::DeviceIdentity, db: Arc<Mutex<Database>>) -> Result<()> {
     let mut cert_cursor = Cursor::new(identity.cert_pem.as_bytes());
     let mut key_cursor = Cursor::new(identity.key_pem.as_bytes());
 
@@ -32,7 +32,7 @@ pub async fn start_server(listener: TcpListener, identity: crate::crypto::Device
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let device_id = identity.device_id.clone();
 
-    let state = AppState { db: Arc::new(Mutex::new(db)) };
+    let state = AppState { db };
 
     let app = Router::new()
         .route("/ping", get(move || async move { format!("pong: {}", device_id) }))

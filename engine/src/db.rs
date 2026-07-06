@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use rusqlite::OptionalExtension;
 
 pub struct Database {
     pub conn: Connection,
@@ -72,5 +73,28 @@ impl Database {
             result.push(file?);
         }
         Ok(result)
+    }
+
+    pub fn upsert_file_from_peer(&self, file: &FileMetadata) -> Result<()> {
+        let existing_version: Option<i64> = self.conn.query_row(
+            "SELECT version FROM files WHERE path = ?1",
+            rusqlite::params![file.path],
+            |row| row.get(0)
+        ).optional()?;
+
+        if let Some(existing_version) = existing_version {
+            if file.version > existing_version {
+                self.conn.execute(
+                    "UPDATE files SET id = ?1, size = ?2, modified_time = ?3, version = ?4, created_by = ?5 WHERE path = ?6",
+                    rusqlite::params![file.id, file.size, file.modified_time, file.version, file.created_by, file.path]
+                )?;
+            }
+        } else {
+            self.conn.execute(
+                "INSERT INTO files (id, path, size, modified_time, version, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![file.id, file.path, file.size, file.modified_time, file.version, file.created_by],
+            )?;
+        }
+        Ok(())
     }
 }

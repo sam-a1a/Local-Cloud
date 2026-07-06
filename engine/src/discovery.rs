@@ -2,7 +2,9 @@ use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
 use std::net::UdpSocket;
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
+use crate::db::Database;
 
 const SERVICE_TYPE: &str = "_local-cloud._tcp.local.";
 
@@ -12,7 +14,7 @@ fn get_local_ip() -> String {
     socket.local_addr().unwrap().ip().to_string()
 }
 
-pub fn start_discovery(device_id: String, port: u16, handle: Handle) -> Result<ServiceDaemon> {
+pub fn start_discovery(device_id: String, port: u16, handle: Handle, db: Arc<Mutex<Database>>) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
     let short_id = &device_id[..8];
@@ -53,6 +55,8 @@ pub fn start_discovery(device_id: String, port: u16, handle: Handle) -> Result<S
                         println!("[Discovery] Found peer: {} at {}:{}", peer_id, peer_ip, peer_port);
 
                         let url = format!("https://{}:{}/metadata", peer_ip, peer_port);
+                        let db_clone = db.clone();
+
                         handle.spawn(async move {
                             let client = reqwest::Client::builder()
                                 .danger_accept_invalid_certs(true)
@@ -61,7 +65,13 @@ pub fn start_discovery(device_id: String, port: u16, handle: Handle) -> Result<S
 
                             if let Ok(res) = client.get(&url).send().await {
                                 if let Ok(text) = res.text().await {
-                                    println!("[Sync] Peer {} metadata: {}", peer_id, text);
+                                    if let Ok(files) = serde_json::from_str::<Vec<crate::FileMetadata>>(&text) {
+                                        let db = db_clone.lock().unwrap();
+                                        for file in files {
+                                            println!("[Sync] Saving peer file metadata: {}", file.path);
+                                            let _ = db.upsert_file_from_peer(&file);
+                                        }
+                                    }
                                 }
                             }
                         });
