@@ -17,6 +17,15 @@ pub struct FileMetadata {
     pub created_by: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlockMetadata {
+    pub id: String,
+    pub file_id: String,
+    pub block_index: i64,
+    pub size: i64,
+    pub is_present: i64,
+}
+
 impl Database {
     pub fn init(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -95,6 +104,14 @@ impl Database {
                 rusqlite::params![file.id, file.path, file.size, file.modified_time, file.version, file.created_by],
             )?;
         }
+        Ok(())
+    }
+
+    pub fn insert_block(&self, block: &BlockMetadata) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO blocks (id, file_id, block_index, size, is_present) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![block.id, block.file_id, block.block_index, block.size, block.is_present],
+        )?;
         Ok(())
     }
 }

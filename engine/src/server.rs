@@ -1,5 +1,5 @@
 use anyhow::Result;
-use axum::{routing::get, Router, Json, extract::State};
+use axum::{routing::get, Router, Json, extract::State, extract::Path, response::IntoResponse, body::Bytes};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::io::Cursor;
@@ -14,9 +14,10 @@ use crate::db::Database;
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Database>>,
+    storage_dir: String,
 }
 
-pub async fn start_server(listener: TcpListener, identity: crate::crypto::DeviceIdentity, db: Arc<Mutex<Database>>) -> Result<()> {
+pub async fn start_server(listener: TcpListener, identity: crate::crypto::DeviceIdentity, db: Arc<Mutex<Database>>, storage_dir: String) -> Result<()> {
     let mut cert_cursor = Cursor::new(identity.cert_pem.as_bytes());
     let mut key_cursor = Cursor::new(identity.key_pem.as_bytes());
 
@@ -32,11 +33,12 @@ pub async fn start_server(listener: TcpListener, identity: crate::crypto::Device
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let device_id = identity.device_id.clone();
 
-    let state = AppState { db };
+    let state = AppState { db, storage_dir };
 
     let app = Router::new()
         .route("/ping", get(move || async move { format!("pong: {}", device_id) }))
         .route("/metadata", get(get_metadata))
+        .route("/block/{block_id}", get(get_block))
         .with_state(state);
 
     loop {
@@ -65,4 +67,14 @@ async fn get_metadata(State(state): State<AppState>) -> Json<Vec<crate::FileMeta
     let db = state.db.lock().unwrap();
     let files = db.get_all_files().unwrap_or_default();
     Json(files)
+}
+
+async fn get_block(
+    State(state): State<AppState>,
+    Path(block_id): Path<String>,
+) -> impl IntoResponse {
+    match crate::storage::read_block(&state.storage_dir, &block_id) {
+        Ok(data) => Bytes::from(data).into_response(),
+        Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
 }
