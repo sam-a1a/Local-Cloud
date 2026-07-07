@@ -20,7 +20,13 @@ pub struct FileMetadata {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BlockMetadata {
     pub id: String,
-    pub file_id: String,
+    pub size: i64,
+    pub is_present: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileBlock {
+    pub block_id: String,
     pub block_index: i64,
     pub size: i64,
     pub is_present: i64,
@@ -42,9 +48,13 @@ impl Database {
                 modified_time INTEGER NOT NULL, version INTEGER NOT NULL, created_by TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS blocks (
-                id TEXT PRIMARY KEY, file_id TEXT NOT NULL, block_index INTEGER NOT NULL,
-                size INTEGER NOT NULL, is_present INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY (file_id) REFERENCES files(id)
+                id TEXT PRIMARY KEY, size INTEGER NOT NULL, is_present INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS file_blocks (
+                file_id TEXT NOT NULL, block_id TEXT NOT NULL, block_index INTEGER NOT NULL,
+                PRIMARY KEY (file_id, block_id),
+                FOREIGN KEY (file_id) REFERENCES files(id),
+                FOREIGN KEY (block_id) REFERENCES blocks(id)
             );
             CREATE TABLE IF NOT EXISTS tombstones (
                 file_id TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL,
@@ -109,8 +119,47 @@ impl Database {
 
     pub fn insert_block(&self, block: &BlockMetadata) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO blocks (id, file_id, block_index, size, is_present) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![block.id, block.file_id, block.block_index, block.size, block.is_present],
+            "INSERT OR IGNORE INTO blocks (id, size, is_present) VALUES (?1, ?2, ?3)",
+            rusqlite::params![block.id, block.size, block.is_present],
+        )?;
+        Ok(())
+    }
+
+    pub fn map_block_to_file(&self, file_id: &str, block_id: &str, block_index: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO file_blocks (file_id, block_id, block_index) VALUES (?1, ?2, ?3)",
+            rusqlite::params![file_id, block_id, block_index],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_blocks_for_file(&self, file_id: &str) -> Result<Vec<FileBlock>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fb.block_id, fb.block_index, b.size, b.is_present
+             FROM file_blocks fb
+             JOIN blocks b ON fb.block_id = b.id
+             WHERE fb.file_id = ?1 ORDER BY fb.block_index ASC"
+        )?;
+        let blocks = stmt.query_map(rusqlite::params![file_id], |row| {
+            Ok(FileBlock {
+                block_id: row.get(0)?,
+                block_index: row.get(1)?,
+                size: row.get(2)?,
+                is_present: row.get(3)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for block in blocks {
+            result.push(block?);
+        }
+        Ok(result)
+    }
+
+    pub fn set_block_present(&self, block_id: &str, is_present: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE blocks SET is_present = ?1 WHERE id = ?2",
+            rusqlite::params![is_present as i64, block_id],
         )?;
         Ok(())
     }

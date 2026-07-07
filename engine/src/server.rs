@@ -39,6 +39,7 @@ pub async fn start_server(listener: TcpListener, identity: crate::crypto::Device
         .route("/ping", get(move || async move { format!("pong: {}", device_id) }))
         .route("/metadata", get(get_metadata))
         .route("/block/{block_id}", get(get_block))
+        .route("/file_blocks/{file_id}", get(get_file_blocks))
         .with_state(state);
 
     loop {
@@ -77,4 +78,13 @@ async fn get_block(
         Ok(data) => Bytes::from(data).into_response(),
         Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn get_file_blocks(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> Json<Vec<crate::db::FileBlock>> {
+    let db = state.db.lock().unwrap();
+    let blocks = db.get_blocks_for_file(&file_id).unwrap_or_default();
+    Json(blocks)
 }
