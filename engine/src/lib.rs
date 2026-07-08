@@ -24,13 +24,13 @@ use mdns_sd::ServiceDaemon;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum EngineError {
-    #[error("{message}")]
-    Generic { message: String },
+    #[error("{description}")]
+    Generic { description: String },
 }
 
 impl EngineError {
     fn from<E: std::fmt::Display>(e: E) -> Self {
-        EngineError::Generic { message: e.to_string() }
+        EngineError::Generic { description: e.to_string() }
     }
 }
 
