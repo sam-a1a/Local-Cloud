@@ -260,4 +260,22 @@ impl Database {
         self.delete_file(file_id)?;
         Ok(())
     }
+
+    pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
+        let result = self.conn.query_row(
+            "SELECT id, path, size, modified_time, version, created_by FROM files WHERE path = ?1",
+            rusqlite::params![path],
+            |row| {
+                Ok(FileMetadata {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    size: row.get(2)?,
+                    modified_time: row.get(3)?,
+                    version: row.get(4)?,
+                    created_by: row.get(5)?,
+                })
+            },
+        ).optional()?;
+        Ok(result)
+    }
 }

@@ -42,3 +42,6 @@ hyper-util = { version = "0.1.12", features = ["server-auto", "tokio"] }
 # HTTP client
 reqwest = { version = "0.12.28", features = ["rustls-tls"], default-features = false }
 rustls-pemfile = "2.2"
+
+notify = { version = "6.1.1", features = ["macos_fsevent"] }
+uuid = { version = "1.23.4", features = ["v4"] }
