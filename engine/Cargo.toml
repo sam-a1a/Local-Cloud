@@ -28,6 +28,7 @@ thiserror = "2.0"
 
 # Encryption & Security
 rustls = { version = "0.23", features = ["ring"] }
+x509-parser = "0.16"
 tokio-rustls = "0.26"
 rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = "0.14"

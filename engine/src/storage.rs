@@ -77,3 +77,35 @@ pub fn assemble_file_from_blocks(base_dir: &str, output_path: &str, blocks: &[Fi
     file.flush()?;
     Ok(())
 }
+
+pub fn get_trusted_peers_dir(base_dir: &str) -> PathBuf {
+    Path::new(base_dir).join("trusted_peers")
+}
+
+pub fn ensure_trusted_peers_dir(base_dir: &str) -> Result<()> {
+    fs::create_dir_all(get_trusted_peers_dir(base_dir))?;
+    Ok(())
+}
+
+pub fn save_peer_cert(base_dir: &str, peer_id: &str, cert_pem: &str) -> Result<()> {
+    let path = get_trusted_peers_dir(base_dir).join(format!("{}.pem", peer_id));
+    let mut file = File::create(path)?;
+    file.write_all(cert_pem.as_bytes())?;
+    Ok(())
+}
+
+pub fn load_all_trusted_certs(base_dir: &str) -> Result<Vec<String>> {
+    let dir = get_trusted_peers_dir(base_dir);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut certs = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|s| s.to_str()) == Some("pem") {
+            let pem = fs::read_to_string(entry.path())?;
+            certs.push(pem);
+        }
+    }
+    Ok(certs)
+}

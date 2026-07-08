@@ -19,11 +19,16 @@ async fn main() -> Result<()> {
 
     let storage_dir = format!("./storage_{}", short_id);
     storage::ensure_storage_dir(&storage_dir)?;
+    storage::ensure_trusted_peers_dir(&storage_dir)?;
 
     let local_file_name = format!("test_{}.txt", short_id);
     let mut file = File::create(&local_file_name)?;
     for i in 0..1000 {
-        writeln!(file, "This is line {} in the local cloud test file, from device {}.", i, short_id)?;
+        writeln!(
+            file,
+            "This is line {} in the local cloud test file, from device {}.",
+            i, short_id
+        )?;
     }
     file.flush()?;
 
@@ -63,7 +68,10 @@ async fn main() -> Result<()> {
         handle.clone(),
         db_state.clone(),
         storage_dir.clone(),
+        identity.cert_pem.clone(),
+        identity.key_pem.clone(),
     )?;
+
     handle.spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
         println!("[Demo] Deleting our own file to test tombstone sync...");

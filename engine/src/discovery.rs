@@ -1,6 +1,10 @@
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use rustls::client::danger::ServerCertVerifier;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -14,12 +18,118 @@ fn get_local_ip() -> String {
     socket.local_addr().unwrap().ip().to_string()
 }
 
+#[derive(Debug)]
+struct TrustedPeerServerVerifier {
+    trusted_cert_ders: Vec<Vec<u8>>,
+}
+
+impl TrustedPeerServerVerifier {
+    fn new(trusted_cert_pems: &[String]) -> Self {
+        let mut trusted_cert_ders = Vec::new();
+        for pem in trusted_cert_pems {
+            let mut cursor = Cursor::new(pem.as_bytes());
+            if let Ok(certs) = rustls_pemfile::certs(&mut cursor)
+                .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            {
+                for cert in certs {
+                    trusted_cert_ders.push(cert.to_vec());
+                }
+            }
+        }
+        Self { trusted_cert_ders }
+    }
+}
+
+impl ServerCertVerifier for TrustedPeerServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self.trusted_cert_ders.is_empty() {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        let presented = end_entity.as_ref();
+        for trusted in &self.trusted_cert_ders {
+            if trusted.as_slice() == presented {
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+        }
+        Err(rustls::Error::General(
+            "Server cert not in trusted peers list".into(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+        ]
+    }
+}
+
+fn build_mtls_client(
+    cert_pem: &str,
+    key_pem: &str,
+    trusted_cert_pems: &[String],
+) -> Result<reqwest::Client> {
+    let mut cert_cursor = Cursor::new(cert_pem.as_bytes());
+    let mut key_cursor = Cursor::new(key_pem.as_bytes());
+
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_cursor)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let key = rustls::pki_types::PrivateKeyDer::from(
+        rustls_pemfile::private_key(&mut key_cursor)?.unwrap(),
+    );
+
+    let verifier = Arc::new(TrustedPeerServerVerifier::new(trusted_cert_pems));
+
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(certs, key)?;
+
+    let client = reqwest::Client::builder()
+        .use_preconfigured_tls(tls_config)
+        .build()?;
+
+    Ok(client)
+}
+
 pub fn start_discovery(
     device_id: String,
     port: u16,
     handle: Handle,
     db: Arc<Mutex<Database>>,
     storage_dir: String,
+    cert_pem: String,
+    key_pem: String,
 ) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
@@ -53,19 +163,28 @@ pub fn start_discovery(
                     continue;
                 }
 
-                let peer_id = info.get_property("device_id").map(|p| p.val_str().to_string());
+                let peer_id = info
+                    .get_property("device_id")
+                    .map(|p| p.val_str().to_string());
                 let peer_port = info.get_port();
 
                 if let Some(peer_ip) = info.get_addresses().iter().next() {
-                    if let Some(peer_id) = peer_id {
-                        println!("[Discovery] Found peer: {} at {}:{}", peer_id, peer_ip, peer_port);
-
+                    if let Some(_peer_id) = peer_id {
                         let url = format!("https://{}:{}", peer_ip, peer_port);
                         let db_clone = db.clone();
                         let storage_dir_clone = storage_dir.clone();
+                        let cert_pem_clone = cert_pem.clone();
+                        let key_pem_clone = key_pem.clone();
 
                         handle.spawn(async move {
-                            sync_with_peer(url, db_clone, storage_dir_clone).await;
+                            sync_with_peer(
+                                url,
+                                db_clone,
+                                storage_dir_clone,
+                                cert_pem_clone,
+                                key_pem_clone,
+                            )
+                                .await;
                         });
                     }
                 }
@@ -76,16 +195,67 @@ pub fn start_discovery(
     Ok(daemon)
 }
 
-async fn sync_with_peer(url: String, db_clone: Arc<Mutex<Database>>, storage_dir_clone: String) {
+async fn sync_with_peer(
+    url: String,
+    db_clone: Arc<Mutex<Database>>,
+    storage_dir_clone: String,
+    cert_pem: String,
+    key_pem: String,
+) {
     println!("[Sync] === Starting sync cycle with {} ===", url);
 
-    let client = reqwest::Client::builder()
+    let untrusted_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap();
 
-    sync_tombstones(&client, &url, &db_clone, &storage_dir_clone).await;
-    sync_files(&client, &url, &db_clone, &storage_dir_clone).await;
+    let peer_cert_pem = match untrusted_client
+        .get(format!("{}/hello", url))
+        .send()
+        .await
+    {
+        Ok(res) => match res.text().await {
+            Ok(pem) => pem,
+            Err(e) => {
+                println!("[FATAL] Failed to read hello response: {}", e);
+                return;
+            }
+        },
+        Err(e) => {
+            println!("[FATAL] Hello handshake failed: {}", e);
+            return;
+        }
+    };
+
+    println!("[mTLS] Got peer certificate, saving as trusted...");
+
+    if let Err(e) =
+        crate::storage::save_peer_cert(&storage_dir_clone, "peer", &peer_cert_pem)
+    {
+        println!("[FATAL] Failed to save peer cert: {}", e);
+        return;
+    }
+
+    let trusted_certs = match crate::storage::load_all_trusted_certs(&storage_dir_clone) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[FATAL] Failed to load trusted certs: {}", e);
+            return;
+        }
+    };
+
+    let mtls_client = match build_mtls_client(&cert_pem, &key_pem, &trusted_certs) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[FATAL] Failed to build mTLS client: {}", e);
+            return;
+        }
+    };
+
+    println!("[mTLS] mTLS client built, all subsequent requests are mutually authenticated");
+
+    sync_tombstones(&mtls_client, &url, &db_clone, &storage_dir_clone).await;
+    sync_files(&mtls_client, &url, &db_clone, &storage_dir_clone).await;
 
     println!("[Sync] === Finished sync cycle with {} ===", url);
 }
@@ -94,7 +264,7 @@ async fn sync_tombstones(
     client: &reqwest::Client,
     url: &str,
     db_clone: &Arc<Mutex<Database>>,
-    storage_dir_clone: &str,
+    _storage_dir_clone: &str,
 ) {
     let res = match client.get(format!("{}/tombstones", url)).send().await {
         Ok(r) => r,
@@ -149,7 +319,7 @@ async fn sync_tombstones(
                 }
             } else {
                 println!(
-                    "[Tombstone] Ignoring tombstone for {} (local version {} > tombstone version {})",
+                    "[Tombstone] Ignoring tombstone for {} (local v{} > tombstone v{})",
                     local_file.path, local_file.version, tombstone.version
                 );
             }
@@ -167,12 +337,10 @@ async fn sync_files(
     db_clone: &Arc<Mutex<Database>>,
     storage_dir_clone: &str,
 ) {
-    let meta_res = client.get(format!("{}/metadata", url)).send().await;
-
-    let res = match meta_res {
+    let res = match client.get(format!("{}/metadata", url)).send().await {
         Ok(r) => r,
         Err(e) => {
-            println!("[FATAL] Metadata request failed to send: {}", e);
+            println!("[FATAL] Metadata request failed: {}", e);
             return;
         }
     };
@@ -180,7 +348,7 @@ async fn sync_files(
     let text = match res.text().await {
         Ok(t) => t,
         Err(e) => {
-            println!("[FATAL] Failed to read metadata response body: {}", e);
+            println!("[FATAL] Failed to read metadata body: {}", e);
             return;
         }
     };
@@ -188,19 +356,19 @@ async fn sync_files(
     let files: Vec<crate::FileMetadata> = match serde_json::from_str(&text) {
         Ok(f) => f,
         Err(e) => {
-            println!("[FATAL] Failed to parse metadata JSON: {} | raw text: {}", e, text);
+            println!("[FATAL] Failed to parse metadata JSON: {} | raw: {}", e, text);
             return;
         }
     };
 
-    println!("[Sync] Got {} files from peer metadata", files.len());
+    println!("[Sync] Got {} files from peer", files.len());
 
     let files_to_sync = {
         let db = db_clone.lock().unwrap();
         let mut to_sync = Vec::new();
         for file in files {
             if db.has_tombstone(&file.id).unwrap_or(false) {
-                println!("[Sync] Skipping {} — already tombstoned locally", file.path);
+                println!("[Sync] Skipping {} — tombstoned locally", file.path);
                 continue;
             }
 
@@ -209,18 +377,12 @@ async fn sync_files(
                 println!("[FATAL] upsert_file_from_peer failed: {}", e);
             }
 
-            let local_blocks = match db.get_blocks_for_file(&file.id) {
-                Ok(b) => b,
-                Err(e) => {
-                    println!("[FATAL] get_blocks_for_file failed: {}", e);
-                    Vec::new()
-                }
-            };
-            let fully_present = !local_blocks.is_empty()
-                && local_blocks.iter().all(|b| b.is_present == 1);
+            let local_blocks = db.get_blocks_for_file(&file.id).unwrap_or_default();
+            let fully_present =
+                !local_blocks.is_empty() && local_blocks.iter().all(|b| b.is_present == 1);
 
             println!(
-                "[Sync] File {} -> local_blocks count: {}, fully_present: {}",
+                "[Sync] File {} -> blocks: {}, fully_present: {}",
                 file.path,
                 local_blocks.len(),
                 fully_present
@@ -236,31 +398,26 @@ async fn sync_files(
     println!("[Sync] {} files need syncing", files_to_sync.len());
 
     for file in files_to_sync {
-        println!("[Sync] --- Syncing blocks for {} (id: {}) ---", file.path, file.id);
+        println!("[Sync] --- Syncing blocks for {} ---", file.path);
 
         let blocks_url = format!("{}/file_blocks/{}", url, file.id);
-        println!("[Sync] Requesting: {}", blocks_url);
-
         let blocks_res = match client.get(&blocks_url).send().await {
             Ok(r) => r,
             Err(e) => {
-                println!("[FATAL] file_blocks request failed to send: {}", e);
+                println!("[FATAL] file_blocks request failed: {}", e);
                 continue;
             }
         };
 
-        let status = blocks_res.status();
-        println!("[Sync] file_blocks response status: {}", status);
-
-        if !status.is_success() {
-            println!("[FATAL] file_blocks returned non-success status: {}", status);
+        if !blocks_res.status().is_success() {
+            println!("[FATAL] file_blocks non-success: {}", blocks_res.status());
             continue;
         }
 
         let blocks_text = match blocks_res.text().await {
             Ok(t) => t,
             Err(e) => {
-                println!("[FATAL] Failed to read file_blocks response body: {}", e);
+                println!("[FATAL] Failed to read file_blocks body: {}", e);
                 continue;
             }
         };
@@ -286,17 +443,20 @@ async fn sync_files(
                 if let Err(e) = db.insert_block(&block_meta) {
                     println!("[FATAL] insert_block failed: {}", e);
                 }
-                if let Err(e) = db.map_block_to_file(&file.id, &p_block.block_id, p_block.block_index) {
+                if let Err(e) =
+                    db.map_block_to_file(&file.id, &p_block.block_id, p_block.block_index)
+                {
                     println!("[FATAL] map_block_to_file failed: {}", e);
                 }
             }
         }
 
         for p_block in &peer_blocks {
-            let block_path = crate::storage::get_block_path(storage_dir_clone, &p_block.block_id);
+            let block_path =
+                crate::storage::get_block_path(storage_dir_clone, &p_block.block_id);
             if !block_path.exists() {
                 let block_url = format!("{}/block/{}", url, p_block.block_id);
-                println!("[Sync] Downloading block from: {}", block_url);
+                println!("[Sync] Downloading block: {}", &p_block.block_id[..8]);
 
                 match client.get(&block_url).send().await {
                     Ok(block_res) => match block_res.bytes().await {
@@ -316,7 +476,7 @@ async fn sync_files(
                         }
                         Err(e) => println!("[FATAL] Failed to read block bytes: {}", e),
                     },
-                    Err(e) => println!("[FATAL] Block download request failed: {}", e),
+                    Err(e) => println!("[FATAL] Block download failed: {}", e),
                 }
             } else {
                 let db = db_clone.lock().unwrap();
