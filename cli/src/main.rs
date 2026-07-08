@@ -1,4 +1,4 @@
-use engine::{Database, DeviceIdentity, start_discovery, start_watcher, server, storage};
+use engine::{Database, DeviceIdentity, start_discovery, start_watcher, server, storage, new_ignore_set};
 use anyhow::Result;
 use tokio::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -21,11 +21,18 @@ async fn main() -> Result<()> {
     storage::ensure_storage_dir(&storage_dir)?;
     storage::ensure_trusted_peers_dir(&storage_dir)?;
 
-    let sync_dir = format!("./sync_{}", short_id);
-    fs::create_dir_all(&sync_dir)?;
-    println!("Sync folder: {}", sync_dir);
+    // Create the sync folder, then canonicalize it to an absolute path.
+    // This MUST match the absolute path format that the `notify` crate
+    // reports for file system events, or path comparisons will silently fail.
+    let sync_dir_relative = format!("./sync_{}", short_id);
+    fs::create_dir_all(&sync_dir_relative)?;
+    let sync_dir = fs::canonicalize(&sync_dir_relative)?
+        .to_string_lossy()
+        .to_string();
+    println!("Sync folder (canonical): {}", sync_dir);
 
     let db_state = Arc::new(Mutex::new(database));
+    let ignore_set = new_ignore_set();
 
     println!("Device ID: {}", identity.device_id);
 
@@ -37,10 +44,9 @@ async fn main() -> Result<()> {
         identity.device_id.clone(),
         db_state.clone(),
         handle.clone(),
+        ignore_set.clone(),
     )?;
 
-    // Drop a test file into the sync folder after 2 seconds
-    // so the watcher is fully initialized before the file appears
     let sync_dir_clone = sync_dir.clone();
     let short_id_owned = short_id.to_string();
     handle.spawn(async move {
@@ -48,11 +54,7 @@ async fn main() -> Result<()> {
         let file_path = format!("{}/hello_from_{}.txt", sync_dir_clone, short_id_owned);
         if let Ok(mut f) = fs::File::create(&file_path) {
             for i in 0..500 {
-                let _ = writeln!(
-                    f,
-                    "Line {} from device {}",
-                    i, short_id_owned
-                );
+                let _ = writeln!(f, "Line {} from device {}", i, short_id_owned);
             }
             println!("[Demo] Dropped test file into sync folder: {}", file_path);
         }
@@ -68,8 +70,10 @@ async fn main() -> Result<()> {
         handle.clone(),
         db_state.clone(),
         storage_dir.clone(),
+        sync_dir.clone(),
         identity.cert_pem.clone(),
         identity.key_pem.clone(),
+        ignore_set.clone(),
     )?;
 
     println!("Starting HTTPS server...");

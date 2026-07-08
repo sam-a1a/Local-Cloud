@@ -128,8 +128,10 @@ pub fn start_discovery(
     handle: Handle,
     db: Arc<Mutex<Database>>,
     storage_dir: String,
+    sync_dir: String,
     cert_pem: String,
     key_pem: String,
+    ignore_set: crate::ignore::IgnoreSet,
 ) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
@@ -173,16 +175,20 @@ pub fn start_discovery(
                         let url = format!("https://{}:{}", peer_ip, peer_port);
                         let db_clone = db.clone();
                         let storage_dir_clone = storage_dir.clone();
+                        let sync_dir_for_task = sync_dir.clone();
                         let cert_pem_clone = cert_pem.clone();
                         let key_pem_clone = key_pem.clone();
+                        let ignore_set_for_task = ignore_set.clone();
 
                         handle.spawn(async move {
                             sync_with_peer(
                                 url,
                                 db_clone,
                                 storage_dir_clone,
+                                sync_dir_for_task,
                                 cert_pem_clone,
                                 key_pem_clone,
+                                ignore_set_for_task,
                             )
                                 .await;
                         });
@@ -199,8 +205,10 @@ async fn sync_with_peer(
     url: String,
     db_clone: Arc<Mutex<Database>>,
     storage_dir_clone: String,
+    sync_dir_clone: String,
     cert_pem: String,
     key_pem: String,
+    ignore_set: crate::ignore::IgnoreSet,
 ) {
     println!("[Sync] === Starting sync cycle with {} ===", url);
 
@@ -254,8 +262,16 @@ async fn sync_with_peer(
 
     println!("[mTLS] mTLS client built, all subsequent requests are mutually authenticated");
 
-    sync_tombstones(&mtls_client, &url, &db_clone, &storage_dir_clone).await;
-    sync_files(&mtls_client, &url, &db_clone, &storage_dir_clone).await;
+    sync_tombstones(&mtls_client, &url, &db_clone, &sync_dir_clone).await;
+    sync_files(
+        &mtls_client,
+        &url,
+        &db_clone,
+        &storage_dir_clone,
+        &sync_dir_clone,
+        &ignore_set,
+    )
+        .await;
 
     println!("[Sync] === Finished sync cycle with {} ===", url);
 }
@@ -264,7 +280,7 @@ async fn sync_tombstones(
     client: &reqwest::Client,
     url: &str,
     db_clone: &Arc<Mutex<Database>>,
-    _storage_dir_clone: &str,
+    sync_dir_clone: &str,
 ) {
     let res = match client.get(format!("{}/tombstones", url)).send().await {
         Ok(r) => r,
@@ -302,7 +318,8 @@ async fn sync_tombstones(
             if tombstone.version >= local_file.version {
                 println!("[Tombstone] Deleting local file: {}", local_file.path);
 
-                if let Err(e) = std::fs::remove_file(&local_file.path) {
+                let full_path = format!("{}/{}", sync_dir_clone, local_file.path);
+                if let Err(e) = std::fs::remove_file(&full_path) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         println!("[FATAL] Failed to delete file from disk: {}", e);
                     }
@@ -336,6 +353,8 @@ async fn sync_files(
     url: &str,
     db_clone: &Arc<Mutex<Database>>,
     storage_dir_clone: &str,
+    sync_dir_clone: &str,
+    ignore_set: &crate::ignore::IgnoreSet,
 ) {
     let res = match client.get(format!("{}/metadata", url)).send().await {
         Ok(r) => r,
@@ -499,14 +518,29 @@ async fn sync_files(
         );
 
         if !final_blocks.is_empty() && final_blocks.iter().all(|b| b.is_present == 1) {
+            let output_path = format!("{}/{}", sync_dir_clone, file.path);
+
+            if let Some(parent) = std::path::Path::new(&output_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            crate::ignore::mark_ignored(ignore_set, &output_path);
+
             match crate::storage::assemble_file_from_blocks(
                 storage_dir_clone,
-                &file.path,
+                &output_path,
                 &final_blocks,
             ) {
-                Ok(_) => println!("[Sync] Assembled file: {}", file.path),
+                Ok(_) => println!("[Sync] Assembled file into sync folder: {}", output_path),
                 Err(e) => println!("[FATAL] assemble_file_from_blocks failed: {}", e),
             }
+
+            let ignore_clone = ignore_set.clone();
+            let path_clone = output_path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                crate::ignore::unmark_ignored(&ignore_clone, &path_clone);
+            });
         }
     }
 }

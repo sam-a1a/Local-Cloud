@@ -45,7 +45,8 @@ impl Database {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "
-            PRAGMA journal_mode=WAL;
+        PRAGMA journal_mode=WAL;
+        PRAGMA foreign_keys=ON;
 
             CREATE TABLE IF NOT EXISTS devices (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, cert_pem TEXT NOT NULL,
