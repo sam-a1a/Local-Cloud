@@ -22,6 +22,18 @@ use tokio::sync::{broadcast, Mutex as TokioMutex};
 use notify::RecommendedWatcher;
 use mdns_sd::ServiceDaemon;
 
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum EngineError {
+    #[error("{message}")]
+    Generic { message: String },
+}
+
+impl EngineError {
+    fn from<E: std::fmt::Display>(e: E) -> Self {
+        EngineError::Generic { message: e.to_string() }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, uniffi::Enum)]
 pub enum EngineEvent {
     EngineStarted,
@@ -51,29 +63,29 @@ pub struct Engine {
 #[uniffi::export]
 impl Engine {
     #[uniffi::constructor]
-    pub fn new(base_dir: String) -> Result<Self, String> {
-        std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
+    pub fn new(base_dir: String) -> Result<Self, EngineError> {
+        std::fs::create_dir_all(&base_dir).map_err(EngineError::from)?;
 
         // Spin up a dedicated Tokio runtime for the engine
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|e| e.to_string())?;
+            .map_err(EngineError::from)?;
 
-        let identity = DeviceIdentity::load_or_generate(&base_dir).map_err(|e| e.to_string())?;
+        let identity = DeviceIdentity::load_or_generate(&base_dir).map_err(EngineError::from)?;
         let short_id = &identity.device_id[..8];
 
         let db_path = format!("{}/local-cloud-{}.db", base_dir, short_id);
         let storage_dir = format!("{}/storage_{}", base_dir, short_id);
         let sync_dir_path = format!("{}/sync_{}", base_dir, short_id);
 
-        let database = Database::init(&db_path).map_err(|e| e.to_string())?;
-        storage::ensure_storage_dir(&storage_dir).map_err(|e| e.to_string())?;
-        storage::ensure_trusted_peers_dir(&storage_dir).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(&sync_dir_path).map_err(|e| e.to_string())?;
+        let database = Database::init(&db_path).map_err(EngineError::from)?;
+        storage::ensure_storage_dir(&storage_dir).map_err(EngineError::from)?;
+        storage::ensure_trusted_peers_dir(&storage_dir).map_err(EngineError::from)?;
+        std::fs::create_dir_all(&sync_dir_path).map_err(EngineError::from)?;
 
         let sync_dir = std::fs::canonicalize(&sync_dir_path)
-            .map_err(|e| e.to_string())?
+            .map_err(EngineError::from)?
             .to_string_lossy()
             .to_string();
 
@@ -109,12 +121,12 @@ impl Engine {
         rx.recv().await.unwrap_or(EngineEvent::ErrorEvent { message: "Event channel closed".to_string() })
     }
 
-    pub async fn start(&self) -> Result<(), String> {
+    pub async fn start(&self) -> Result<(), EngineError> {
         let handle = self.runtime.handle().clone();
 
         // 1. Start Server
-        let listener = TcpListener::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let listener = TcpListener::bind("0.0.0.0:0").await.map_err(EngineError::from)?;
+        let port = listener.local_addr().map_err(EngineError::from)?.port();
 
         let server_db = self.db.clone();
         let server_storage = self.storage_dir.clone();
@@ -158,7 +170,7 @@ impl Engine {
             disc_key,
             disc_ignore,
             disc_tx,
-        ).map_err(|e| e.to_string())?;
+        ).map_err(EngineError::from)?;
 
         *self.mdns_daemon.lock().unwrap() = Some(daemon);
 
@@ -178,7 +190,7 @@ impl Engine {
             handle,
             watch_ignore,
             watch_tx,
-        ).map_err(|e| e.to_string())?;
+        ).map_err(EngineError::from)?;
 
         *self.watcher.lock().unwrap() = Some(watcher);
 

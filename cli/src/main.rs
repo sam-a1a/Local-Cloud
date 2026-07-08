@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
 
     println!("Starting local-cloud-cli...");
 
-    let engine = Arc::new(Engine::new(".".to_string()).map_err(|e| anyhow::anyhow!(e))?);
+    let engine = Arc::new(Engine::new(".".to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))?);
 
     let short_id = engine.device_short_id();
     let sync_dir = engine.get_sync_dir();
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    engine.start().await.map_err(|e| anyhow::anyhow!(e))?;
+    engine.start().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     // Drop a test file into the sync folder after 2 seconds
     let sync_dir_clone = sync_dir.clone();
