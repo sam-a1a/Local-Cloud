@@ -7,7 +7,7 @@ pub struct Database {
     pub conn: Connection,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, uniffi::Record)]
 pub struct FileMetadata {
     pub id: String,
     pub path: String,

@@ -2,10 +2,9 @@ use anyhow::Result;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::broadcast;
 use crate::db::{Database, FileMetadata};
 use crate::ignore::IgnoreSet;
 use crate::storage;
@@ -20,7 +19,7 @@ pub fn start_watcher(
     db: Arc<Mutex<Database>>,
     handle: Handle,
     ignore_set: IgnoreSet,
-    event_tx: broadcast::Sender<EngineEvent>,
+    event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<RecommendedWatcher> {
     let watch_path = watch_dir.clone();
     let debounce_map: DebounceMap = Arc::new(Mutex::new(HashMap::new()));
@@ -68,14 +67,12 @@ async fn handle_fs_event(
     watch_dir: String,
     ignore_set: IgnoreSet,
     debounce_map: DebounceMap,
-    event_tx: broadcast::Sender<EngineEvent>,
+    event_tx: mpsc::Sender<EngineEvent>,
 ) {
     match event.kind {
         EventKind::Create(_) | EventKind::Modify(_) => {
             for path in event.paths {
-                if !path.is_file() {
-                    continue;
-                }
+                if !path.is_file() { continue; }
 
                 let path_str = match path.to_str() {
                     Some(s) => s.to_string(),
@@ -91,7 +88,6 @@ async fn handle_fs_event(
                     continue;
                 }
 
-                // Debounce: skip if we processed this exact path within the last 500ms
                 {
                     let mut map = debounce_map.lock().unwrap();
                     let now = Instant::now();
@@ -103,36 +99,19 @@ async fn handle_fs_event(
                     map.insert(path_str.clone(), now);
                 }
 
-                let relative_path = path_str
-                    .strip_prefix(&watch_dir)
-                    .unwrap_or(&path_str)
-                    .trim_start_matches('/')
-                    .to_string();
-
-                if relative_path.is_empty() {
-                    continue;
-                }
+                let relative_path = path_str.strip_prefix(&watch_dir).unwrap_or(&path_str).trim_start_matches('/').to_string();
+                if relative_path.is_empty() { continue; }
 
                 println!("[Watcher] Detected create/modify: {}", relative_path);
-
-                // Small delay to let the OS finish flushing the write before we hash it
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
                 let file_size = match std::fs::metadata(&path_str) {
                     Ok(m) => m.len() as i64,
-                    Err(e) => {
-                        println!("[Watcher] Failed to stat file: {}", e);
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
 
                 let modified_time = match std::fs::metadata(&path_str) {
-                    Ok(m) => m
-                        .modified()
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64,
+                    Ok(m) => m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH).duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
                     Err(_) => 0,
                 };
 
@@ -147,19 +126,13 @@ async fn handle_fs_event(
                             }
                         }
                         _ => {
-                            let new_id = format!(
-                                "{}-{}",
-                                device_id,
-                                uuid::Uuid::new_v4().to_string().replace("-", "")
-                            );
+                            let new_id = format!("{}-{}", device_id, uuid::Uuid::new_v4().to_string().replace("-", ""));
                             (new_id, 1, true)
                         }
                     }
                 };
 
-                if !should_process {
-                    continue;
-                }
+                if !should_process { continue; }
 
                 let file_meta = FileMetadata {
                     id: file_id.clone(),
@@ -176,12 +149,7 @@ async fn handle_fs_event(
                         println!("[Watcher] Failed to insert file metadata: {}", e);
                         continue;
                     }
-                    if let Err(e) = storage::chunk_and_store_file(
-                        &storage_dir,
-                        &db,
-                        &file_id,
-                        &path_str,
-                    ) {
+                    if let Err(e) = storage::chunk_and_store_file(&storage_dir, &db, &file_id, &path_str) {
                         println!("[Watcher] Failed to chunk file: {}", e);
                         continue;
                     }
@@ -199,40 +167,20 @@ async fn handle_fs_event(
                     None => continue,
                 };
 
-                if crate::ignore::is_ignored(&ignore_set, &path_str) {
-                    continue;
-                }
+                if crate::ignore::is_ignored(&ignore_set, &path_str) { continue; }
 
-                let relative_path = path_str
-                    .strip_prefix(&watch_dir)
-                    .unwrap_or(&path_str)
-                    .trim_start_matches('/')
-                    .to_string();
+                let relative_path = path_str.strip_prefix(&watch_dir).unwrap_or(&path_str).trim_start_matches('/').to_string();
+                if relative_path.is_empty() { continue; }
 
-                if relative_path.is_empty() {
-                    continue;
-                }
-
-                println!("[Watcher] Detected delete: {}", relative_path);
+                println!("[Watcher] Detected local delete: {}", relative_path);
 
                 let db = db.lock().unwrap();
                 match db.get_file_by_path(&relative_path) {
                     Ok(Some(file)) => {
-                        match db.delete_file_with_tombstone(
-                            &file.id,
-                            &device_id,
-                            file.version + 1,
-                        ) {
-                            Ok(_) => {
-                                println!(
-                                    "[Watcher] Tombstone written for deleted file: {}",
-                                    relative_path
-                                );
-                                let _ = event_tx.send(EngineEvent::FileDeleted { path: relative_path });
-                            }
-                            Err(e) => {
-                                println!("[Watcher] Failed to write tombstone: {}", e)
-                            }
+                        // Local delete only. Do not propagate tombstones.
+                        match db.delete_file(&file.id) {
+                            Ok(_) => println!("[Watcher] Deleted file locally from DB: {}", relative_path),
+                            Err(e) => println!("[Watcher] Failed to delete file: {}", e),
                         }
                     }
                     Ok(None) => {}

@@ -16,9 +16,9 @@ pub use crypto::DeviceIdentity;
 pub use ignore::{new_ignore_set, IgnoreSet};
 
 use serde::Serialize;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Mutex as TokioMutex};
 use notify::RecommendedWatcher;
 use mdns_sd::ServiceDaemon;
 
@@ -40,8 +40,8 @@ pub enum EngineEvent {
     EngineStopped,
     PeerDiscovered { peer_id: String, addr: String },
     FileIndexed { path: String },
+    FileSent { path: String },
     FileDownloaded { path: String },
-    FileDeleted { path: String },
     ErrorEvent { message: String },
 }
 
@@ -52,21 +52,21 @@ pub struct Engine {
     storage_dir: String,
     sync_dir: String,
     ignore_set: IgnoreSet,
-    event_tx: broadcast::Sender<EngineEvent>,
-    event_rx: TokioMutex<broadcast::Receiver<EngineEvent>>,
+    event_tx: mpsc::Sender<EngineEvent>,
+    event_rx: StdMutex<mpsc::Receiver<EngineEvent>>,
     runtime: tokio::runtime::Runtime,
     watcher: StdMutex<Option<RecommendedWatcher>>,
     mdns_daemon: StdMutex<Option<ServiceDaemon>>,
     server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    known_peers: Arc<StdMutex<HashMap<String, String>>>,
 }
 
 #[uniffi::export]
 impl Engine {
     #[uniffi::constructor]
-    pub fn new(base_dir: String) -> Result<Self, EngineError> {
+    pub fn new(base_dir: String, sync_dir_path: String) -> Result<Self, EngineError> {
         std::fs::create_dir_all(&base_dir).map_err(EngineError::from)?;
 
-        // Spin up a dedicated Tokio runtime for the engine
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -77,13 +77,12 @@ impl Engine {
 
         let db_path = format!("{}/local-cloud-{}.db", base_dir, short_id);
         let storage_dir = format!("{}/storage_{}", base_dir, short_id);
-        let sync_dir_path = format!("{}/sync_{}", base_dir, short_id);
 
         let database = Database::init(&db_path).map_err(EngineError::from)?;
         storage::ensure_storage_dir(&storage_dir).map_err(EngineError::from)?;
         storage::ensure_trusted_peers_dir(&storage_dir).map_err(EngineError::from)?;
-        std::fs::create_dir_all(&sync_dir_path).map_err(EngineError::from)?;
 
+        std::fs::create_dir_all(&sync_dir_path).map_err(EngineError::from)?;
         let sync_dir = std::fs::canonicalize(&sync_dir_path)
             .map_err(EngineError::from)?
             .to_string_lossy()
@@ -91,7 +90,8 @@ impl Engine {
 
         let db_state = Arc::new(StdMutex::new(database));
         let ignore_set = new_ignore_set();
-        let (event_tx, event_rx) = broadcast::channel(100);
+        let (event_tx, event_rx) = mpsc::channel();
+        let known_peers = Arc::new(StdMutex::new(HashMap::new()));
 
         Ok(Self {
             db: db_state,
@@ -100,11 +100,12 @@ impl Engine {
             sync_dir,
             ignore_set,
             event_tx,
-            event_rx: TokioMutex::new(event_rx),
+            event_rx: StdMutex::new(event_rx),
             runtime,
             watcher: StdMutex::new(None),
             mdns_daemon: StdMutex::new(None),
             server_task: StdMutex::new(None),
+            known_peers,
         })
     }
 
@@ -116,24 +117,67 @@ impl Engine {
         self.sync_dir.clone()
     }
 
-    pub async fn next_event(&self) -> EngineEvent {
-        let mut rx = self.event_rx.lock().await;
-        rx.recv().await.unwrap_or(EngineEvent::ErrorEvent { message: "Event channel closed".to_string() })
+    pub fn poll_event(&self, timeout_ms: u64) -> Option<EngineEvent> {
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let rx = self.event_rx.lock().unwrap();
+        rx.recv_timeout(timeout).ok()
     }
 
-    pub async fn start(&self) -> Result<(), EngineError> {
+    pub fn get_known_peers(&self) -> Vec<String> {
+        let peers = self.known_peers.lock().unwrap();
+        peers.keys().cloned().collect()
+    }
+
+    pub fn get_local_files(&self) -> Vec<FileMetadata> {
+        let db = self.db.lock().unwrap();
+        db.get_all_files().unwrap_or_default()
+    }
+
+    pub fn send_file_to_peer(&self, peer_id: String, file_id: String) -> Result<(), EngineError> {
+        let peer_url = {
+            let peers = self.known_peers.lock().unwrap();
+            peers.get(&peer_id).cloned()
+        };
+
+        if let Some(url) = peer_url {
+            let db = self.db.clone();
+            let storage = self.storage_dir.clone();
+            let sync = self.sync_dir.clone();
+            let cert = self.identity.cert_pem.clone();
+            let key = self.identity.key_pem.clone();
+            let ignore = self.ignore_set.clone();
+            let tx = self.event_tx.clone();
+            let pid = peer_id.clone();
+            let fid = file_id.clone();
+
+            self.runtime.spawn(async move {
+                discovery::push_file_to_peer(url, pid, fid, db, storage, sync, cert, key, ignore, tx).await;
+            });
+            Ok(())
+        } else {
+            Err(EngineError::from("Peer not found"))
+        }
+    }
+
+    pub fn start(&self) -> Result<(), EngineError> {
         let handle = self.runtime.handle().clone();
 
         // 1. Start Server
-        let listener = TcpListener::bind("0.0.0.0:0").await.map_err(EngineError::from)?;
-        let port = listener.local_addr().map_err(EngineError::from)?.port();
+        let (listener, port) = self.runtime.block_on(async {
+            let listener = TcpListener::bind("0.0.0.0:0").await.map_err(EngineError::from)?;
+            let port = listener.local_addr().map_err(EngineError::from)?.port();
+            Ok::<(TcpListener, u16), EngineError>((listener, port))
+        })?;
 
         let server_db = self.db.clone();
         let server_storage = self.storage_dir.clone();
+        let server_sync = self.sync_dir.clone();
         let server_cert = self.identity.cert_pem.clone();
         let server_key = self.identity.key_pem.clone();
         let server_device_id = self.identity.device_id.clone();
         let server_tx = self.event_tx.clone();
+        let server_tx_err = self.event_tx.clone();
+        let server_ignore = self.ignore_set.clone();
 
         let server_task = handle.spawn(async move {
             if let Err(e) = server::start_server(
@@ -143,33 +187,27 @@ impl Engine {
                 server_key,
                 server_db,
                 server_storage,
+                server_sync,
+                server_ignore,
+                server_tx,
             ).await {
-                let _ = server_tx.send(EngineEvent::ErrorEvent { message: format!("Server error: {}", e) });
+                let _ = server_tx_err.send(EngineEvent::ErrorEvent {
+                    message: format!("Server error: {}", e),
+                });
             }
         });
         *self.server_task.lock().unwrap() = Some(server_task);
 
         // 2. Start Discovery
-        let disc_db = self.db.clone();
-        let disc_storage = self.storage_dir.clone();
-        let disc_sync = self.sync_dir.clone();
-        let disc_cert = self.identity.cert_pem.clone();
-        let disc_key = self.identity.key_pem.clone();
         let disc_tx = self.event_tx.clone();
         let disc_device_id = self.identity.device_id.clone();
-        let disc_ignore = self.ignore_set.clone();
+        let disc_peers = self.known_peers.clone();
 
         let daemon = discovery::start_discovery(
             disc_device_id,
             port,
-            handle.clone(),
-            disc_db,
-            disc_storage,
-            disc_sync,
-            disc_cert,
-            disc_key,
-            disc_ignore,
             disc_tx,
+            disc_peers,
         ).map_err(EngineError::from)?;
 
         *self.mdns_daemon.lock().unwrap() = Some(daemon);

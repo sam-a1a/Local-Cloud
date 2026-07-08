@@ -1,26 +1,31 @@
+use crate::db::Database;
+use crate::ignore::IgnoreSet;
+use crate::tls::TrustedCerts;
+use crate::EngineEvent;
 use anyhow::Result;
 use axum::{
-    body::Bytes, extract::Path, extract::State, response::IntoResponse, routing::get, Json, Router,
+    body::Bytes, extract::Path, extract::State, response::IntoResponse, routing::{get, post}, Json, Router,
 };
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
 use rustls::{DistinguishedName, ServerConfig};
 use rustls_pemfile;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
 use tower::ServiceExt;
-use crate::db::Database;
-use crate::tls::TrustedCerts;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Database>>,
     pub storage_dir: String,
+    pub sync_dir: String,
     pub cert_pem: String,
+    pub ignore_set: IgnoreSet,
+    pub event_tx: mpsc::Sender<EngineEvent>,
 }
 
 #[derive(Debug)]
@@ -64,6 +69,9 @@ pub async fn start_server(
     key_pem: String,
     db: Arc<Mutex<Database>>,
     storage_dir: String,
+    sync_dir: String,
+    ignore_set: IgnoreSet,
+    event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<()> {
     let mut cert_cursor = Cursor::new(cert_pem.as_bytes());
     let mut key_cursor = Cursor::new(key_pem.as_bytes());
@@ -92,7 +100,10 @@ pub async fn start_server(
     let state = AppState {
         db,
         storage_dir,
+        sync_dir,
         cert_pem: cert_pem_state,
+        ignore_set,
+        event_tx,
     };
 
     let app = Router::new()
@@ -104,10 +115,9 @@ pub async fn start_server(
             }
         }))
         .route("/hello", get(get_hello))
-        .route("/metadata", get(get_metadata))
-        .route("/tombstones", get(get_tombstones))
-        .route("/block/{block_id}", get(get_block))
-        .route("/file_blocks/{file_id}", get(get_file_blocks))
+        .route("/push_metadata", post(push_metadata))
+        .route("/push_block/{block_id}", post(push_block))
+        .route("/finalize_file/{file_id}", post(finalize_file))
         .with_state(state);
 
     loop {
@@ -136,33 +146,88 @@ async fn get_hello(State(state): State<AppState>) -> String {
     state.cert_pem.clone()
 }
 
-async fn get_metadata(State(state): State<AppState>) -> Json<Vec<crate::FileMetadata>> {
-    let db = state.db.lock().unwrap();
-    let files = db.get_all_files().unwrap_or_default();
-    Json(files)
+#[derive(serde::Deserialize)]
+struct PushMetadataRequest {
+    file: crate::FileMetadata,
+    blocks: Vec<crate::db::FileBlock>,
 }
 
-async fn get_tombstones(State(state): State<AppState>) -> Json<Vec<crate::db::Tombstone>> {
+async fn push_metadata(
+    State(state): State<AppState>,
+    Json(req): Json<PushMetadataRequest>,
+) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
-    let tombstones = db.get_all_tombstones().unwrap_or_default();
-    Json(tombstones)
+    if let Err(e) = db.upsert_file_from_peer(&req.file) {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save metadata: {}", e));
+    }
+    for b in &req.blocks {
+        let block_meta = crate::db::BlockMetadata {
+            id: b.block_id.clone(),
+            size: b.size,
+            is_present: 0,
+        };
+        let _ = db.insert_block(&block_meta);
+        let _ = db.map_block_to_file(&req.file.id, &b.block_id, b.block_index);
+    }
+    (axum::http::StatusCode::OK, String::new())
 }
 
-async fn get_block(
+async fn push_block(
     State(state): State<AppState>,
     Path(block_id): Path<String>,
+    body: Bytes,
 ) -> impl IntoResponse {
-    match crate::storage::read_block(&state.storage_dir, &block_id) {
-        Ok(data) => Bytes::from(data).into_response(),
-        Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+    if let Err(e) = crate::storage::write_block(&state.storage_dir, &block_id, &body) {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write block: {}", e));
     }
+    let db = state.db.lock().unwrap();
+    if let Err(e) = db.set_block_present(&block_id, true) {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update DB: {}", e));
+    }
+    (axum::http::StatusCode::OK, String::new())
 }
 
-async fn get_file_blocks(
+async fn finalize_file(
     State(state): State<AppState>,
     Path(file_id): Path<String>,
-) -> Json<Vec<crate::db::FileBlock>> {
+) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
-    let blocks = db.get_blocks_for_file(&file_id).unwrap_or_default();
-    Json(blocks)
+
+    let file = match db.get_file_by_id(&file_id) {
+        Ok(Some(f)) => f,
+        _ => return (axum::http::StatusCode::NOT_FOUND, "File not in DB".to_string()),
+    };
+
+    let blocks = match db.get_blocks_for_file(&file_id) {
+        Ok(b) => b,
+        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)),
+    };
+
+    if blocks.iter().all(|b| b.is_present == 1) {
+        let output_path = format!("{}/{}", state.sync_dir, file.path);
+
+        if let Some(parent) = std::path::Path::new(&output_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        crate::ignore::mark_ignored(&state.ignore_set, &output_path);
+
+        match crate::storage::assemble_file_from_blocks(&state.storage_dir, &output_path, &blocks) {
+            Ok(_) => {
+                let _ = state.event_tx.send(EngineEvent::FileDownloaded { path: file.path.clone() });
+
+                let ignore_clone = state.ignore_set.clone();
+                let path_clone = output_path.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    crate::ignore::unmark_ignored(&ignore_clone, &path_clone);
+                });
+
+                (axum::http::StatusCode::OK, "Assembled".to_string())
+            }
+            Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Assemble failed: {}", e)),
+        }
+    } else {
+        (axum::http::StatusCode::BAD_REQUEST, "Blocks missing".to_string())
+    }
 }

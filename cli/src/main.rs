@@ -10,24 +10,30 @@ async fn main() -> Result<()> {
 
     println!("Starting local-cloud-cli...");
 
-    let engine = Arc::new(Engine::new(".".to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))?);
+    let engine = Arc::new(Engine::new(".".to_string(), "./sync_folder".to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))?);
 
     let short_id = engine.device_short_id();
     let sync_dir = engine.get_sync_dir();
 
-    // Listen for events using UniFFI's async next_event method
+    // Listen for events by polling in a background blocking thread
     let engine_events = engine.clone();
     tokio::spawn(async move {
         loop {
-            let event = engine_events.next_event().await;
-            println!("[Event] {:?}", event);
-            if let EngineEvent::EngineStopped = event {
-                break;
+            let eng = engine_events.clone();
+            let event = tokio::task::spawn_blocking(move || {
+                eng.poll_event(500)
+            }).await.unwrap();
+
+            if let Some(event) = event {
+                println!("[Event] {:?}", event);
+                if let EngineEvent::EngineStopped = event {
+                    break;
+                }
             }
         }
     });
 
-    engine.start().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    engine.start().map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     // Drop a test file into the sync folder after 2 seconds
     let sync_dir_clone = sync_dir.clone();
@@ -40,6 +46,20 @@ async fn main() -> Result<()> {
                 let _ = writeln!(f, "Line {} from device {}", i, short_id_clone);
             }
             println!("[Demo] Dropped test file into sync folder: {}", file_path);
+        }
+    });
+
+    // Demo: Auto-send the first file to the first peer after 5 seconds
+    let engine_send = engine.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        let peers = engine_send.get_known_peers();
+        let files = engine_send.get_local_files();
+        if !peers.is_empty() && !files.is_empty() {
+            let peer_id = peers.first().unwrap().clone();
+            let file_id = files.first().unwrap().id.clone();
+            println!("[Demo] Auto-sending file {} to peer {}", file_id, peer_id);
+            let _ = engine_send.send_file_to_peer(peer_id, file_id);
         }
     });
 
