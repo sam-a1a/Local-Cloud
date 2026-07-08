@@ -14,7 +14,13 @@ fn get_local_ip() -> String {
     socket.local_addr().unwrap().ip().to_string()
 }
 
-pub fn start_discovery(device_id: String, port: u16, handle: Handle, db: Arc<Mutex<Database>>, storage_dir: String) -> Result<ServiceDaemon> {
+pub fn start_discovery(
+    device_id: String,
+    port: u16,
+    handle: Handle,
+    db: Arc<Mutex<Database>>,
+    storage_dir: String,
+) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
     let short_id = &device_id[..8];
@@ -78,6 +84,89 @@ async fn sync_with_peer(url: String, db_clone: Arc<Mutex<Database>>, storage_dir
         .build()
         .unwrap();
 
+    sync_tombstones(&client, &url, &db_clone, &storage_dir_clone).await;
+    sync_files(&client, &url, &db_clone, &storage_dir_clone).await;
+
+    println!("[Sync] === Finished sync cycle with {} ===", url);
+}
+
+async fn sync_tombstones(
+    client: &reqwest::Client,
+    url: &str,
+    db_clone: &Arc<Mutex<Database>>,
+    storage_dir_clone: &str,
+) {
+    let res = match client.get(format!("{}/tombstones", url)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[FATAL] Tombstone request failed: {}", e);
+            return;
+        }
+    };
+
+    let text = match res.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            println!("[FATAL] Failed to read tombstone response: {}", e);
+            return;
+        }
+    };
+
+    let tombstones: Vec<crate::db::Tombstone> = match serde_json::from_str(&text) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("[FATAL] Failed to parse tombstone JSON: {}", e);
+            return;
+        }
+    };
+
+    println!("[Tombstone] Got {} tombstones from peer", tombstones.len());
+
+    let db = db_clone.lock().unwrap();
+    for tombstone in tombstones {
+        if db.has_tombstone(&tombstone.file_id).unwrap_or(false) {
+            continue;
+        }
+
+        if let Ok(Some(local_file)) = db.get_file_by_id(&tombstone.file_id) {
+            if tombstone.version >= local_file.version {
+                println!("[Tombstone] Deleting local file: {}", local_file.path);
+
+                if let Err(e) = std::fs::remove_file(&local_file.path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        println!("[FATAL] Failed to delete file from disk: {}", e);
+                    }
+                }
+
+                if let Err(e) = db.delete_file_with_tombstone(
+                    &tombstone.file_id,
+                    &tombstone.deleted_by,
+                    tombstone.version,
+                ) {
+                    println!("[FATAL] Failed to apply tombstone to DB: {}", e);
+                } else {
+                    println!("[Tombstone] Applied tombstone for: {}", local_file.path);
+                }
+            } else {
+                println!(
+                    "[Tombstone] Ignoring tombstone for {} (local version {} > tombstone version {})",
+                    local_file.path, local_file.version, tombstone.version
+                );
+            }
+        } else {
+            if let Err(e) = db.insert_tombstone(&tombstone) {
+                println!("[FATAL] Failed to store tombstone: {}", e);
+            }
+        }
+    }
+}
+
+async fn sync_files(
+    client: &reqwest::Client,
+    url: &str,
+    db_clone: &Arc<Mutex<Database>>,
+    storage_dir_clone: &str,
+) {
     let meta_res = client.get(format!("{}/metadata", url)).send().await;
 
     let res = match meta_res {
@@ -110,6 +199,11 @@ async fn sync_with_peer(url: String, db_clone: Arc<Mutex<Database>>, storage_dir
         let db = db_clone.lock().unwrap();
         let mut to_sync = Vec::new();
         for file in files {
+            if db.has_tombstone(&file.id).unwrap_or(false) {
+                println!("[Sync] Skipping {} — already tombstoned locally", file.path);
+                continue;
+            }
+
             println!("[Sync] Saving peer file metadata: {}", file.path);
             if let Err(e) = db.upsert_file_from_peer(&file) {
                 println!("[FATAL] upsert_file_from_peer failed: {}", e);
@@ -122,8 +216,15 @@ async fn sync_with_peer(url: String, db_clone: Arc<Mutex<Database>>, storage_dir
                     Vec::new()
                 }
             };
-            let fully_present = !local_blocks.is_empty() && local_blocks.iter().all(|b| b.is_present == 1);
-            println!("[Sync] File {} -> local_blocks count: {}, fully_present: {}", file.path, local_blocks.len(), fully_present);
+            let fully_present = !local_blocks.is_empty()
+                && local_blocks.iter().all(|b| b.is_present == 1);
+
+            println!(
+                "[Sync] File {} -> local_blocks count: {}, fully_present: {}",
+                file.path,
+                local_blocks.len(),
+                fully_present
+            );
 
             if !fully_present {
                 to_sync.push(file);
@@ -164,8 +265,6 @@ async fn sync_with_peer(url: String, db_clone: Arc<Mutex<Database>>, storage_dir
             }
         };
 
-        println!("[Sync] file_blocks raw response: {}", blocks_text);
-
         let peer_blocks: Vec<crate::db::FileBlock> = match serde_json::from_str(&blocks_text) {
             Ok(b) => b,
             Err(e) => {
@@ -194,27 +293,29 @@ async fn sync_with_peer(url: String, db_clone: Arc<Mutex<Database>>, storage_dir
         }
 
         for p_block in &peer_blocks {
-            let block_path = crate::storage::get_block_path(&storage_dir_clone, &p_block.block_id);
+            let block_path = crate::storage::get_block_path(storage_dir_clone, &p_block.block_id);
             if !block_path.exists() {
                 let block_url = format!("{}/block/{}", url, p_block.block_id);
                 println!("[Sync] Downloading block from: {}", block_url);
 
                 match client.get(&block_url).send().await {
-                    Ok(block_res) => {
-                        match block_res.bytes().await {
-                            Ok(block_bytes) => {
-                                if let Err(e) = crate::storage::write_block(&storage_dir_clone, &p_block.block_id, &block_bytes) {
-                                    println!("[FATAL] write_block failed: {}", e);
-                                }
-                                let db = db_clone.lock().unwrap();
-                                if let Err(e) = db.set_block_present(&p_block.block_id, true) {
-                                    println!("[FATAL] set_block_present failed: {}", e);
-                                }
-                                println!("[Sync] Downloaded block {}", &p_block.block_id[..8]);
+                    Ok(block_res) => match block_res.bytes().await {
+                        Ok(block_bytes) => {
+                            if let Err(e) = crate::storage::write_block(
+                                storage_dir_clone,
+                                &p_block.block_id,
+                                &block_bytes,
+                            ) {
+                                println!("[FATAL] write_block failed: {}", e);
                             }
-                            Err(e) => println!("[FATAL] Failed to read block bytes: {}", e),
+                            let db = db_clone.lock().unwrap();
+                            if let Err(e) = db.set_block_present(&p_block.block_id, true) {
+                                println!("[FATAL] set_block_present failed: {}", e);
+                            }
+                            println!("[Sync] Downloaded block {}", &p_block.block_id[..8]);
                         }
-                    }
+                        Err(e) => println!("[FATAL] Failed to read block bytes: {}", e),
+                    },
                     Err(e) => println!("[FATAL] Block download request failed: {}", e),
                 }
             } else {
@@ -230,17 +331,22 @@ async fn sync_with_peer(url: String, db_clone: Arc<Mutex<Database>>, storage_dir
             db.get_blocks_for_file(&file.id).unwrap_or_default()
         };
 
-        println!("[Sync] Final blocks for {}: {} total, all_present: {}",
-                 file.path, final_blocks.len(),
-                 !final_blocks.is_empty() && final_blocks.iter().all(|b| b.is_present == 1));
+        println!(
+            "[Sync] Final blocks for {}: {} total, all_present: {}",
+            file.path,
+            final_blocks.len(),
+            !final_blocks.is_empty() && final_blocks.iter().all(|b| b.is_present == 1)
+        );
 
         if !final_blocks.is_empty() && final_blocks.iter().all(|b| b.is_present == 1) {
-            match crate::storage::assemble_file_from_blocks(&storage_dir_clone, &file.path, &final_blocks) {
+            match crate::storage::assemble_file_from_blocks(
+                storage_dir_clone,
+                &file.path,
+                &final_blocks,
+            ) {
                 Ok(_) => println!("[Sync] Assembled file: {}", file.path),
                 Err(e) => println!("[FATAL] assemble_file_from_blocks failed: {}", e),
             }
         }
     }
-
-    println!("[Sync] === Finished sync cycle with {} ===", url);
 }

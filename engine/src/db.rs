@@ -32,6 +32,14 @@ pub struct FileBlock {
     pub is_present: i64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Tombstone {
+    pub file_id: String,
+    pub deleted_at: i64,
+    pub deleted_by: String,
+    pub version: i64,
+}
+
 impl Database {
     pub fn init(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -75,7 +83,9 @@ impl Database {
     }
 
     pub fn get_all_files(&self) -> Result<Vec<FileMetadata>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, size, modified_time, version, created_by FROM files")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, modified_time, version, created_by FROM files"
+        )?;
         let files = stmt.query_map([], |row| {
             Ok(FileMetadata {
                 id: row.get(0)?,
@@ -91,6 +101,24 @@ impl Database {
         for file in files {
             result.push(file?);
         }
+        Ok(result)
+    }
+
+    pub fn get_file_by_id(&self, file_id: &str) -> Result<Option<FileMetadata>> {
+        let result = self.conn.query_row(
+            "SELECT id, path, size, modified_time, version, created_by FROM files WHERE id = ?1",
+            rusqlite::params![file_id],
+            |row| {
+                Ok(FileMetadata {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    size: row.get(2)?,
+                    modified_time: row.get(3)?,
+                    version: row.get(4)?,
+                    created_by: row.get(5)?,
+                })
+            }
+        ).optional()?;
         Ok(result)
     }
 
@@ -161,6 +189,75 @@ impl Database {
             "UPDATE blocks SET is_present = ?1 WHERE id = ?2",
             rusqlite::params![is_present as i64, block_id],
         )?;
+        Ok(())
+    }
+
+    pub fn delete_file(&self, file_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_blocks WHERE file_id = ?1",
+            rusqlite::params![file_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM files WHERE id = ?1",
+            rusqlite::params![file_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_tombstone(&self, tombstone: &Tombstone) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tombstones (file_id, deleted_at, deleted_by, version) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![tombstone.file_id, tombstone.deleted_at, tombstone.deleted_by, tombstone.version],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_all_tombstones(&self) -> Result<Vec<Tombstone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, deleted_at, deleted_by, version FROM tombstones"
+        )?;
+        let tombstones = stmt.query_map([], |row| {
+            Ok(Tombstone {
+                file_id: row.get(0)?,
+                deleted_at: row.get(1)?,
+                deleted_by: row.get(2)?,
+                version: row.get(3)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for tombstone in tombstones {
+            result.push(tombstone?);
+        }
+        Ok(result)
+    }
+
+    pub fn has_tombstone(&self, file_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tombstones WHERE file_id = ?1",
+            rusqlite::params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn delete_file_with_tombstone(
+        &self,
+        file_id: &str,
+        deleted_by: &str,
+        version: i64,
+    ) -> Result<()> {
+        let tombstone = Tombstone {
+            file_id: file_id.to_string(),
+            deleted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            deleted_by: deleted_by.to_string(),
+            version,
+        };
+        self.insert_tombstone(&tombstone)?;
+        self.delete_file(file_id)?;
         Ok(())
     }
 }

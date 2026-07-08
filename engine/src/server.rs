@@ -17,7 +17,12 @@ struct AppState {
     storage_dir: String,
 }
 
-pub async fn start_server(listener: TcpListener, identity: crate::crypto::DeviceIdentity, db: Arc<Mutex<Database>>, storage_dir: String) -> Result<()> {
+pub async fn start_server(
+    listener: TcpListener,
+    identity: crate::crypto::DeviceIdentity,
+    db: Arc<Mutex<Database>>,
+    storage_dir: String,
+) -> Result<()> {
     let mut cert_cursor = Cursor::new(identity.cert_pem.as_bytes());
     let mut key_cursor = Cursor::new(identity.key_pem.as_bytes());
 
@@ -38,6 +43,7 @@ pub async fn start_server(listener: TcpListener, identity: crate::crypto::Device
     let app = Router::new()
         .route("/ping", get(move || async move { format!("pong: {}", device_id) }))
         .route("/metadata", get(get_metadata))
+        .route("/tombstones", get(get_tombstones))
         .route("/block/{block_id}", get(get_block))
         .route("/file_blocks/{file_id}", get(get_file_blocks))
         .with_state(state);
@@ -68,6 +74,12 @@ async fn get_metadata(State(state): State<AppState>) -> Json<Vec<crate::FileMeta
     let db = state.db.lock().unwrap();
     let files = db.get_all_files().unwrap_or_default();
     Json(files)
+}
+
+async fn get_tombstones(State(state): State<AppState>) -> Json<Vec<crate::db::Tombstone>> {
+    let db = state.db.lock().unwrap();
+    let tombstones = db.get_all_tombstones().unwrap_or_default();
+    Json(tombstones)
 }
 
 async fn get_block(

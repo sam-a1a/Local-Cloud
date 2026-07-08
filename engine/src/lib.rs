@@ -8,5 +8,6 @@ pub use db::Database;
 pub use db::FileMetadata;
 pub use db::BlockMetadata;
 pub use db::FileBlock;
+pub use db::Tombstone;
 pub use crypto::DeviceIdentity;
 pub use discovery::start_discovery;
