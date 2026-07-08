@@ -40,6 +40,17 @@ pub struct Tombstone {
     pub version: i64,
 }
 
+fn file_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileMetadata> {
+    Ok(FileMetadata {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        size: row.get(2)?,
+        modified_time: row.get(3)?,
+        version: row.get(4)?,
+        created_by: row.get(5)?,
+    })
+}
+
 impl Database {
     pub fn init(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -87,16 +98,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, size, modified_time, version, created_by FROM files"
         )?;
-        let files = stmt.query_map([], |row| {
-            Ok(FileMetadata {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                size: row.get(2)?,
-                modified_time: row.get(3)?,
-                version: row.get(4)?,
-                created_by: row.get(5)?,
-            })
-        })?;
+        let files = stmt.query_map([], file_from_row)?;
 
         let mut result = Vec::new();
         for file in files {
@@ -109,16 +111,7 @@ impl Database {
         let result = self.conn.query_row(
             "SELECT id, path, size, modified_time, version, created_by FROM files WHERE id = ?1",
             rusqlite::params![file_id],
-            |row| {
-                Ok(FileMetadata {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    size: row.get(2)?,
-                    modified_time: row.get(3)?,
-                    version: row.get(4)?,
-                    created_by: row.get(5)?,
-                })
-            }
+            file_from_row,
         ).optional()?;
         Ok(result)
     }
@@ -127,14 +120,14 @@ impl Database {
         let existing_version: Option<i64> = self.conn.query_row(
             "SELECT version FROM files WHERE path = ?1",
             rusqlite::params![file.path],
-            |row| row.get(0)
+            |row| row.get(0),
         ).optional()?;
 
         if let Some(existing_version) = existing_version {
             if file.version > existing_version {
                 self.conn.execute(
                     "UPDATE files SET id = ?1, size = ?2, modified_time = ?3, version = ?4, created_by = ?5 WHERE path = ?6",
-                    rusqlite::params![file.id, file.size, file.modified_time, file.version, file.created_by, file.path]
+                    rusqlite::params![file.id, file.size, file.modified_time, file.version, file.created_by, file.path],
                 )?;
             }
         } else {
@@ -251,8 +244,7 @@ impl Database {
         let tombstone = Tombstone {
             file_id: file_id.to_string(),
             deleted_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64,
             deleted_by: deleted_by.to_string(),
             version,
@@ -266,16 +258,7 @@ impl Database {
         let result = self.conn.query_row(
             "SELECT id, path, size, modified_time, version, created_by FROM files WHERE path = ?1",
             rusqlite::params![path],
-            |row| {
-                Ok(FileMetadata {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    size: row.get(2)?,
-                    modified_time: row.get(3)?,
-                    version: row.get(4)?,
-                    created_by: row.get(5)?,
-                })
-            },
+            file_from_row,
         ).optional()?;
         Ok(result)
     }

@@ -4,7 +4,7 @@ use axum::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
-use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
+use rustls::{DistinguishedName, ServerConfig};
 use rustls_pemfile;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use tower::ServiceExt;
 use crate::db::Database;
+use crate::tls::TrustedCerts;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,23 +25,14 @@ pub struct AppState {
 
 #[derive(Debug)]
 struct TrustedPeerVerifier {
-    trusted_cert_ders: Vec<Vec<u8>>,
+    certs: TrustedCerts,
 }
 
 impl TrustedPeerVerifier {
     fn new(trusted_cert_pems: &[String]) -> Self {
-        let mut trusted_cert_ders = Vec::new();
-        for pem in trusted_cert_pems {
-            let mut cursor = Cursor::new(pem.as_bytes());
-            if let Ok(certs) = rustls_pemfile::certs(&mut cursor)
-                .collect::<Result<Vec<CertificateDer<'static>>, _>>()
-            {
-                for cert in certs {
-                    trusted_cert_ders.push(cert.to_vec());
-                }
-            }
+        Self {
+            certs: TrustedCerts::new(trusted_cert_pems),
         }
-        Self { trusted_cert_ders }
     }
 }
 
@@ -55,56 +47,26 @@ impl ClientCertVerifier for TrustedPeerVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        if self.trusted_cert_ders.is_empty() {
-            return Ok(rustls::server::danger::ClientCertVerified::assertion());
+        if self.certs.is_trusted(end_entity) {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("Certificate not in trusted peers list".into()))
         }
-        let presented = end_entity.as_ref();
-        for trusted in &self.trusted_cert_ders {
-            if trusted.as_slice() == presented {
-                return Ok(rustls::server::danger::ClientCertVerified::assertion());
-            }
-        }
-        Err(rustls::Error::General("Certificate not in trusted peers list".into()))
     }
 
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-        ]
-    }
+    crate::impl_tls_verifier_methods!();
 }
 
 pub async fn start_server(
     listener: TcpListener,
-    identity: crate::crypto::DeviceIdentity,
+    device_id: String,
+    cert_pem: String,
+    key_pem: String,
     db: Arc<Mutex<Database>>,
     storage_dir: String,
 ) -> Result<()> {
-    let mut cert_cursor = Cursor::new(identity.cert_pem.as_bytes());
-    let mut key_cursor = Cursor::new(identity.key_pem.as_bytes());
+    let mut cert_cursor = Cursor::new(cert_pem.as_bytes());
+    let mut key_cursor = Cursor::new(key_pem.as_bytes());
 
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_cursor)
         .collect::<Result<Vec<_>, _>>()?;
@@ -125,19 +87,21 @@ pub async fn start_server(
     };
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
-    let device_id = identity.device_id.clone();
-    let cert_pem = identity.cert_pem.clone();
+    let cert_pem_state = cert_pem.clone();
 
     let state = AppState {
         db,
         storage_dir,
-        cert_pem,
+        cert_pem: cert_pem_state,
     };
 
     let app = Router::new()
         .route("/ping", get({
             let id = device_id.clone();
-            move || { let id = id.clone(); async move { format!("pong: {}", id) } }
+            move || {
+                let id = id.clone();
+                async move { format!("pong: {}", id) }
+            }
         }))
         .route("/hello", get(get_hello))
         .route("/metadata", get(get_metadata))

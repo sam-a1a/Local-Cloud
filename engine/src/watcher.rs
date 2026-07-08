@@ -5,9 +5,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
+use tokio::sync::broadcast;
 use crate::db::{Database, FileMetadata};
 use crate::ignore::IgnoreSet;
 use crate::storage;
+use crate::EngineEvent;
 
 type DebounceMap = Arc<Mutex<HashMap<String, Instant>>>;
 
@@ -18,6 +20,7 @@ pub fn start_watcher(
     db: Arc<Mutex<Database>>,
     handle: Handle,
     ignore_set: IgnoreSet,
+    event_tx: broadcast::Sender<EngineEvent>,
 ) -> Result<RecommendedWatcher> {
     let watch_path = watch_dir.clone();
     let debounce_map: DebounceMap = Arc::new(Mutex::new(HashMap::new()));
@@ -31,6 +34,7 @@ pub fn start_watcher(
                 let watch_dir_clone = watch_dir.clone();
                 let ignore_clone = ignore_set.clone();
                 let debounce_clone = debounce_map.clone();
+                let event_tx_clone = event_tx.clone();
 
                 handle.spawn(async move {
                     handle_fs_event(
@@ -41,6 +45,7 @@ pub fn start_watcher(
                         watch_dir_clone,
                         ignore_clone,
                         debounce_clone,
+                        event_tx_clone,
                     )
                         .await;
                 });
@@ -63,6 +68,7 @@ async fn handle_fs_event(
     watch_dir: String,
     ignore_set: IgnoreSet,
     debounce_map: DebounceMap,
+    event_tx: broadcast::Sender<EngineEvent>,
 ) {
     match event.kind {
         EventKind::Create(_) | EventKind::Modify(_) => {
@@ -76,7 +82,7 @@ async fn handle_fs_event(
                     None => continue,
                 };
 
-                if path_str.contains(".db") || path_str.contains(".pem") {
+                if path_str.contains(".db") || path_str.contains(".pem") || path_str.contains("identity.json") {
                     continue;
                 }
 
@@ -182,6 +188,7 @@ async fn handle_fs_event(
                 }
 
                 println!("[Watcher] Indexed and chunked: {}", relative_path);
+                let _ = event_tx.send(EngineEvent::FileIndexed { path: relative_path });
             }
         }
 
@@ -216,10 +223,13 @@ async fn handle_fs_event(
                             &device_id,
                             file.version + 1,
                         ) {
-                            Ok(_) => println!(
-                                "[Watcher] Tombstone written for deleted file: {}",
-                                relative_path
-                            ),
+                            Ok(_) => {
+                                println!(
+                                    "[Watcher] Tombstone written for deleted file: {}",
+                                    relative_path
+                                );
+                                let _ = event_tx.send(EngineEvent::FileDeleted { path: relative_path });
+                            }
                             Err(e) => {
                                 println!("[Watcher] Failed to write tombstone: {}", e)
                             }

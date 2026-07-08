@@ -2,13 +2,15 @@ use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
+use tokio::sync::broadcast;
 use crate::db::Database;
+use crate::tls::TrustedCerts;
+use crate::EngineEvent;
 
 const SERVICE_TYPE: &str = "_local-cloud._tcp.local.";
 
@@ -20,23 +22,14 @@ fn get_local_ip() -> String {
 
 #[derive(Debug)]
 struct TrustedPeerServerVerifier {
-    trusted_cert_ders: Vec<Vec<u8>>,
+    certs: TrustedCerts,
 }
 
 impl TrustedPeerServerVerifier {
     fn new(trusted_cert_pems: &[String]) -> Self {
-        let mut trusted_cert_ders = Vec::new();
-        for pem in trusted_cert_pems {
-            let mut cursor = Cursor::new(pem.as_bytes());
-            if let Ok(certs) = rustls_pemfile::certs(&mut cursor)
-                .collect::<Result<Vec<CertificateDer<'static>>, _>>()
-            {
-                for cert in certs {
-                    trusted_cert_ders.push(cert.to_vec());
-                }
-            }
+        Self {
+            certs: TrustedCerts::new(trusted_cert_pems),
         }
-        Self { trusted_cert_ders }
     }
 }
 
@@ -49,48 +42,16 @@ impl ServerCertVerifier for TrustedPeerServerVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if self.trusted_cert_ders.is_empty() {
-            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        if self.certs.is_trusted(end_entity) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "Server cert not in trusted peers list".into(),
+            ))
         }
-        let presented = end_entity.as_ref();
-        for trusted in &self.trusted_cert_ders {
-            if trusted.as_slice() == presented {
-                return Ok(rustls::client::danger::ServerCertVerified::assertion());
-            }
-        }
-        Err(rustls::Error::General(
-            "Server cert not in trusted peers list".into(),
-        ))
     }
 
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-        ]
-    }
+    crate::impl_tls_verifier_methods!();
 }
 
 fn build_mtls_client(
@@ -132,6 +93,7 @@ pub fn start_discovery(
     cert_pem: String,
     key_pem: String,
     ignore_set: crate::ignore::IgnoreSet,
+    event_tx: broadcast::Sender<EngineEvent>,
 ) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
@@ -171,14 +133,21 @@ pub fn start_discovery(
                 let peer_port = info.get_port();
 
                 if let Some(peer_ip) = info.get_addresses().iter().next() {
-                    if let Some(_peer_id) = peer_id {
+                    if let Some(pid) = peer_id.clone() {
                         let url = format!("https://{}:{}", peer_ip, peer_port);
+
+                        let _ = event_tx.send(EngineEvent::PeerDiscovered {
+                            peer_id: pid,
+                            addr: url.clone(),
+                        });
+
                         let db_clone = db.clone();
                         let storage_dir_clone = storage_dir.clone();
                         let sync_dir_for_task = sync_dir.clone();
                         let cert_pem_clone = cert_pem.clone();
                         let key_pem_clone = key_pem.clone();
                         let ignore_set_for_task = ignore_set.clone();
+                        let event_tx_for_task = event_tx.clone();
 
                         handle.spawn(async move {
                             sync_with_peer(
@@ -189,6 +158,7 @@ pub fn start_discovery(
                                 cert_pem_clone,
                                 key_pem_clone,
                                 ignore_set_for_task,
+                                event_tx_for_task,
                             )
                                 .await;
                         });
@@ -209,6 +179,7 @@ async fn sync_with_peer(
     cert_pem: String,
     key_pem: String,
     ignore_set: crate::ignore::IgnoreSet,
+    event_tx: broadcast::Sender<EngineEvent>,
 ) {
     println!("[Sync] === Starting sync cycle with {} ===", url);
 
@@ -262,7 +233,7 @@ async fn sync_with_peer(
 
     println!("[mTLS] mTLS client built, all subsequent requests are mutually authenticated");
 
-    sync_tombstones(&mtls_client, &url, &db_clone, &sync_dir_clone).await;
+    sync_tombstones(&mtls_client, &url, &db_clone, &sync_dir_clone, &event_tx).await;
     sync_files(
         &mtls_client,
         &url,
@@ -270,6 +241,7 @@ async fn sync_with_peer(
         &storage_dir_clone,
         &sync_dir_clone,
         &ignore_set,
+        &event_tx,
     )
         .await;
 
@@ -281,6 +253,7 @@ async fn sync_tombstones(
     url: &str,
     db_clone: &Arc<Mutex<Database>>,
     sync_dir_clone: &str,
+    event_tx: &broadcast::Sender<EngineEvent>,
 ) {
     let res = match client.get(format!("{}/tombstones", url)).send().await {
         Ok(r) => r,
@@ -333,6 +306,7 @@ async fn sync_tombstones(
                     println!("[FATAL] Failed to apply tombstone to DB: {}", e);
                 } else {
                     println!("[Tombstone] Applied tombstone for: {}", local_file.path);
+                    let _ = event_tx.send(EngineEvent::FileDeleted { path: local_file.path.clone() });
                 }
             } else {
                 println!(
@@ -355,6 +329,7 @@ async fn sync_files(
     storage_dir_clone: &str,
     sync_dir_clone: &str,
     ignore_set: &crate::ignore::IgnoreSet,
+    event_tx: &broadcast::Sender<EngineEvent>,
 ) {
     let res = match client.get(format!("{}/metadata", url)).send().await {
         Ok(r) => r,
@@ -531,7 +506,10 @@ async fn sync_files(
                 &output_path,
                 &final_blocks,
             ) {
-                Ok(_) => println!("[Sync] Assembled file into sync folder: {}", output_path),
+                Ok(_) => {
+                    println!("[Sync] Assembled file into sync folder: {}", output_path);
+                    let _ = event_tx.send(EngineEvent::FileDownloaded { path: file.path.clone() });
+                }
                 Err(e) => println!("[FATAL] assemble_file_from_blocks failed: {}", e),
             }
 
