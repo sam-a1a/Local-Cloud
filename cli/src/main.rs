@@ -1,5 +1,6 @@
-use engine::Engine;
+use localcloud::{Engine, EngineEvent};
 use anyhow::Result;
+use std::sync::Arc;
 use std::fs;
 use std::io::Write;
 
@@ -9,23 +10,24 @@ async fn main() -> Result<()> {
 
     println!("Starting local-cloud-cli...");
 
-    let handle = tokio::runtime::Handle::current();
+    let engine = Arc::new(Engine::new(".".to_string()).map_err(|e| anyhow::anyhow!(e))?);
 
-    // Engine will create ./identity.json, ./local-cloud-<id>.db, ./sync_<id>, etc.
-    let mut engine = Engine::new(".", handle)?;
+    let short_id = engine.device_short_id();
+    let sync_dir = engine.get_sync_dir();
 
-    let short_id = engine.device_short_id().to_string();
-    let sync_dir = engine.get_sync_dir().to_string();
-
-    // Subscribe to engine events
-    let mut rx = engine.subscribe();
+    // Listen for events using UniFFI's async next_event method
+    let engine_events = engine.clone();
     tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
+        loop {
+            let event = engine_events.next_event().await;
             println!("[Event] {:?}", event);
+            if let EngineEvent::EngineStopped = event {
+                break;
+            }
         }
     });
 
-    engine.start().await?;
+    engine.start().await.map_err(|e| anyhow::anyhow!(e))?;
 
     // Drop a test file into the sync folder after 2 seconds
     let sync_dir_clone = sync_dir.clone();
@@ -46,6 +48,7 @@ async fn main() -> Result<()> {
     println!("\nReceived Ctrl+C, shutting down gracefully...");
 
     engine.stop();
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     Ok(())
 }

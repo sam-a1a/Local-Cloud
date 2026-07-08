@@ -15,16 +15,14 @@ pub use db::Tombstone;
 pub use crypto::DeviceIdentity;
 pub use ignore::{new_ignore_set, IgnoreSet};
 
-use anyhow::Result;
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::net::TcpListener;
-use tokio::runtime::Handle;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as TokioMutex};
 use notify::RecommendedWatcher;
 use mdns_sd::ServiceDaemon;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, uniffi::Enum)]
 pub enum EngineEvent {
     EngineStarted,
     EngineStopped,
@@ -32,46 +30,56 @@ pub enum EngineEvent {
     FileIndexed { path: String },
     FileDownloaded { path: String },
     FileDeleted { path: String },
-    Error { message: String },
+    ErrorEvent { message: String },
 }
 
+#[derive(uniffi::Object)]
 pub struct Engine {
-    db: Arc<Mutex<Database>>,
+    db: Arc<StdMutex<Database>>,
     identity: DeviceIdentity,
     storage_dir: String,
     sync_dir: String,
     ignore_set: IgnoreSet,
     event_tx: broadcast::Sender<EngineEvent>,
-    handle: Handle,
-    watcher: Option<RecommendedWatcher>,
-    mdns_daemon: Option<ServiceDaemon>,
-    server_task: Option<tokio::task::JoinHandle<()>>,
+    event_rx: TokioMutex<broadcast::Receiver<EngineEvent>>,
+    runtime: tokio::runtime::Runtime,
+    watcher: StdMutex<Option<RecommendedWatcher>>,
+    mdns_daemon: StdMutex<Option<ServiceDaemon>>,
+    server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+#[uniffi::export]
 impl Engine {
-    pub fn new(base_dir: &str, handle: Handle) -> Result<Self> {
-        std::fs::create_dir_all(base_dir)?;
+    #[uniffi::constructor]
+    pub fn new(base_dir: String) -> Result<Self, String> {
+        std::fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
 
-        let identity = DeviceIdentity::load_or_generate(base_dir)?;
+        // Spin up a dedicated Tokio runtime for the engine
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let identity = DeviceIdentity::load_or_generate(&base_dir).map_err(|e| e.to_string())?;
         let short_id = &identity.device_id[..8];
 
         let db_path = format!("{}/local-cloud-{}.db", base_dir, short_id);
         let storage_dir = format!("{}/storage_{}", base_dir, short_id);
         let sync_dir_path = format!("{}/sync_{}", base_dir, short_id);
 
-        let database = Database::init(&db_path)?;
-        storage::ensure_storage_dir(&storage_dir)?;
-        storage::ensure_trusted_peers_dir(&storage_dir)?;
-        std::fs::create_dir_all(&sync_dir_path)?;
+        let database = Database::init(&db_path).map_err(|e| e.to_string())?;
+        storage::ensure_storage_dir(&storage_dir).map_err(|e| e.to_string())?;
+        storage::ensure_trusted_peers_dir(&storage_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&sync_dir_path).map_err(|e| e.to_string())?;
 
-        // Canonicalize sync dir so path comparisons with OS events work perfectly
-        let sync_dir = std::fs::canonicalize(&sync_dir_path)?
+        let sync_dir = std::fs::canonicalize(&sync_dir_path)
+            .map_err(|e| e.to_string())?
             .to_string_lossy()
             .to_string();
 
-        let db_state = Arc::new(Mutex::new(database));
+        let db_state = Arc::new(StdMutex::new(database));
         let ignore_set = new_ignore_set();
-        let (event_tx, _) = broadcast::channel(100);
+        let (event_tx, event_rx) = broadcast::channel(100);
 
         Ok(Self {
             db: db_state,
@@ -80,29 +88,33 @@ impl Engine {
             sync_dir,
             ignore_set,
             event_tx,
-            handle,
-            watcher: None,
-            mdns_daemon: None,
-            server_task: None,
+            event_rx: TokioMutex::new(event_rx),
+            runtime,
+            watcher: StdMutex::new(None),
+            mdns_daemon: StdMutex::new(None),
+            server_task: StdMutex::new(None),
         })
     }
 
-    pub fn device_short_id(&self) -> &str {
-        &self.identity.device_id[..8]
+    pub fn device_short_id(&self) -> String {
+        self.identity.device_id[..8].to_string()
     }
 
-    pub fn get_sync_dir(&self) -> &str {
-        &self.sync_dir
+    pub fn get_sync_dir(&self) -> String {
+        self.sync_dir.clone()
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
-        self.event_tx.subscribe()
+    pub async fn next_event(&self) -> EngineEvent {
+        let mut rx = self.event_rx.lock().await;
+        rx.recv().await.unwrap_or(EngineEvent::ErrorEvent { message: "Event channel closed".to_string() })
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    pub async fn start(&self) -> Result<(), String> {
+        let handle = self.runtime.handle().clone();
+
         // 1. Start Server
-        let listener = TcpListener::bind("0.0.0.0:0").await?;
-        let port = listener.local_addr()?.port();
+        let listener = TcpListener::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
         let server_db = self.db.clone();
         let server_storage = self.storage_dir.clone();
@@ -111,7 +123,7 @@ impl Engine {
         let server_device_id = self.identity.device_id.clone();
         let server_tx = self.event_tx.clone();
 
-        self.server_task = Some(tokio::spawn(async move {
+        let server_task = handle.spawn(async move {
             if let Err(e) = server::start_server(
                 listener,
                 server_device_id,
@@ -120,9 +132,10 @@ impl Engine {
                 server_db,
                 server_storage,
             ).await {
-                let _ = server_tx.send(EngineEvent::Error { message: format!("Server error: {}", e) });
+                let _ = server_tx.send(EngineEvent::ErrorEvent { message: format!("Server error: {}", e) });
             }
-        }));
+        });
+        *self.server_task.lock().unwrap() = Some(server_task);
 
         // 2. Start Discovery
         let disc_db = self.db.clone();
@@ -130,15 +143,14 @@ impl Engine {
         let disc_sync = self.sync_dir.clone();
         let disc_cert = self.identity.cert_pem.clone();
         let disc_key = self.identity.key_pem.clone();
-        let disc_handle = self.handle.clone();
         let disc_tx = self.event_tx.clone();
         let disc_device_id = self.identity.device_id.clone();
         let disc_ignore = self.ignore_set.clone();
 
-        self.mdns_daemon = Some(discovery::start_discovery(
+        let daemon = discovery::start_discovery(
             disc_device_id,
             port,
-            disc_handle,
+            handle.clone(),
             disc_db,
             disc_storage,
             disc_sync,
@@ -146,41 +158,48 @@ impl Engine {
             disc_key,
             disc_ignore,
             disc_tx,
-        )?);
+        ).map_err(|e| e.to_string())?;
+
+        *self.mdns_daemon.lock().unwrap() = Some(daemon);
 
         // 3. Start Watcher
         let watch_db = self.db.clone();
         let watch_storage = self.storage_dir.clone();
         let watch_sync = self.sync_dir.clone();
         let watch_device_id = self.identity.device_id.clone();
-        let watch_handle = self.handle.clone();
         let watch_ignore = self.ignore_set.clone();
         let watch_tx = self.event_tx.clone();
 
-        self.watcher = Some(watcher::start_watcher(
+        let watcher = watcher::start_watcher(
             watch_sync,
             watch_storage,
             watch_device_id,
             watch_db,
-            watch_handle,
+            handle,
             watch_ignore,
             watch_tx,
-        )?);
+        ).map_err(|e| e.to_string())?;
+
+        *self.watcher.lock().unwrap() = Some(watcher);
 
         let _ = self.event_tx.send(EngineEvent::EngineStarted);
         println!("[Engine] Started. Sync folder: {}", self.sync_dir);
         Ok(())
     }
 
-    pub fn stop(&mut self) {
-        self.watcher.take(); // Dropping the watcher stops it
-        if let Some(daemon) = self.mdns_daemon.take() {
-            let _ = daemon.shutdown();
+    pub fn stop(&self) {
+        if let Some(w) = self.watcher.lock().unwrap().take() {
+            drop(w);
         }
-        if let Some(handle) = self.server_task.take() {
-            handle.abort();
+        if let Some(d) = self.mdns_daemon.lock().unwrap().take() {
+            let _ = d.shutdown();
+        }
+        if let Some(t) = self.server_task.lock().unwrap().take() {
+            t.abort();
         }
         let _ = self.event_tx.send(EngineEvent::EngineStopped);
         println!("[Engine] Stopped.");
     }
 }
+
+uniffi::setup_scaffolding!();
