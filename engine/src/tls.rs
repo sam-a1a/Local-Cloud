@@ -1,6 +1,8 @@
 // engine/src/tls.rs
 use rustls::pki_types::CertificateDer;
 use std::io::Cursor;
+use anyhow::Result;
+use rustls::pki_types::PrivateKeyDer;
 
 #[derive(Debug)]
 pub struct TrustedCerts {
@@ -32,6 +34,23 @@ impl TrustedCerts {
             .iter()
             .any(|trusted| trusted.as_slice() == presented)
     }
+}
+
+pub fn load_certs_and_key(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let mut cert_cursor = Cursor::new(cert_pem.as_bytes());
+    let mut key_cursor = Cursor::new(key_pem.as_bytes());
+
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_cursor)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let key = PrivateKeyDer::from(
+        rustls_pemfile::private_key(&mut key_cursor)?.unwrap(),
+    );
+
+    Ok((certs, key))
 }
 
 #[macro_export]

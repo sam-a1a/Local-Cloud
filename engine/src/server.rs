@@ -9,11 +9,9 @@ use axum::{
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::CertificateDer;
 use rustls::server::danger::ClientCertVerifier;
 use rustls::{DistinguishedName, ServerConfig};
-use rustls_pemfile;
-use std::io::Cursor;
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -74,13 +72,7 @@ pub async fn start_server(
     ignore_set: IgnoreSet,
     event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<()> {
-    let mut cert_cursor = Cursor::new(cert_pem.as_bytes());
-    let mut key_cursor = Cursor::new(key_pem.as_bytes());
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_cursor)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let key = PrivateKeyDer::from(rustls_pemfile::private_key(&mut key_cursor)?.unwrap());
+    let (certs, key) = crate::tls::load_certs_and_key(&cert_pem, &key_pem)?;
 
     let trusted_certs = crate::storage::load_all_trusted_certs(&storage_dir)?;
 
@@ -242,12 +234,7 @@ async fn finalize_file(
             Ok(_) => {
                 let _ = state.event_tx.send(EngineEvent::FileDownloaded { path: file.path.clone() });
 
-                let ignore_clone = state.ignore_set.clone();
-                let path_clone = output_path.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                    crate::ignore::unmark_ignored(&ignore_clone, &path_clone);
-                });
+                crate::ignore::schedule_unmark_ignored(state.ignore_set.clone(), output_path, 3);
 
                 (axum::http::StatusCode::OK, "Assembled".to_string())
             }

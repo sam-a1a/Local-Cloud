@@ -4,7 +4,6 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex, mpsc};
 use crate::db::Database;
@@ -59,15 +58,7 @@ pub(crate) fn build_mtls_client(
     key_pem: &str,
     trusted_cert_pems: &[String],
 ) -> Result<reqwest::Client> {
-    let mut cert_cursor = Cursor::new(cert_pem.as_bytes());
-    let mut key_cursor = Cursor::new(key_pem.as_bytes());
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_cursor)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let key = rustls::pki_types::PrivateKeyDer::from(
-        rustls_pemfile::private_key(&mut key_cursor)?.unwrap(),
-    );
+    let (certs, key) = crate::tls::load_certs_and_key(cert_pem, key_pem)?;
 
     let verifier = Arc::new(TrustedPeerServerVerifier::new(trusted_cert_pems));
 
@@ -145,6 +136,34 @@ pub fn start_discovery(
     Ok(daemon)
 }
 
+async fn fetch_blocks_from_peer(
+    client: &reqwest::Client,
+    peer_url: &str,
+    blocks: &[crate::db::FileBlock],
+    db_clone: &Arc<Mutex<Database>>,
+    storage_dir_clone: &str,
+) -> bool {
+    for b in blocks {
+        let resp = match client.get(format!("{}/get_block/{}", peer_url, b.block_id)).send().await {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+
+        if resp.status() != 200 {
+            return false;
+        }
+
+        if let Ok(data) = resp.bytes().await {
+            let _ = crate::storage::write_block(storage_dir_clone, &b.block_id, &data);
+            let db = db_clone.lock().unwrap();
+            let _ = db.set_block_present(&b.block_id, true);
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 pub async fn sync_with_peer(
     peer_url: String,
     peer_id: String,
@@ -199,25 +218,17 @@ pub async fn sync_with_peer(
 
         if need_blocks {
             println!("[Sync] Auto-downloading pinned file: {}", remote_file.path);
-            for b in missing_blocks {
-                let resp = match mtls_client.get(format!("{}/get_block/{}", peer_url, b.block_id)).send().await {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                if let Ok(data) = resp.bytes().await {
-                    let _ = crate::storage::write_block(&storage_dir_clone, &b.block_id, &data);
-                    let db = db_clone.lock().unwrap();
-                    let _ = db.set_block_present(&b.block_id, true);
-                }
+            let success = fetch_blocks_from_peer(&mtls_client, &peer_url, &missing_blocks, &db_clone, &storage_dir_clone).await;
+
+            if success {
+                // Assemble the file locally so the user sees it
+                let db = db_clone.lock().unwrap();
+                let blocks = db.get_blocks_for_file(&remote_file.id).unwrap_or_default();
+                let output_path = format!("/tmp/local_cloud_sync/{}", remote_file.path);
+                let _ = crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks);
+
+                let _ = event_tx.send(EngineEvent::FileDownloaded { path: remote_file.path.clone() });
             }
-
-            // Assemble the file locally so the user sees it
-            let db = db_clone.lock().unwrap();
-            let blocks = db.get_blocks_for_file(&remote_file.id).unwrap_or_default();
-            let output_path = format!("/tmp/local_cloud_sync/{}", remote_file.path); // Fallback path, true UI resolves this
-            let _ = crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks);
-
-            let _ = event_tx.send(EngineEvent::FileDownloaded { path: remote_file.path.clone() });
         }
     }
 
@@ -306,24 +317,7 @@ pub async fn download_file_on_demand(
 
     // Try peers until one works
     for (_peer_id, peer_url) in peers {
-        let mut success = true;
-        for b in &missing {
-            let resp = match client.get(format!("{}/get_block/{}", peer_url, b.block_id)).send().await {
-                Ok(r) => r,
-                Err(_) => { success = false; break; }
-            };
-
-            if resp.status() == 200 {
-                if let Ok(data) = resp.bytes().await {
-                    let _ = crate::storage::write_block(&storage_dir_clone, &b.block_id, &data);
-                    let db = db_clone.lock().unwrap();
-                    let _ = db.set_block_present(&b.block_id, true);
-                }
-            } else {
-                success = false;
-                break;
-            }
-        }
+        let success = fetch_blocks_from_peer(&client, &peer_url, &missing, &db_clone, &storage_dir_clone).await;
 
         if success {
             let output_path = format!("{}/{}", sync_dir_clone, file.path);
@@ -333,12 +327,7 @@ pub async fn download_file_on_demand(
             crate::ignore::mark_ignored(&ignore_set, &output_path);
             crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks).map_err(|e| e.to_string())?;
 
-            let ignore_clone = ignore_set.clone();
-            let path_clone = output_path.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                crate::ignore::unmark_ignored(&ignore_clone, &path_clone);
-            });
+            crate::ignore::schedule_unmark_ignored(ignore_set.clone(), output_path, 3);
 
             let _ = event_tx.send(EngineEvent::FileDownloaded { path: file.path.clone() });
             return Ok(());

@@ -191,7 +191,7 @@ impl Engine {
         // Push updated metadata to all peers
         self.runtime.spawn(async move {
             let peers = peers.lock().unwrap().clone();
-            let trusted_certs = match crate::storage::load_all_trusted_certs(&storage) {
+            let trusted_certs = match storage::load_all_trusted_certs(&storage) {
                 Ok(c) => c,
                 Err(_) => return,
             };
@@ -224,7 +224,7 @@ impl Engine {
 
                 if peer_is_pinned && we_have_data {
                     for b in &blocks {
-                        if let Ok(data) = crate::storage::read_block(&storage, &b.block_id) {
+                        if let Ok(data) = storage::read_block(&storage, &b.block_id) {
                             let _ = client.post(format!("{}/push_block/{}", peer_url, b.block_id)).body(data).send().await;
                         }
                     }

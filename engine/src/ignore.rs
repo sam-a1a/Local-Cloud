@@ -22,3 +22,10 @@ pub fn unmark_ignored(set: &IgnoreSet, path: &str) {
     let mut guard = set.lock().unwrap();
     guard.remove(path);
 }
+
+pub fn schedule_unmark_ignored(ignore_set: IgnoreSet, path: String, delay_secs: u64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+        unmark_ignored(&ignore_set, &path);
+    });
+}
