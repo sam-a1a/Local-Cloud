@@ -1,3 +1,4 @@
+// engine/src/db.rs
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ pub struct Database {
     pub conn: Connection,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, uniffi::Record)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileMetadata {
     pub id: String,
     pub path: String,

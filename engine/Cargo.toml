@@ -36,8 +36,10 @@ tokio-rustls = "0.26"
 rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = "0.14"
 sha2 = "0.10"
-ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+
 rand = "0.8"
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+
 hex = "0.4"
 hyper-util = { version = "0.1.12", features = ["server-auto", "tokio"] }
 

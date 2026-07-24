@@ -1,8 +1,9 @@
+// engine/src/crypto.rs
 use anyhow::Result;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use rand::rngs::OsRng;
 
 #[derive(Serialize, Deserialize)]
 struct IdentityFile {

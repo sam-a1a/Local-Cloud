@@ -1,3 +1,4 @@
+// engine/src/lib.rs
 pub mod crypto;
 pub mod db;
 pub mod discovery;
@@ -22,7 +23,7 @@ use tokio::net::TcpListener;
 use notify::RecommendedWatcher;
 use mdns_sd::ServiceDaemon;
 
-#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("{description}")]
     Generic { description: String },
@@ -34,7 +35,7 @@ impl EngineError {
     }
 }
 
-#[derive(Clone, Debug, Serialize, uniffi::Enum)]
+#[derive(Clone, Debug, Serialize)]
 pub enum EngineEvent {
     EngineStarted,
     EngineStopped,
@@ -45,7 +46,6 @@ pub enum EngineEvent {
     ErrorEvent { message: String },
 }
 
-#[derive(uniffi::Object)]
 pub struct Engine {
     db: Arc<StdMutex<Database>>,
     identity: DeviceIdentity,
@@ -61,9 +61,7 @@ pub struct Engine {
     known_peers: Arc<StdMutex<HashMap<String, String>>>,
 }
 
-#[uniffi::export]
 impl Engine {
-    #[uniffi::constructor]
     pub fn new(base_dir: String, sync_dir_path: String) -> Result<Self, EngineError> {
         std::fs::create_dir_all(&base_dir).map_err(EngineError::from)?;
 
@@ -162,12 +160,13 @@ impl Engine {
     pub fn start(&self) -> Result<(), EngineError> {
         let handle = self.runtime.handle().clone();
 
-        // 1. Start Server
-        let (listener, port) = self.runtime.block_on(async {
-            let listener = TcpListener::bind("0.0.0.0:0").await.map_err(EngineError::from)?;
-            let port = listener.local_addr().map_err(EngineError::from)?.port();
-            Ok::<(TcpListener, u16), EngineError>((listener, port))
-        })?;
+        // 1. Start Server — bind synchronously to avoid "runtime within runtime" panic.
+        //    The CLI may already be running inside a Tokio runtime, and `block_on`
+        //    from inside a runtime is forbidden by Tokio.
+        let std_listener = std::net::TcpListener::bind("0.0.0.0:0").map_err(EngineError::from)?;
+        let port = std_listener.local_addr().map_err(EngineError::from)?.port();
+        std_listener.set_nonblocking(true).map_err(EngineError::from)?;
+        let listener = TcpListener::from_std(std_listener).map_err(EngineError::from)?;
 
         let server_db = self.db.clone();
         let server_storage = self.storage_dir.clone();
@@ -251,5 +250,3 @@ impl Engine {
         println!("[Engine] Stopped.");
     }
 }
-
-uniffi::setup_scaffolding!();
