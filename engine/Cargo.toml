@@ -47,6 +47,3 @@ rustls-pemfile = "2.2"
 
 notify = { version = "6.1.1", features = ["macos_fsevent"] }
 uuid = { version = "1.23.4", features = ["v4"] }
-
-# FFI
-uniffi = { version = "0.28", features = ["cli"] }
