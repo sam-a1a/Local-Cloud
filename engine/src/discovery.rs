@@ -1,3 +1,4 @@
+// engine/src/discovery.rs
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rustls::client::danger::ServerCertVerifier;
@@ -7,9 +8,9 @@ use std::io::Cursor;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex, mpsc};
 use crate::db::Database;
+use crate::ignore::IgnoreSet;
 use crate::tls::TrustedCerts;
 use crate::EngineEvent;
-use crate::ignore::IgnoreSet;
 
 const SERVICE_TYPE: &str = "_local-cloud._tcp.local.";
 
@@ -53,7 +54,7 @@ impl ServerCertVerifier for TrustedPeerServerVerifier {
     crate::impl_tls_verifier_methods!();
 }
 
-fn build_mtls_client(
+pub(crate) fn build_mtls_client(
     cert_pem: &str,
     key_pem: &str,
     trusted_cert_pems: &[String],
@@ -144,120 +145,205 @@ pub fn start_discovery(
     Ok(daemon)
 }
 
-pub async fn push_file_to_peer(
+pub async fn sync_with_peer(
     peer_url: String,
     peer_id: String,
-    file_id: String,
+    my_device_id: String,
     db_clone: Arc<Mutex<Database>>,
     storage_dir_clone: String,
-    _sync_dir_clone: String,
     cert_pem: String,
     key_pem: String,
-    _ignore_set: IgnoreSet,
     event_tx: mpsc::Sender<EngineEvent>,
 ) {
-    println!("[Push] === Starting push of {} to {} ===", file_id, peer_id);
+    println!("[Sync] Starting metadata sync with {}", peer_id);
 
-    // 1. mTLS Handshake
-    let untrusted_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-
-    let peer_cert_pem = match untrusted_client.get(format!("{}/hello", peer_url)).send().await {
-        Ok(res) => match res.text().await {
-            Ok(pem) => pem,
-            Err(e) => {
-                let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Push failed: {}", e) });
-                return;
-            }
-        },
-        Err(e) => {
-            let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Push handshake failed: {}", e) });
-            return;
-        }
-    };
-
-    // Use peer_id for the cert filename to support multiple devices
+    // 1. Fetch peer cert and build mTLS client
     let peer_cert_filename = format!("{}.pem", peer_id);
-    if let Err(e) = crate::storage::save_peer_cert(&storage_dir_clone, &peer_cert_filename, &peer_cert_pem) {
-        let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Failed to save peer cert: {}", e) });
-        return;
-    }
+    let untrusted_client = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+    let peer_cert_pem = match untrusted_client.get(format!("{}/hello", peer_url)).send().await {
+        Ok(res) => match res.text().await { Ok(pem) => pem, Err(_) => return },
+        Err(_) => return,
+    };
+    let _ = crate::storage::save_peer_cert(&storage_dir_clone, &peer_cert_filename, &peer_cert_pem);
 
     let trusted_certs = match crate::storage::load_all_trusted_certs(&storage_dir_clone) {
         Ok(c) => c,
-        Err(e) => {
-            let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Failed to load trusted certs: {}", e) });
-            return;
-        }
+        Err(_) => return,
     };
-
     let mtls_client = match build_mtls_client(&cert_pem, &key_pem, &trusted_certs) {
         Ok(c) => c,
-        Err(e) => {
-            let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Failed to build mTLS client: {}", e) });
-            return;
-        }
+        Err(_) => return,
     };
 
-    // 2. Fetch File & Blocks from DB
-    let (file, blocks) = {
+    // 2. Fetch peer's file list
+    let remote_files: Vec<crate::FileMetadata> = match mtls_client.get(format!("{}/list_files", peer_url)).send().await {
+        Ok(res) => match res.json().await { Ok(f) => f, Err(e) => { println!("[Sync] Failed to parse list_files: {}", e); return; } },
+        Err(e) => { println!("[Sync] Failed to fetch list_files: {}", e); return; }
+    };
+
+    // 3. Upsert remote files and auto-download if we are pinned
+    for remote_file in &remote_files {
+        let (need_blocks, missing_blocks) = {
+            let db = db_clone.lock().unwrap();
+            let _ = db.upsert_file_from_peer(remote_file);
+
+            // If we are pinned, check if we are missing blocks
+            if remote_file.pinned_devices.contains(&my_device_id) {
+                let local_blocks = db.get_blocks_for_file(&remote_file.id).unwrap_or_default();
+                let missing: Vec<crate::db::FileBlock> = local_blocks.into_iter().filter(|b| b.is_present == 0).collect();
+                (!missing.is_empty(), missing)
+            } else {
+                (false, vec![])
+            }
+        }; // db lock dropped
+
+        if need_blocks {
+            println!("[Sync] Auto-downloading pinned file: {}", remote_file.path);
+            for b in missing_blocks {
+                let resp = match mtls_client.get(format!("{}/get_block/{}", peer_url, b.block_id)).send().await {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if let Ok(data) = resp.bytes().await {
+                    let _ = crate::storage::write_block(&storage_dir_clone, &b.block_id, &data);
+                    let db = db_clone.lock().unwrap();
+                    let _ = db.set_block_present(&b.block_id, true);
+                }
+            }
+
+            // Assemble the file locally so the user sees it
+            let db = db_clone.lock().unwrap();
+            let blocks = db.get_blocks_for_file(&remote_file.id).unwrap_or_default();
+            let output_path = format!("/tmp/local_cloud_sync/{}", remote_file.path); // Fallback path, true UI resolves this
+            let _ = crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks);
+
+            let _ = event_tx.send(EngineEvent::FileDownloaded { path: remote_file.path.clone() });
+        }
+    }
+
+    // 4. Push our local files that the peer doesn't have or is outdated on
+    let local_files = {
         let db = db_clone.lock().unwrap();
-        let file = match db.get_file_by_id(&file_id) {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                let _ = event_tx.send(EngineEvent::ErrorEvent { message: "File not found locally".to_string() });
-                return;
-            }
-            Err(e) => {
-                let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("DB error: {}", e) });
-                return;
-            }
-        };
-        let blocks = match db.get_blocks_for_file(&file_id) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("DB block error: {}", e) });
-                return;
-            }
-        };
-        (file, blocks)
+        db.get_all_files().unwrap_or_default()
     };
 
-    // 3. Push Metadata (Clone file and blocks so we can use them later)
-    let push_req = serde_json::json!({
-        "file": file.clone(),
-        "blocks": blocks.clone()
-    });
+    for local_file in &local_files {
+        let remote_version = remote_files.iter().find(|f| f.path == local_file.path).map(|f| f.version);
 
-    if let Err(e) = mtls_client.post(format!("{}/push_metadata", peer_url)).json(&push_req).send().await {
-        let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Push metadata failed: {}", e) });
-        return;
-    }
-
-    // 4. Push Blocks
-    for b in &blocks {
-        let data = match crate::storage::read_block(&storage_dir_clone, &b.block_id) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Failed to read block: {}", e) });
-                return;
-            }
+        let needs_push = match remote_version {
+            Some(v) => local_file.version > v,
+            None => true,
         };
 
-        if let Err(e) = mtls_client.post(format!("{}/push_block/{}", peer_url, b.block_id)).body(data).send().await {
-            let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Push block failed: {}", e) });
-            return;
+        if needs_push {
+            let (blocks, blocks_data_present) = {
+                let db = db_clone.lock().unwrap();
+                let blocks = db.get_blocks_for_file(&local_file.id).unwrap_or_default();
+                let all_present = blocks.iter().all(|b| b.is_present == 1);
+                (blocks, all_present)
+            };
+
+            let push_req = serde_json::json!({
+                "file": local_file,
+                "blocks": blocks.clone()
+            });
+
+            if let Err(e) = mtls_client.post(format!("{}/push_metadata", peer_url)).json(&push_req).send().await {
+                println!("[Sync] Failed to push metadata: {}", e);
+                continue;
+            }
+
+            // If we have the data and peer is pinned to it, push blocks automatically
+            if blocks_data_present && local_file.pinned_devices.contains(&peer_id) {
+                for b in &blocks {
+                    if let Ok(data) = crate::storage::read_block(&storage_dir_clone, &b.block_id) {
+                        let _ = mtls_client.post(format!("{}/push_block/{}", peer_url, b.block_id)).body(data).send().await;
+                    }
+                }
+                let _ = mtls_client.post(format!("{}/finalize_file/{}", peer_url, local_file.id)).send().await;
+            }
         }
     }
 
-    // 5. Finalize File on Peer
-    if let Err(e) = mtls_client.post(format!("{}/finalize_file/{}", peer_url, file_id)).send().await {
-        let _ = event_tx.send(EngineEvent::ErrorEvent { message: format!("Finalize file failed: {}", e) });
-        return;
+    println!("[Sync] Finished metadata sync with {}", peer_id);
+}
+
+pub async fn download_file_on_demand(
+    file_id: String,
+    db_clone: Arc<Mutex<Database>>,
+    storage_dir_clone: String,
+    sync_dir_clone: String,
+    cert_pem: String,
+    key_pem: String,
+    known_peers: Arc<Mutex<HashMap<String, String>>>,
+    ignore_set: IgnoreSet,
+    event_tx: mpsc::Sender<EngineEvent>,
+) -> Result<(), String> {
+    // 1. Check if we already have it locally
+    let (file, blocks, missing) = {
+        let db = db_clone.lock().unwrap();
+        let file = db.get_file_by_id(&file_id).map_err(|e| e.to_string())?
+            .ok_or("File not in DB")?;
+        let blocks = db.get_blocks_for_file(&file_id).map_err(|e| e.to_string())?;
+        let missing: Vec<crate::db::FileBlock> = blocks.iter().filter(|b| b.is_present == 0).cloned().collect();
+        (file, blocks, missing)
+    };
+
+    if missing.is_empty() {
+        let output_path = format!("{}/{}", sync_dir_clone, file.path);
+        crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks).map_err(|e| e.to_string())?;
+        return Ok(());
     }
 
-    let _ = event_tx.send(EngineEvent::FileSent { path: file.path.clone() });
-    println!("[Push] === Finished push of {} to {} ===", file_id, peer_id);
+    // 2. Find a peer who has the blocks
+    let peers = known_peers.lock().unwrap().clone();
+    if peers.is_empty() {
+        return Err("No peers available".to_string());
+    }
+
+    let trusted_certs = crate::storage::load_all_trusted_certs(&storage_dir_clone).map_err(|e| e.to_string())?;
+    let client = build_mtls_client(&cert_pem, &key_pem, &trusted_certs).map_err(|e| e.to_string())?;
+
+    // Try peers until one works
+    for (_peer_id, peer_url) in peers {
+        let mut success = true;
+        for b in &missing {
+            let resp = match client.get(format!("{}/get_block/{}", peer_url, b.block_id)).send().await {
+                Ok(r) => r,
+                Err(_) => { success = false; break; }
+            };
+
+            if resp.status() == 200 {
+                if let Ok(data) = resp.bytes().await {
+                    let _ = crate::storage::write_block(&storage_dir_clone, &b.block_id, &data);
+                    let db = db_clone.lock().unwrap();
+                    let _ = db.set_block_present(&b.block_id, true);
+                }
+            } else {
+                success = false;
+                break;
+            }
+        }
+
+        if success {
+            let output_path = format!("{}/{}", sync_dir_clone, file.path);
+            if let Some(parent) = std::path::Path::new(&output_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            crate::ignore::mark_ignored(&ignore_set, &output_path);
+            crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks).map_err(|e| e.to_string())?;
+
+            let ignore_clone = ignore_set.clone();
+            let path_clone = output_path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                crate::ignore::unmark_ignored(&ignore_clone, &path_clone);
+            });
+
+            let _ = event_tx.send(EngineEvent::FileDownloaded { path: file.path.clone() });
+            return Ok(());
+        }
+    }
+
+    Err("Failed to download from all peers".to_string())
 }

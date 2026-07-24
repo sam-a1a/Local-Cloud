@@ -16,6 +16,7 @@ pub struct FileMetadata {
     pub modified_time: i64,
     pub version: i64,
     pub created_by: String,
+    pub pinned_devices: Vec<String>, // NEW: Tracks which devices should hold the data
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -42,6 +43,8 @@ pub struct Tombstone {
 }
 
 fn file_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileMetadata> {
+    let pinned_str: String = row.get(6)?;
+    let pinned_devices: Vec<String> = serde_json::from_str(&pinned_str).unwrap_or_default();
     Ok(FileMetadata {
         id: row.get(0)?,
         path: row.get(1)?,
@@ -49,6 +52,7 @@ fn file_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileMetadata> {
         modified_time: row.get(3)?,
         version: row.get(4)?,
         created_by: row.get(5)?,
+        pinned_devices,
     })
 }
 
@@ -66,7 +70,8 @@ impl Database {
             );
             CREATE TABLE IF NOT EXISTS files (
                 id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, size INTEGER NOT NULL,
-                modified_time INTEGER NOT NULL, version INTEGER NOT NULL, created_by TEXT NOT NULL
+                modified_time INTEGER NOT NULL, version INTEGER NOT NULL, created_by TEXT NOT NULL,
+                pinned_devices TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS blocks (
                 id TEXT PRIMARY KEY, size INTEGER NOT NULL, is_present INTEGER NOT NULL DEFAULT 0
@@ -88,16 +93,17 @@ impl Database {
     }
 
     pub fn insert_file(&self, file: &FileMetadata) -> Result<()> {
+        let pinned_str = serde_json::to_string(&file.pinned_devices)?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO files (id, path, size, modified_time, version, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![file.id, file.path, file.size, file.modified_time, file.version, file.created_by],
+            "INSERT OR REPLACE INTO files (id, path, size, modified_time, version, created_by, pinned_devices) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![file.id, file.path, file.size, file.modified_time, file.version, file.created_by, pinned_str],
         )?;
         Ok(())
     }
 
     pub fn get_all_files(&self) -> Result<Vec<FileMetadata>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, size, modified_time, version, created_by FROM files"
+            "SELECT id, path, size, modified_time, version, created_by, pinned_devices FROM files"
         )?;
         let files = stmt.query_map([], file_from_row)?;
 
@@ -110,7 +116,7 @@ impl Database {
 
     pub fn get_file_by_id(&self, file_id: &str) -> Result<Option<FileMetadata>> {
         let result = self.conn.query_row(
-            "SELECT id, path, size, modified_time, version, created_by FROM files WHERE id = ?1",
+            "SELECT id, path, size, modified_time, version, created_by, pinned_devices FROM files WHERE id = ?1",
             rusqlite::params![file_id],
             file_from_row,
         ).optional()?;
@@ -118,6 +124,7 @@ impl Database {
     }
 
     pub fn upsert_file_from_peer(&self, file: &FileMetadata) -> Result<()> {
+        let pinned_str = serde_json::to_string(&file.pinned_devices)?;
         let existing_version: Option<i64> = self.conn.query_row(
             "SELECT version FROM files WHERE path = ?1",
             rusqlite::params![file.path],
@@ -127,14 +134,14 @@ impl Database {
         if let Some(existing_version) = existing_version {
             if file.version > existing_version {
                 self.conn.execute(
-                    "UPDATE files SET id = ?1, size = ?2, modified_time = ?3, version = ?4, created_by = ?5 WHERE path = ?6",
-                    rusqlite::params![file.id, file.size, file.modified_time, file.version, file.created_by, file.path],
+                    "UPDATE files SET id = ?1, size = ?2, modified_time = ?3, version = ?4, created_by = ?5, pinned_devices = ?6 WHERE path = ?7",
+                    rusqlite::params![file.id, file.size, file.modified_time, file.version, file.created_by, pinned_str, file.path],
                 )?;
             }
         } else {
             self.conn.execute(
-                "INSERT INTO files (id, path, size, modified_time, version, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![file.id, file.path, file.size, file.modified_time, file.version, file.created_by],
+                "INSERT INTO files (id, path, size, modified_time, version, created_by, pinned_devices) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![file.id, file.path, file.size, file.modified_time, file.version, file.created_by, pinned_str],
             )?;
         }
         Ok(())
@@ -152,6 +159,14 @@ impl Database {
         self.conn.execute(
             "INSERT OR REPLACE INTO file_blocks (file_id, block_id, block_index) VALUES (?1, ?2, ?3)",
             rusqlite::params![file_id, block_id, block_index],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_blocks_for_file(&self, file_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_blocks WHERE file_id = ?1",
+            rusqlite::params![file_id],
         )?;
         Ok(())
     }
@@ -257,7 +272,7 @@ impl Database {
 
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
         let result = self.conn.query_row(
-            "SELECT id, path, size, modified_time, version, created_by FROM files WHERE path = ?1",
+            "SELECT id, path, size, modified_time, version, created_by, pinned_devices FROM files WHERE path = ?1",
             rusqlite::params![path],
             file_from_row,
         ).optional()?;

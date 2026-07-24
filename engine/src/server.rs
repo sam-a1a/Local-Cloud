@@ -1,3 +1,4 @@
+// engine/src/server.rs
 use crate::db::Database;
 use crate::ignore::IgnoreSet;
 use crate::tls::TrustedCerts;
@@ -115,6 +116,8 @@ pub async fn start_server(
             }
         }))
         .route("/hello", get(get_hello))
+        .route("/list_files", get(list_files))
+        .route("/get_block/{block_id}", get(get_block))
         .route("/push_metadata", post(push_metadata))
         .route("/push_block/{block_id}", post(push_block))
         .route("/finalize_file/{file_id}", post(finalize_file))
@@ -146,6 +149,21 @@ async fn get_hello(State(state): State<AppState>) -> String {
     state.cert_pem.clone()
 }
 
+async fn list_files(State(state): State<AppState>) -> Json<Vec<crate::FileMetadata>> {
+    let db = state.db.lock().unwrap();
+    Json(db.get_all_files().unwrap_or_default())
+}
+
+async fn get_block(
+    State(state): State<AppState>,
+    Path(block_id): Path<String>,
+) -> impl IntoResponse {
+    match crate::storage::read_block(&state.storage_dir, &block_id) {
+        Ok(data) => Bytes::from(data).into_response(),
+        Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct PushMetadataRequest {
     file: crate::FileMetadata,
@@ -157,6 +175,14 @@ async fn push_metadata(
     Json(req): Json<PushMetadataRequest>,
 ) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
+
+    // Clear old block mappings if we are updating an existing file
+    if let Ok(Some(existing)) = db.get_file_by_id(&req.file.id) {
+        if req.file.version > existing.version {
+            let _ = db.clear_blocks_for_file(&req.file.id);
+        }
+    }
+
     if let Err(e) = db.upsert_file_from_peer(&req.file) {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save metadata: {}", e));
     }
@@ -164,7 +190,7 @@ async fn push_metadata(
         let block_meta = crate::db::BlockMetadata {
             id: b.block_id.clone(),
             size: b.size,
-            is_present: 0,
+            is_present: 0, // Default to not present locally
         };
         let _ = db.insert_block(&block_meta);
         let _ = db.map_block_to_file(&req.file.id, &b.block_id, b.block_index);

@@ -131,38 +131,115 @@ impl Engine {
         db.get_all_files().unwrap_or_default()
     }
 
-    pub fn send_file_to_peer(&self, peer_id: String, file_id: String) -> Result<(), EngineError> {
-        let peer_url = {
-            let peers = self.known_peers.lock().unwrap();
-            peers.get(&peer_id).cloned()
-        };
+    pub fn sync_with_peer(&self, peer_id: String, peer_url: String) -> Result<(), EngineError> {
+        let db = self.db.clone();
+        let storage = self.storage_dir.clone();
+        let cert = self.identity.cert_pem.clone();
+        let key = self.identity.key_pem.clone();
+        let my_id = self.identity.device_id.clone();
+        let tx = self.event_tx.clone();
 
-        if let Some(url) = peer_url {
-            let db = self.db.clone();
-            let storage = self.storage_dir.clone();
-            let sync = self.sync_dir.clone();
-            let cert = self.identity.cert_pem.clone();
-            let key = self.identity.key_pem.clone();
-            let ignore = self.ignore_set.clone();
-            let tx = self.event_tx.clone();
-            let pid = peer_id.clone();
-            let fid = file_id.clone();
+        self.runtime.spawn(async move {
+            discovery::sync_with_peer(peer_url, peer_id, my_id, db, storage, cert, key, tx).await;
+        });
+        Ok(())
+    }
 
-            self.runtime.spawn(async move {
-                discovery::push_file_to_peer(url, pid, fid, db, storage, sync, cert, key, ignore, tx).await;
-            });
-            Ok(())
-        } else {
-            Err(EngineError::from("Peer not found"))
+    pub fn fetch_file_on_demand(&self, file_id: String) -> Result<(), EngineError> {
+        let db = self.db.clone();
+        let storage = self.storage_dir.clone();
+        let sync = self.sync_dir.clone();
+        let cert = self.identity.cert_pem.clone();
+        let key = self.identity.key_pem.clone();
+        let peers = self.known_peers.clone();
+        let ignore = self.ignore_set.clone();
+        let tx = self.event_tx.clone();
+
+        self.runtime.spawn(async move {
+            match discovery::download_file_on_demand(
+                file_id, db, storage, sync, cert, key, peers, ignore, tx
+            ).await {
+                Ok(_) => println!("[Engine] On-demand fetch successful"),
+                Err(e) => println!("[Engine] On-demand fetch failed: {}", e),
+            }
+        });
+        Ok(())
+    }
+
+    pub fn set_file_pinned_devices(&self, file_id: String, devices: Vec<String>) -> Result<(), EngineError> {
+        let db = self.db.clone();
+        let storage = self.storage_dir.clone();
+        let cert = self.identity.cert_pem.clone();
+        let key = self.identity.key_pem.clone();
+        let peers = self.known_peers.clone();
+        let tx = self.event_tx.clone();
+
+        // Update local DB first
+        {
+            let db = db.lock().unwrap();
+            if let Ok(Some(mut file)) = db.get_file_by_id(&file_id) {
+                file.pinned_devices = devices.clone();
+                file.version += 1; // bump version
+                if let Err(e) = db.insert_file(&file) {
+                    return Err(EngineError::from(e.to_string()));
+                }
+            } else {
+                return Err(EngineError::from("File not found"));
+            }
         }
+
+        // Push updated metadata to all peers
+        self.runtime.spawn(async move {
+            let peers = peers.lock().unwrap().clone();
+            let trusted_certs = match crate::storage::load_all_trusted_certs(&storage) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let client = match discovery::build_mtls_client(&cert, &key, &trusted_certs) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let (file, blocks) = {
+                let db = db.lock().unwrap();
+                let file = match db.get_file_by_id(&file_id).ok().flatten() {
+                    Some(f) => f,
+                    None => return,
+                };
+                let blocks = db.get_blocks_for_file(&file_id).unwrap_or_default();
+                (file, blocks)
+            };
+
+            let push_req = serde_json::json!({
+                "file": file.clone(),
+                "blocks": blocks.clone()
+            });
+
+            let we_have_data = blocks.iter().all(|b| b.is_present == 1);
+
+            for (peer_id, peer_url) in peers {
+                let _ = client.post(format!("{}/push_metadata", peer_url)).json(&push_req).send().await;
+
+                let peer_is_pinned = file.pinned_devices.contains(&peer_id);
+
+                if peer_is_pinned && we_have_data {
+                    for b in &blocks {
+                        if let Ok(data) = crate::storage::read_block(&storage, &b.block_id) {
+                            let _ = client.post(format!("{}/push_block/{}", peer_url, b.block_id)).body(data).send().await;
+                        }
+                    }
+                    let _ = client.post(format!("{}/finalize_file/{}", peer_url, file_id)).send().await;
+                }
+            }
+
+            let _ = tx.send(EngineEvent::FileSent { path: file.path.clone() });
+        });
+        Ok(())
     }
 
     pub fn start(&self) -> Result<(), EngineError> {
         let handle = self.runtime.handle().clone();
 
-        // 1. Start Server — bind synchronously to avoid "runtime within runtime" panic.
-        //    The CLI may already be running inside a Tokio runtime, and `block_on`
-        //    from inside a runtime is forbidden by Tokio.
         let std_listener = std::net::TcpListener::bind("0.0.0.0:0").map_err(EngineError::from)?;
         let port = std_listener.local_addr().map_err(EngineError::from)?.port();
         std_listener.set_nonblocking(true).map_err(EngineError::from)?;
@@ -197,7 +274,6 @@ impl Engine {
         });
         *self.server_task.lock().unwrap() = Some(server_task);
 
-        // 2. Start Discovery
         let disc_tx = self.event_tx.clone();
         let disc_device_id = self.identity.device_id.clone();
         let disc_peers = self.known_peers.clone();
@@ -211,7 +287,6 @@ impl Engine {
 
         *self.mdns_daemon.lock().unwrap() = Some(daemon);
 
-        // 3. Start Watcher
         let watch_db = self.db.clone();
         let watch_storage = self.storage_dir.clone();
         let watch_sync = self.sync_dir.clone();

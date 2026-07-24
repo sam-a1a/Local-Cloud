@@ -1,3 +1,4 @@
+// cli/src/main.rs
 use localcloud::{Engine, EngineEvent};
 use anyhow::Result;
 use std::sync::Arc;
@@ -26,6 +27,19 @@ async fn main() -> Result<()> {
 
             if let Some(event) = event {
                 println!("[Event] {:?}", event);
+
+                // Automatically synchronize metadata when a peer is discovered
+                // Use a reference (&event) to avoid moving the values out
+                if let EngineEvent::PeerDiscovered { peer_id, addr } = &event {
+                    let engine_sync = engine_events.clone();
+                    let peer_id = peer_id.clone();
+                    let addr = addr.clone();
+                    tokio::spawn(async move {
+                        let _ = engine_sync.sync_with_peer(peer_id, addr);
+                    });
+                }
+
+                // Now we can still use `event` here because we didn't move it above
                 if let EngineEvent::EngineStopped = event {
                     break;
                 }
@@ -49,17 +63,18 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Demo: Auto-send the first file to the first peer after 5 seconds
-    let engine_send = engine.clone();
+    // Demo: Auto-pin the first file to the first peer after 5 seconds
+    // This will force the peer to automatically download the data blocks
+    let engine_pin = engine.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        let peers = engine_send.get_known_peers();
-        let files = engine_send.get_local_files();
+        let peers = engine_pin.get_known_peers();
+        let files = engine_pin.get_local_files();
         if !peers.is_empty() && !files.is_empty() {
             let peer_id = peers.first().unwrap().clone();
             let file_id = files.first().unwrap().id.clone();
-            println!("[Demo] Auto-sending file {} to peer {}", file_id, peer_id);
-            let _ = engine_send.send_file_to_peer(peer_id, file_id);
+            println!("[Demo] Auto-pinning file {} to peer {}", file_id, peer_id);
+            let _ = engine_pin.set_file_pinned_devices(file_id, vec![peer_id]);
         }
     });
 

@@ -1,3 +1,4 @@
+// engine/src/watcher.rs
 use anyhow::Result;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -115,19 +116,19 @@ async fn handle_fs_event(
                     Err(_) => 0,
                 };
 
-                let (file_id, new_version, should_process) = {
+                let (file_id, new_version, should_process, existing_pinned) = {
                     let db = db.lock().unwrap();
                     match db.get_file_by_path(&relative_path) {
                         Ok(Some(existing)) => {
                             if existing.size == file_size {
-                                (existing.id.clone(), existing.version, false)
+                                (existing.id.clone(), existing.version, false, existing.pinned_devices)
                             } else {
-                                (existing.id.clone(), existing.version + 1, true)
+                                (existing.id.clone(), existing.version + 1, true, existing.pinned_devices)
                             }
                         }
                         _ => {
                             let new_id = format!("{}-{}", device_id, uuid::Uuid::new_v4().to_string().replace("-", ""));
-                            (new_id, 1, true)
+                            (new_id, 1, true, vec![device_id.clone()])
                         }
                     }
                 };
@@ -141,6 +142,7 @@ async fn handle_fs_event(
                     modified_time,
                     version: new_version,
                     created_by: device_id.clone(),
+                    pinned_devices: existing_pinned, // Inherit pins on modifications
                 };
 
                 {
@@ -149,6 +151,8 @@ async fn handle_fs_event(
                         println!("[Watcher] Failed to insert file metadata: {}", e);
                         continue;
                     }
+                    // Clear old blocks because the file changed
+                    let _ = db.clear_blocks_for_file(&file_id);
                     if let Err(e) = storage::chunk_and_store_file(&storage_dir, &db, &file_id, &path_str) {
                         println!("[Watcher] Failed to chunk file: {}", e);
                         continue;
@@ -172,16 +176,26 @@ async fn handle_fs_event(
                 let relative_path = path_str.strip_prefix(&watch_dir).unwrap_or(&path_str).trim_start_matches('/').to_string();
                 if relative_path.is_empty() { continue; }
 
-                println!("[Watcher] Detected local delete: {}", relative_path);
+                println!("[Watcher] Detected local delete (freeing space): {}", relative_path);
 
                 let db = db.lock().unwrap();
                 match db.get_file_by_path(&relative_path) {
                     Ok(Some(file)) => {
-                        // Local delete only. Do not propagate tombstones.
-                        match db.delete_file(&file.id) {
-                            Ok(_) => println!("[Watcher] Deleted file locally from DB: {}", relative_path),
-                            Err(e) => println!("[Watcher] Failed to delete file: {}", e),
+                        // "Free up space": Keep metadata, but mark blocks as missing and delete physical blocks
+                        let blocks = match db.get_blocks_for_file(&file.id) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                println!("[Watcher] Failed to get blocks for delete: {}", e);
+                                continue;
+                            }
+                        };
+
+                        for b in &blocks {
+                            let _ = db.set_block_present(&b.block_id, false);
+                            let block_path = storage::get_block_path(&storage_dir, &b.block_id);
+                            let _ = std::fs::remove_file(block_path);
                         }
+                        println!("[Watcher] Freed up space for file locally (metadata kept): {}", relative_path);
                     }
                     Ok(None) => {}
                     Err(e) => println!("[Watcher] DB lookup failed: {}", e),
