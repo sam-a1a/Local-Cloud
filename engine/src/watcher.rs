@@ -143,6 +143,8 @@ async fn handle_fs_event(
                         content_hash: known_hash.clone(),
                         modified_time,
                         created_by: device_id.clone(),
+                        trashed_at: 0,
+                        trashed_by: String::new(),
                     };
                     if let Err(e) = db.insert_file(&placeholder) {
                         println!("[Watcher] Failed to insert file metadata: {}", e);
@@ -177,6 +179,8 @@ async fn handle_fs_event(
                         content_hash: content_hash.clone(),
                         modified_time,
                         created_by: device_id.clone(),
+                        trashed_at: 0,
+                        trashed_by: String::new(),
                     };
                     if let Err(e) = db.insert_file(&file_meta) {
                         println!("[Watcher] Failed to record content hash: {}", e);

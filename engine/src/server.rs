@@ -311,7 +311,9 @@ async fn pair_confirm(
 async fn get_catalog(State(state): State<AppState>) -> Json<crate::db::Catalog> {
     let db = state.db.lock().unwrap();
     Json(crate::db::Catalog {
-        files: db.get_all_files().unwrap_or_default(),
+        // Trashed items travel too, or a peer that missed the deletion would
+        // keep listing the item as live.
+        files: db.get_catalog_files().unwrap_or_default(),
         holders: db.get_all_holders().unwrap_or_default(),
     })
 }

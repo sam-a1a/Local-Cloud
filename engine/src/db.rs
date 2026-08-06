@@ -21,6 +21,17 @@ pub struct FileMetadata {
     pub content_hash: String,
     pub modified_time: i64,
     pub created_by: String,
+    /// Unix seconds, or 0 while the item is live.
+    #[serde(default)]
+    pub trashed_at: i64,
+    #[serde(default)]
+    pub trashed_by: String,
+}
+
+impl FileMetadata {
+    pub fn is_trashed(&self) -> bool {
+        self.trashed_at != 0
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -87,7 +98,8 @@ fn holder_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileHolder> {
     })
 }
 
-const FILE_COLUMNS: &str = "id, path, size, content_hash, modified_time, created_by";
+const FILE_COLUMNS: &str =
+    "id, path, size, content_hash, modified_time, created_by, trashed_at, trashed_by";
 
 fn file_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileMetadata> {
     Ok(FileMetadata {
@@ -97,6 +109,8 @@ fn file_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileMetadata> {
         content_hash: row.get(3)?,
         modified_time: row.get(4)?,
         created_by: row.get(5)?,
+        trashed_at: row.get(6)?,
+        trashed_by: row.get(7)?,
     })
 }
 
@@ -113,9 +127,11 @@ impl Database {
                 paired_at INTEGER NOT NULL, last_seen INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS files (
-                id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, size INTEGER NOT NULL,
+                id TEXT PRIMARY KEY, path TEXT NOT NULL, size INTEGER NOT NULL,
                 content_hash TEXT NOT NULL DEFAULT '',
-                modified_time INTEGER NOT NULL, created_by TEXT NOT NULL
+                modified_time INTEGER NOT NULL, created_by TEXT NOT NULL,
+                trashed_at INTEGER NOT NULL DEFAULT 0,
+                trashed_by TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS blocks (
                 id TEXT PRIMARY KEY, size INTEGER NOT NULL, is_present INTEGER NOT NULL DEFAULT 0
@@ -151,15 +167,71 @@ impl Database {
     /// columns have to be applied separately.
     fn migrate(&self) -> Result<()> {
         self.add_column_if_missing("devices", "platform", "TEXT NOT NULL DEFAULT ''")?;
-        self.add_column_if_missing("files", "content_hash", "TEXT NOT NULL DEFAULT ''")?;
 
-        // Both belonged to the merge-and-pin model that no longer exists.
+        // Older files tables need a full rebuild rather than added columns.
+        // They declare path as inline UNIQUE, which would keep a trashed item
+        // holding on to its name forever, and an inline constraint cannot be
+        // dropped in place. The rebuild also sheds the merge-and-pin columns:
         // version ordered concurrent edits, which cannot happen now that copies
-        // never propagate on their own; pinned_devices recorded where data
+        // never propagate on their own, and pinned_devices recorded where data
         // *should* go, which file_holders replaces with where it actually is.
-        self.drop_column_if_present("files", "version")?;
-        self.drop_column_if_present("files", "pinned_devices")?;
+        if !self.has_column("files", "trashed_at")? {
+            self.rebuild_files_table()?;
+        }
+
+        // Created here rather than alongside the table, because on an older
+        // database the column it filters on does not exist until the rebuild
+        // above has run.
+        //
+        // Names are unique among live items only: a trashed item keeps its path
+        // for restore but stops owning the name, which is what lets Override
+        // move the old content aside and reuse it.
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_live_path
+                ON files(path) WHERE trashed_at = 0",
+        )?;
         Ok(())
+    }
+
+    fn rebuild_files_table(&self) -> Result<()> {
+        // Intermediate databases already have content_hash; the earliest ones
+        // do not, and start with an empty hash until their files are reindexed.
+        let content_hash = if self.has_column("files", "content_hash")? {
+            "content_hash"
+        } else {
+            "''"
+        };
+
+        // file_blocks references files(id), so the old table cannot be dropped
+        // with enforcement on. This has to sit outside the transaction: the
+        // pragma is a no-op inside one.
+        self.conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+
+        let result = (|| -> Result<()> {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(&format!(
+                "CREATE TABLE files_rebuilt (
+                    id TEXT PRIMARY KEY, path TEXT NOT NULL, size INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    modified_time INTEGER NOT NULL, created_by TEXT NOT NULL,
+                    trashed_at INTEGER NOT NULL DEFAULT 0,
+                    trashed_by TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO files_rebuilt
+                    (id, path, size, content_hash, modified_time, created_by)
+                    SELECT id, path, size, {}, modified_time, created_by FROM files;
+                 DROP TABLE files;
+                 ALTER TABLE files_rebuilt RENAME TO files;",
+                content_hash
+            ))?;
+            tx.commit()?;
+            Ok(())
+        })();
+
+        // Restore enforcement even if the rebuild failed, so a partial
+        // migration cannot leave the connection silently unprotected.
+        self.conn.execute_batch("PRAGMA foreign_keys=ON")?;
+        result
     }
 
     fn column_names(&self, table: &str) -> Result<Vec<String>> {
@@ -170,20 +242,16 @@ impl Database {
         Ok(names)
     }
 
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        Ok(self.column_names(table)?.iter().any(|c| c == column))
+    }
+
     fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
-        if !self.column_names(table)?.iter().any(|c| c == column) {
+        if !self.has_column(table, column)? {
             self.conn.execute_batch(&format!(
                 "ALTER TABLE {} ADD COLUMN {} {}",
                 table, column, definition
             ))?;
-        }
-        Ok(())
-    }
-
-    fn drop_column_if_present(&self, table: &str, column: &str) -> Result<()> {
-        if self.column_names(table)?.iter().any(|c| c == column) {
-            self.conn
-                .execute_batch(&format!("ALTER TABLE {} DROP COLUMN {}", table, column))?;
         }
         Ok(())
     }
@@ -261,24 +329,42 @@ impl Database {
 
     pub fn insert_file(&self, file: &FileMetadata) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO files (id, path, size, content_hash, modified_time, created_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO files
+                (id, path, size, content_hash, modified_time, created_by, trashed_at, trashed_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 file.id,
                 file.path,
                 file.size,
                 file.content_hash,
                 file.modified_time,
-                file.created_by
+                file.created_by,
+                file.trashed_at,
+                file.trashed_by
             ],
         )?;
         Ok(())
     }
 
+    /// Live items only. This is the catalog as a person sees it.
     pub fn get_all_files(&self) -> Result<Vec<FileMetadata>> {
+        self.query_files("SELECT {} FROM files WHERE trashed_at = 0")
+    }
+
+    /// Live and trashed together, for replicating to a peer. Trash state has to
+    /// travel or a device that missed the deletion would keep offering the item.
+    pub fn get_catalog_files(&self) -> Result<Vec<FileMetadata>> {
+        self.query_files("SELECT {} FROM files")
+    }
+
+    pub fn get_trashed_files(&self) -> Result<Vec<FileMetadata>> {
+        self.query_files("SELECT {} FROM files WHERE trashed_at != 0 ORDER BY trashed_at DESC")
+    }
+
+    fn query_files(&self, sql_template: &str) -> Result<Vec<FileMetadata>> {
         let mut stmt = self
             .conn
-            .prepare(&format!("SELECT {} FROM files", FILE_COLUMNS))?;
+            .prepare(&sql_template.replace("{}", FILE_COLUMNS))?;
         let files = stmt.query_map([], file_from_row)?;
 
         let mut result = Vec::new();
@@ -286,6 +372,49 @@ impl Database {
             result.push(file?);
         }
         Ok(result)
+    }
+
+    /// Moves an item aside without destroying it: its blocks and holder rows
+    /// stay put, and its name becomes available again.
+    pub fn trash_file(&self, file_id: &str, trashed_by: &str, trashed_at: i64) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE files SET trashed_at = ?1, trashed_by = ?2 WHERE id = ?3 AND trashed_at = 0",
+            rusqlite::params![trashed_at, trashed_by, file_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("No live item with that id");
+        }
+        Ok(())
+    }
+
+    /// Brings a trashed item back. Fails if something else took its name in the
+    /// meantime, rather than silently restoring it under a different one.
+    pub fn restore_file(&self, file_id: &str) -> Result<()> {
+        let path: String = self.conn.query_row(
+            "SELECT path FROM files WHERE id = ?1 AND trashed_at != 0",
+            rusqlite::params![file_id],
+            |row| row.get(0),
+        )?;
+
+        if self.is_path_taken(&path)? {
+            anyhow::bail!("\"{}\" is in use by another item", path);
+        }
+
+        self.conn.execute(
+            "UPDATE files SET trashed_at = 0, trashed_by = '' WHERE id = ?1",
+            rusqlite::params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a live item already owns this name.
+    pub fn is_path_taken(&self, path: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path = ?1 AND trashed_at = 0",
+            rusqlite::params![path],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn get_file_by_id(&self, file_id: &str) -> Result<Option<FileMetadata>> {
@@ -309,22 +438,36 @@ impl Database {
     /// the user at send time rather than being silently merged here.
     pub fn upsert_file_from_catalog(&self, file: &FileMetadata) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO files (id, path, size, content_hash, modified_time, created_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO files
+                (id, path, size, content_hash, modified_time, created_by, trashed_at, trashed_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 path = excluded.path,
                 size = excluded.size,
                 content_hash = excluded.content_hash,
                 modified_time = excluded.modified_time,
-                created_by = excluded.created_by",
+                created_by = excluded.created_by,
+                trashed_at = excluded.trashed_at,
+                trashed_by = excluded.trashed_by",
             rusqlite::params![
                 file.id,
                 file.path,
                 file.size,
                 file.content_hash,
                 file.modified_time,
-                file.created_by
+                file.created_by,
+                file.trashed_at,
+                file.trashed_by
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Renames an item. Fails rather than clobbering if the name is taken.
+    pub fn set_file_path(&self, file_id: &str, path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET path = ?1 WHERE id = ?2",
+            rusqlite::params![path, file_id],
         )?;
         Ok(())
     }
@@ -577,11 +720,16 @@ impl Database {
         Ok(())
     }
 
+    /// The live item at this name, if any. Trashed items are excluded: they
+    /// keep their path for restore but no longer own the name.
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
         let result = self
             .conn
             .query_row(
-                &format!("SELECT {} FROM files WHERE path = ?1", FILE_COLUMNS),
+                &format!(
+                    "SELECT {} FROM files WHERE path = ?1 AND trashed_at = 0",
+                    FILE_COLUMNS
+                ),
                 rusqlite::params![path],
                 file_from_row,
             )
@@ -695,6 +843,98 @@ mod tests {
         assert_eq!(db.holder_count("f2").unwrap(), 0);
     }
 
+    fn file(id: &str, path: &str) -> FileMetadata {
+        FileMetadata {
+            id: id.to_string(),
+            path: path.to_string(),
+            size: 10,
+            content_hash: format!("hash-{}", id),
+            modified_time: 1_700_000_000,
+            created_by: "android".to_string(),
+            trashed_at: 0,
+            trashed_by: String::new(),
+        }
+    }
+
+    #[test]
+    fn two_live_items_cannot_share_a_name() {
+        let db = db();
+        db.insert_file(&file("f1", "example.txt")).unwrap();
+
+        assert!(db.is_path_taken("example.txt").unwrap());
+        assert!(
+            db.upsert_file_from_catalog(&file("f2", "example.txt")).is_err(),
+            "a second item must not be able to take a live name"
+        );
+    }
+
+    #[test]
+    fn trashing_frees_the_name_without_destroying_the_item() {
+        let db = db();
+        db.insert_file(&file("f1", "example.txt")).unwrap();
+        db.set_holder(&holder("f1", "android", "hash-f1")).unwrap();
+
+        db.trash_file("f1", "iphone", 1_700_000_900).unwrap();
+
+        // The name is available again, so Override can reuse it.
+        assert!(!db.is_path_taken("example.txt").unwrap());
+        db.upsert_file_from_catalog(&file("f2", "example.txt")).unwrap();
+
+        // The old item is still there, still with its copy attached.
+        assert!(db.get_file_by_path("example.txt").unwrap().unwrap().id == "f2");
+        assert_eq!(db.get_trashed_files().unwrap().len(), 1);
+        assert_eq!(db.holder_count("f1").unwrap(), 1);
+
+        let trashed = &db.get_trashed_files().unwrap()[0];
+        assert_eq!(trashed.id, "f1");
+        assert_eq!(trashed.trashed_by, "iphone");
+        assert!(trashed.is_trashed());
+    }
+
+    #[test]
+    fn trashed_items_are_hidden_from_the_catalog_but_still_replicate() {
+        let db = db();
+        db.insert_file(&file("f1", "a.txt")).unwrap();
+        db.insert_file(&file("f2", "b.txt")).unwrap();
+        db.trash_file("f2", "macos", 1).unwrap();
+
+        // A person sees only live items...
+        let live = db.get_all_files().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, "f1");
+
+        // ...but peers must learn about the deletion.
+        assert_eq!(db.get_catalog_files().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn restoring_returns_the_item_unless_its_name_was_taken() {
+        let db = db();
+        db.insert_file(&file("f1", "example.txt")).unwrap();
+        db.trash_file("f1", "macos", 1).unwrap();
+
+        db.restore_file("f1").unwrap();
+        assert!(db.is_path_taken("example.txt").unwrap());
+        assert!(db.get_trashed_files().unwrap().is_empty());
+
+        // Trash it again, let something else claim the name, and restoring
+        // must refuse rather than quietly renaming or clobbering.
+        db.trash_file("f1", "macos", 2).unwrap();
+        db.insert_file(&file("f2", "example.txt")).unwrap();
+        assert!(db.restore_file("f1").is_err());
+    }
+
+    #[test]
+    fn trashing_is_not_repeatable() {
+        let db = db();
+        db.insert_file(&file("f1", "a.txt")).unwrap();
+        db.trash_file("f1", "macos", 1).unwrap();
+        assert!(
+            db.trash_file("f1", "macos", 2).is_err(),
+            "an already-trashed item has no live copy to move aside"
+        );
+    }
+
     #[test]
     fn an_old_database_migrates_without_losing_rows() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -723,18 +963,31 @@ mod tests {
         let db = Database::init(&path).expect("migrate");
 
         // Nothing was dropped on the way.
-        let file = db.get_file_by_path("notes.txt").expect("query").expect("row");
-        assert_eq!(file.id, "f1");
-        assert_eq!(file.created_by, "android");
-        assert_eq!(file.size, 10);
+        let migrated = db.get_file_by_path("notes.txt").expect("query").expect("row");
+        assert_eq!(migrated.id, "f1");
+        assert_eq!(migrated.created_by, "android");
+        assert_eq!(migrated.size, 10);
         assert!(db.is_paired("d1").expect("query"));
         assert_eq!(db.get_paired_devices().expect("query")[0].name, "MacBook");
 
-        // The merge-and-pin columns are gone and the content hash is in place.
+        // The merge-and-pin columns are gone and the new ones are in place.
         let columns = db.column_names("files").expect("columns");
         assert!(!columns.iter().any(|c| c == "version"));
         assert!(!columns.iter().any(|c| c == "pinned_devices"));
         assert!(columns.iter().any(|c| c == "content_hash"));
+        assert!(columns.iter().any(|c| c == "trashed_at"));
+
+        // The inline UNIQUE(path) is gone, replaced by uniqueness among live
+        // items only - otherwise a trashed item would own its name forever.
+        db.trash_file("f1", "macos", 1).expect("trash");
+        db.upsert_file_from_catalog(&file("f2", "notes.txt"))
+            .expect("a trashed name must be reusable");
+
+        // Blocks still reference files after the rebuild.
+        db.insert_block(&BlockMetadata { id: "b1".into(), size: 1, is_present: 1 })
+            .expect("block");
+        db.map_block_to_file("f2", "b1", 0)
+            .expect("foreign key survived the rebuild");
 
         // Migrating twice must be a no-op rather than an error.
         drop(db);

@@ -383,6 +383,19 @@ impl Engine {
         }
     }
 
+    /// Items that have been moved aside. Their bytes are still on whichever
+    /// devices held them, so restoring is possible until they are purged.
+    pub fn get_trashed_files(&self) -> Vec<FileMetadata> {
+        let db = self.db.lock().unwrap();
+        db.get_trashed_files().unwrap_or_default()
+    }
+
+    /// Brings a trashed item back under its original name.
+    pub fn restore_file(&self, file_id: String) -> Result<(), EngineError> {
+        let db = self.db.lock().unwrap();
+        db.restore_file(&file_id).map_err(EngineError::from)
+    }
+
     /// Which devices hold this item, and which content each one has.
     pub fn get_file_holders(&self, file_id: &str) -> Vec<db::FileHolder> {
         let db = self.db.lock().unwrap();
