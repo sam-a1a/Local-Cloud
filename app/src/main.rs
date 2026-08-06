@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use localcloud::db::{FileHolder, PairedDevice};
-use localcloud::{Engine, FileMetadata};
+use localcloud::{CollisionResolution, Engine, FileMetadata, PendingCollision};
 use std::sync::Arc;
 
 fn main() {
@@ -98,6 +98,8 @@ fn app() -> Element {
     let mut holders = use_signal(Vec::new);
     let mut peers = use_signal(Vec::new);
     let mut paired = use_signal(Vec::new);
+    let mut collisions = use_signal(Vec::new);
+    let mut trashed = use_signal(Vec::new);
     let mut logs = use_signal(Vec::new);
 
     // Dedicated clone for the background poller so `engine` stays usable
@@ -123,6 +125,8 @@ fn app() -> Element {
                 holders.write().clone_from(&catalog.holders);
                 peers.write().clone_from(&poll_engine.get_known_peers());
                 paired.write().clone_from(&poll_engine.paired_devices());
+                collisions.write().clone_from(&poll_engine.pending_collisions());
+                trashed.write().clone_from(&poll_engine.get_trashed_files());
             }
         }
     });
@@ -145,6 +149,16 @@ fn app() -> Element {
                             span { color: "gray", " · not paired" }
                         }
                     }
+                }
+            }
+
+            if !collisions.read().is_empty() {
+                h2 { "Name conflicts ({collisions.read().len()})" }
+                p { font_size: "12px", color: "gray",
+                    "Both files were kept, so nothing is lost. Override gives the name to the new file and moves the old one to Trash."
+                }
+                for collision in collisions.read().iter().cloned() {
+                    { collision_row(collision, engine.clone()) }
                 }
             }
 
@@ -188,6 +202,16 @@ fn app() -> Element {
                         }
                     },
                     "Share first item with first paired device"
+                }
+            }
+
+            if !trashed.read().is_empty() {
+                h2 { "Trash ({trashed.read().len()})" }
+                p { font_size: "12px", color: "gray",
+                    "Still held by whichever devices had them, so these can be brought back."
+                }
+                for file in trashed.read().iter().cloned() {
+                    { trashed_row(file, engine.clone()) }
                 }
             }
 
@@ -251,6 +275,61 @@ fn catalog_rows(
             (file.clone(), summary)
         })
         .collect()
+}
+
+fn collision_row(collision: PendingCollision, engine: Arc<Engine>) -> Element {
+    let requested = collision.requested_path.clone();
+    let current = collision.current_path.clone();
+    let created_by: String = collision.existing_created_by.chars().take(8).collect();
+
+    let override_engine = engine.clone();
+    let override_id = collision.id.clone();
+    let keep_id = collision.id.clone();
+
+    rsx! {
+        div { border: "1px solid #ddd", padding: "10px", margin_bottom: "8px",
+            p { margin: "0 0 6px 0",
+                "\"{requested}\" was already taken by an item from {created_by}. Kept as \"{current}\"."
+            }
+            button {
+                onclick: move |_| {
+                    if let Err(e) = override_engine
+                        .resolve_collision(override_id.clone(), CollisionResolution::Override)
+                    {
+                        println!("[UI] Override failed: {}", e);
+                    }
+                },
+                "Override"
+            }
+            button {
+                margin_left: "8px",
+                onclick: move |_| {
+                    let _ = engine.resolve_collision(keep_id.clone(), CollisionResolution::KeepBoth);
+                },
+                "Keep both"
+            }
+        }
+    }
+}
+
+fn trashed_row(file: FileMetadata, engine: Arc<Engine>) -> Element {
+    let path = file.path.clone();
+    let file_id = file.id.clone();
+
+    rsx! {
+        div { padding: "4px 0",
+            span { "{path}" }
+            button {
+                margin_left: "8px",
+                onclick: move |_| {
+                    if let Err(e) = engine.restore_file(file_id.clone()) {
+                        println!("[UI] Restore failed: {}", e);
+                    }
+                },
+                "Restore"
+            }
+        }
+    }
 }
 
 fn file_row(file: FileMetadata, holders: String, engine: Arc<Engine>) -> Element {

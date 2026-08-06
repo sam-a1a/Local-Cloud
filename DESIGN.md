@@ -130,18 +130,38 @@ the only one that goes through trash.
 
 ## 7. Name collisions
 
-Two different files can want the same name in a shared namespace. When a send
-would collide, the sender is prompted:
+A name is owned by exactly one live item across the whole mesh, so two different
+files can want the same one:
 
-- **Keep both** — the incoming file is renamed with a numeric suffix
-  (`example.txt` → `example 1.txt`). Two independent items, two holder sets.
-- **Override** — the catalog entry now points at the new content. The previous
-  content goes to trash under the same 30-day rule, so an accidental override is
-  recoverable.
+- **Keep both** — the incoming file gets a numeric suffix (`example.txt` →
+  `example 1.txt`). Two independent items, two holder sets.
+- **Override** — the incoming item takes the name and the previous one goes to
+  trash, so an accidental override is recoverable.
 
-Re-sending an edited file to a device that already has it is the same operation:
-it collides, and Override is how you refresh a stale copy. Updating a copy and
-resolving a name clash are one mechanism, not two.
+**Asking cannot block indexing.** The watcher runs in the background, and on
+mobile the app may not even be foregrounded, so a prompt that had to be answered
+before the file could be recorded would either stall or drop it. Keep both is
+therefore applied immediately — it cannot lose anything — and the conflict is
+surfaced with Override offered as a follow-up. The user still sees a prompt with
+two buttons; the difference is that ignoring it destroys nothing.
+
+Override is atomic: the previous owner goes to trash and the incoming item takes
+the name, or neither happens. Half of it would leave an item trashed for a name
+it never received.
+
+**Editing versus colliding** is decided by whether this device already holds the
+item at that path. If it does, the file was edited. If another device's item owns
+the name, this is a different file that happens to share it.
+
+**Two devices that were apart** can each create an item with the same name, and a
+sync cannot stop to ask. There the tie-break is the item id: the smaller one
+keeps the name. Both devices hold both ids, so each reaches the same answer alone
+and they converge with no extra round trip. It is still recorded as a conflict,
+so Override remains available afterwards.
+
+Whenever an item this device holds is moved aside, the sync folder is renamed
+with it — the folder and the catalog must never disagree about what a file is
+called.
 
 ---
 
@@ -252,11 +272,10 @@ pinned at pairing time.
 
 1. ~~**Pairing** — 6-digit code protocol replacing trust-on-first-use.~~ **Done.**
 2. ~~**Holder sets** — `file_holders` with per-copy content hashes.~~ **Done.**
-3. **Push** — the collision prompt. `share_to(item, targets)` transfers, but a
-   recipient that already has a different item at the same path rejects the
-   metadata instead of offering Override or Keep both.
-4. **Pull, delete, trash** — `/request_delete` with offline queueing, the
-   30-day retention and its sweep, and restore.
+3. ~~**Push** — the collision prompt, and the trash storage Override needs.~~
+   **Done.**
+4. **Pull, delete, trash** — `/request_delete` with offline queueing, the 30-day
+   retention and its sweep, and permanent delete. Restore already works.
 5. **Platform surfaces** — folder invariant on desktop, `import_file()` on mobile.
 6. **Performance and cleanup** — block size, batched transfer, catalog sync on
    peer discovery.
@@ -264,9 +283,11 @@ pinned at pairing time.
 Steps 1 and 2 were load-bearing: everything after assumes trusted peers and a
 truthful holder set.
 
-Until step 4 lands, deleting the last copy of an item leaves the catalog entry
-in place with an empty holder set rather than moving it to trash. Nothing is
-silently destroyed, but nothing is recoverable either.
+Until step 4 lands, deleting the last copy of an item leaves the catalog entry in
+place with an empty holder set rather than moving it to trash. Nothing is
+silently destroyed. Trash itself exists and is reachable — Override puts content
+there and Restore brings it back — but only Override currently routes anything
+into it, and nothing is ever purged.
 
 ---
 
@@ -289,6 +310,12 @@ silently destroyed, but nothing is recoverable either.
 - Blocks are stored unencrypted at rest.
 - A device's certificate is pinned for good; there is no rotation path, so a
   compromised key means unpairing and pairing again.
+- `share_to` does not consult the collision rules. Since the catalog is shared,
+  an item being sent already owns its name everywhere, so a send cannot create a
+  conflict — but a recipient whose catalog has not caught up will reject the
+  metadata until its next sync.
+- The on-disk renames that keep the sync folder in step with the catalog have no
+  automated test, because driving real filesystem events is timing-dependent.
 
 Fixed since the first draft: the committed `identity.json`, the two fail-open
 TLS paths, trust-on-first-use in `sync_with_peer`, and the hardcoded
