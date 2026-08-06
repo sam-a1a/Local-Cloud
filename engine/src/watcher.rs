@@ -13,6 +13,14 @@ use crate::EngineEvent;
 
 type DebounceMap = Arc<Mutex<HashMap<String, Instant>>>;
 
+fn new_file_id(device_id: &str) -> String {
+    format!(
+        "{}-{}",
+        device_id,
+        uuid::Uuid::new_v4().to_string().replace("-", "")
+    )
+}
+
 pub fn start_watcher(
     watch_dir: String,
     storage_dir: String,
@@ -20,6 +28,7 @@ pub fn start_watcher(
     db: Arc<Mutex<Database>>,
     handle: Handle,
     ignore_set: IgnoreSet,
+    collisions: crate::collision::CollisionQueue,
     event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<RecommendedWatcher> {
     let watch_path = watch_dir.clone();
@@ -34,6 +43,7 @@ pub fn start_watcher(
                 let watch_dir_clone = watch_dir.clone();
                 let ignore_clone = ignore_set.clone();
                 let debounce_clone = debounce_map.clone();
+                let collisions_clone = collisions.clone();
                 let event_tx_clone = event_tx.clone();
 
                 handle.spawn(async move {
@@ -45,6 +55,7 @@ pub fn start_watcher(
                         watch_dir_clone,
                         ignore_clone,
                         debounce_clone,
+                        collisions_clone,
                         event_tx_clone,
                     )
                         .await;
@@ -68,6 +79,7 @@ async fn handle_fs_event(
     watch_dir: String,
     ignore_set: IgnoreSet,
     debounce_map: DebounceMap,
+    collisions: crate::collision::CollisionQueue,
     event_tx: mpsc::Sender<EngineEvent>,
 ) {
     match event.kind {
@@ -116,18 +128,87 @@ async fn handle_fs_event(
                     Err(_) => 0,
                 };
 
-                let (file_id, known_hash) = {
+                // A name is owned by exactly one live item across the whole
+                // mesh. If this device already holds the item at this path then
+                // the file was edited; if another device's item owns the name,
+                // this is an unrelated file that happens to share it.
+                let existing_owner = {
                     let db = db.lock().unwrap();
                     match db.get_file_by_path(&relative_path) {
-                        Ok(Some(existing)) => (existing.id, existing.content_hash),
-                        _ => {
-                            let new_id = format!(
-                                "{}-{}",
-                                device_id,
-                                uuid::Uuid::new_v4().to_string().replace("-", "")
-                            );
-                            (new_id, String::new())
+                        Ok(Some(existing)) => {
+                            let ours = db.is_holder(&existing.id, &device_id).unwrap_or(false);
+                            if ours { None } else { Some(existing) }
                         }
+                        _ => None,
+                    }
+                };
+
+                let (relative_path, path_str, file_id, known_hash) = match existing_owner {
+                    None => {
+                        let db = db.lock().unwrap();
+                        match db.get_file_by_path(&relative_path) {
+                            Ok(Some(existing)) => (
+                                relative_path,
+                                path_str,
+                                existing.id,
+                                existing.content_hash,
+                            ),
+                            _ => (relative_path, path_str, new_file_id(&device_id), String::new()),
+                        }
+                    }
+                    Some(existing) => {
+                        // Keep both, which cannot lose anything, and surface the
+                        // conflict so Override stays available as a decision.
+                        let free_path = {
+                            let db = db.lock().unwrap();
+                            crate::collision::next_available_path(&relative_path, |candidate| {
+                                db.is_path_taken(candidate).unwrap_or(true)
+                                    || Path::new(&format!("{}/{}", watch_dir, candidate)).exists()
+                            })
+                        };
+                        let free_abs = format!("{}/{}", watch_dir, free_path);
+
+                        // Rename on disk too: on desktop the folder is supposed
+                        // to show exactly what this device holds, so the two
+                        // must not disagree about what the file is called.
+                        crate::ignore::mark_ignored(&ignore_set, &path_str);
+                        crate::ignore::mark_ignored(&ignore_set, &free_abs);
+                        if let Err(e) = std::fs::rename(&path_str, &free_abs) {
+                            println!("[Watcher] Failed to rename colliding file: {}", e);
+                            continue;
+                        }
+                        crate::ignore::schedule_unmark_ignored(
+                            ignore_set.clone(),
+                            path_str.clone(),
+                            3,
+                        );
+                        crate::ignore::schedule_unmark_ignored(
+                            ignore_set.clone(),
+                            free_abs.clone(),
+                            3,
+                        );
+
+                        let file_id = new_file_id(&device_id);
+                        collisions.record(crate::collision::PendingCollision {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            incoming_file_id: file_id.clone(),
+                            requested_path: relative_path.clone(),
+                            current_path: free_path.clone(),
+                            existing_file_id: existing.id.clone(),
+                            existing_created_by: existing.created_by.clone(),
+                            detected_at: modified_time,
+                        });
+
+                        println!(
+                            "[Watcher] \"{}\" is taken; kept as \"{}\"",
+                            relative_path, free_path
+                        );
+                        let _ = event_tx.send(EngineEvent::NameCollision {
+                            requested_path: relative_path,
+                            kept_as: free_path.clone(),
+                        });
+
+                        (free_path, free_abs, file_id, String::new())
                     }
                 };
 
@@ -243,6 +324,10 @@ async fn handle_fs_event(
                         if let Err(e) = db.remove_holder(&file.id, &device_id) {
                             println!("[Watcher] Failed to drop holder row: {}", e);
                         }
+
+                        // A conflict about a file that is gone is no longer a
+                        // question anyone can answer.
+                        collisions.forget_file(&file.id);
 
                         let remaining = db.holder_count(&file.id).unwrap_or(0);
                         if remaining == 0 {

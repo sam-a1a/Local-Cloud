@@ -387,6 +387,40 @@ impl Database {
         Ok(())
     }
 
+    /// Hands a name from one item to another, atomically.
+    ///
+    /// Either the previous owner goes to trash and the incoming item takes the
+    /// name, or nothing changes. Doing it in two steps could leave an item
+    /// trashed for a name it never received.
+    pub fn override_file(
+        &self,
+        existing_file_id: &str,
+        incoming_file_id: &str,
+        path: &str,
+        trashed_by: &str,
+        trashed_at: i64,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let moved = tx.execute(
+            "UPDATE files SET trashed_at = ?1, trashed_by = ?2 WHERE id = ?3 AND trashed_at = 0",
+            rusqlite::params![trashed_at, trashed_by, existing_file_id],
+        )?;
+        if moved == 0 {
+            anyhow::bail!("The item being overridden is no longer live");
+        }
+
+        // Rejected by the live-path index if anything else claimed the name in
+        // the meantime, which rolls the trash back with it.
+        tx.execute(
+            "UPDATE files SET path = ?1 WHERE id = ?2",
+            rusqlite::params![path, incoming_file_id],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Brings a trashed item back. Fails if something else took its name in the
     /// meantime, rather than silently restoring it under a different one.
     pub fn restore_file(&self, file_id: &str) -> Result<()> {
@@ -922,6 +956,61 @@ mod tests {
         db.trash_file("f1", "macos", 2).unwrap();
         db.insert_file(&file("f2", "example.txt")).unwrap();
         assert!(db.restore_file("f1").is_err());
+    }
+
+    #[test]
+    fn override_hands_the_name_over_and_keeps_the_old_item() {
+        let db = db();
+
+        // Another device's item owns the name, and holds the only copy.
+        db.insert_file(&file("existing", "example.txt")).unwrap();
+        db.set_holder(&holder("existing", "android", "hash-existing"))
+            .unwrap();
+
+        // Ours arrived and was kept under a free name.
+        db.insert_file(&file("incoming", "example 1.txt")).unwrap();
+        db.set_holder(&holder("incoming", "linux", "hash-incoming"))
+            .unwrap();
+
+        db.override_file("existing", "incoming", "example.txt", "linux", 1_700_000_900)
+            .unwrap();
+
+        let live = db.get_file_by_path("example.txt").unwrap().unwrap();
+        assert_eq!(live.id, "incoming");
+        assert_eq!(db.get_all_files().unwrap().len(), 1);
+
+        // The overridden content is not gone: still trashed, still on Android,
+        // so it can be restored.
+        let trashed = db.get_trashed_files().unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].id, "existing");
+        assert_eq!(db.holder_count("existing").unwrap(), 1);
+    }
+
+    #[test]
+    fn a_failed_override_changes_nothing() {
+        let db = db();
+        db.insert_file(&file("existing", "old.txt")).unwrap();
+        db.insert_file(&file("incoming", "example 1.txt")).unwrap();
+        // Something else already owns the name the incoming item is aiming for.
+        db.insert_file(&file("other", "example.txt")).unwrap();
+
+        assert!(db
+            .override_file("existing", "incoming", "example.txt", "linux", 2)
+            .is_err());
+
+        // The item being overridden must not be left trashed for a name it
+        // never received.
+        assert!(db.get_trashed_files().unwrap().is_empty());
+        assert!(!db
+            .get_file_by_path("old.txt")
+            .unwrap()
+            .unwrap()
+            .is_trashed());
+        assert_eq!(
+            db.get_file_by_path("example 1.txt").unwrap().unwrap().id,
+            "incoming"
+        );
     }
 
     #[test]

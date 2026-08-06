@@ -1,4 +1,5 @@
 // engine/src/lib.rs
+pub mod collision;
 pub mod crypto;
 pub mod db;
 pub mod discovery;
@@ -16,6 +17,7 @@ pub use db::FileBlock;
 pub use db::PairedDevice;
 pub use db::Tombstone;
 pub use pairing::{PairingOffer, PairingState};
+pub use collision::{CollisionQueue, CollisionResolution, PendingCollision};
 pub use crypto::DeviceIdentity;
 pub use discovery::{DiscoveredDevice, PeerMap};
 pub use ignore::{new_ignore_set, IgnoreSet};
@@ -48,6 +50,8 @@ pub enum EngineEvent {
     PairingRequested { device_id: String, name: String, platform: String },
     DevicePaired { device_id: String, name: String },
     PairingFailed { device_id: String, reason: String },
+    NameCollision { requested_path: String, kept_as: String },
+    CollisionResolved { path: String },
     FileIndexed { path: String },
     FileSent { path: String },
     FileDownloaded { path: String },
@@ -69,6 +73,7 @@ pub struct Engine {
     known_peers: PeerMap,
     trust: TrustStore,
     pairing: PairingState,
+    collisions: CollisionQueue,
 }
 
 impl Engine {
@@ -119,6 +124,7 @@ impl Engine {
             known_peers,
             trust,
             pairing: PairingState::new(),
+            collisions: CollisionQueue::new(),
         })
     }
 
@@ -383,6 +389,72 @@ impl Engine {
         }
     }
 
+    // ---- Name collisions ----
+
+    /// Conflicts kept both ways for safety, still awaiting a decision.
+    pub fn pending_collisions(&self) -> Vec<PendingCollision> {
+        self.collisions.pending()
+    }
+
+    /// Applies a decision to a name conflict.
+    ///
+    /// `KeepBoth` confirms what already happened. `Override` gives the name to
+    /// the incoming item and moves the previous one to trash, where it stays
+    /// restorable rather than being destroyed.
+    pub fn resolve_collision(
+        &self,
+        collision_id: String,
+        resolution: CollisionResolution,
+    ) -> Result<(), EngineError> {
+        let collision = self
+            .collisions
+            .take(&collision_id)
+            .ok_or_else(|| EngineError::from("No such collision, or it was already resolved"))?;
+
+        if resolution == CollisionResolution::KeepBoth {
+            return Ok(());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        {
+            let db = self.db.lock().unwrap();
+            if let Err(e) = db.override_file(
+                &collision.existing_file_id,
+                &collision.incoming_file_id,
+                &collision.requested_path,
+                &self.identity.device_id,
+                now,
+            ) {
+                // Nothing changed, so put the question back rather than
+                // silently dropping the decision.
+                self.collisions.record(collision);
+                return Err(EngineError::from(e));
+            }
+        }
+
+        // Keep the sync folder agreeing with the catalog about the name.
+        let from = format!("{}/{}", self.sync_dir, collision.current_path);
+        let to = format!("{}/{}", self.sync_dir, collision.requested_path);
+        if std::path::Path::new(&from).exists() {
+            ignore::mark_ignored(&self.ignore_set, &from);
+            ignore::mark_ignored(&self.ignore_set, &to);
+            if let Err(e) = std::fs::rename(&from, &to) {
+                println!("[Engine] Renamed in catalog but not on disk: {}", e);
+            }
+            ignore::schedule_unmark_ignored(self.ignore_set.clone(), from, 3);
+            ignore::schedule_unmark_ignored(self.ignore_set.clone(), to, 3);
+        }
+
+        let _ = self.event_tx.send(EngineEvent::CollisionResolved {
+            path: collision.requested_path,
+        });
+        Ok(())
+    }
+
     /// Items that have been moved aside. Their bytes are still on whichever
     /// devices held them, so restoring is possible until they are purged.
     pub fn get_trashed_files(&self) -> Vec<FileMetadata> {
@@ -612,6 +684,7 @@ impl Engine {
             watch_db,
             handle,
             watch_ignore,
+            self.collisions.clone(),
             watch_tx,
         ).map_err(EngineError::from)?;
 
