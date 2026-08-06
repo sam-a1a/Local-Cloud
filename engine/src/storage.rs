@@ -83,6 +83,16 @@ pub fn write_block(base_dir: &str, block_id: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Deletes a stored block. Callers must have established that nothing else
+/// references it - see `Database::blocks_exclusive_to_file`.
+pub fn remove_block(base_dir: &str, block_id: &str) -> Result<()> {
+    let path = get_block_path(base_dir, block_id);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 pub fn assemble_file_from_blocks(base_dir: &str, output_path: &str, blocks: &[FileBlock]) -> Result<()> {
     let mut file = File::create(output_path)?;
     for block in blocks {

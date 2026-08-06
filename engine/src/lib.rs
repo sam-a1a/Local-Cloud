@@ -52,6 +52,8 @@ pub enum EngineEvent {
     PairingFailed { device_id: String, reason: String },
     NameCollision { requested_path: String, kept_as: String },
     CollisionResolved { path: String },
+    CopyDeleted { file_id: String, device_id: String },
+    FileTrashed { file_id: String },
     FileIndexed { path: String },
     FileSent { path: String },
     FileDownloaded { path: String },
@@ -395,6 +397,17 @@ impl Engine {
         }
     }
 
+    fn indexer(&self) -> watcher::Indexer {
+        watcher::Indexer::new(
+            self.db.clone(),
+            self.storage_dir.clone(),
+            self.sync_dir.clone(),
+            self.identity.device_id.clone(),
+            self.ignore_set.clone(),
+            self.collisions.clone(),
+        )
+    }
+
     // ---- Name collisions ----
 
     /// Conflicts kept both ways for safety, still awaiting a decision.
@@ -676,22 +689,11 @@ impl Engine {
 
         *self.mdns_daemon.lock().unwrap() = Some(daemon);
 
-        let watch_db = self.db.clone();
-        let watch_storage = self.storage_dir.clone();
-        let watch_sync = self.sync_dir.clone();
-        let watch_device_id = self.identity.device_id.clone();
-        let watch_ignore = self.ignore_set.clone();
-        let watch_tx = self.event_tx.clone();
-
         let watcher = watcher::start_watcher(
-            watch_sync,
-            watch_storage,
-            watch_device_id,
-            watch_db,
+            self.indexer(),
             handle,
-            watch_ignore,
-            self.collisions.clone(),
-            watch_tx,
+            self.ignore_set.clone(),
+            self.event_tx.clone(),
         ).map_err(EngineError::from)?;
 
         *self.watcher.lock().unwrap() = Some(watcher);

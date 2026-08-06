@@ -608,6 +608,30 @@ impl Database {
         Ok(())
     }
 
+    /// Blocks that only this file uses.
+    ///
+    /// Blocks are addressed by content hash and therefore shared: two identical
+    /// files, or two revisions with an unchanged region, map to the same block.
+    /// Deleting a file's blocks outright would take those away from whatever
+    /// else still needs them, so only the exclusive ones may be removed.
+    pub fn blocks_exclusive_to_file(&self, file_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fb.block_id FROM file_blocks fb
+             WHERE fb.file_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM file_blocks other
+                   WHERE other.block_id = fb.block_id AND other.file_id != ?1
+               )",
+        )?;
+        let blocks = stmt.query_map(rusqlite::params![file_id], |row| row.get::<_, String>(0))?;
+
+        let mut result = Vec::new();
+        for block in blocks {
+            result.push(block?);
+        }
+        Ok(result)
+    }
+
     pub fn clear_blocks_for_file(&self, file_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM file_blocks WHERE file_id = ?1",
