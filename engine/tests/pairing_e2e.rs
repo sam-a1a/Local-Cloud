@@ -43,6 +43,7 @@ impl TestDevice {
 
         let sync_dir = format!("{}/sync", base);
         std::fs::create_dir_all(&sync_dir).expect("sync dir");
+        let ignore_set = localcloud::new_ignore_set();
 
         let db = Arc::new(Mutex::new(
             Database::init(&format!("{}/test.db", base)).expect("db"),
@@ -74,10 +75,18 @@ impl TestDevice {
             identity.key_pem.clone(),
             db.clone(),
             storage_dir.clone(),
-            sync_dir,
-            localcloud::new_ignore_set(),
+            sync_dir.clone(),
+            ignore_set.clone(),
             trust.clone(),
             pairing_state.clone(),
+            localcloud::watcher::Indexer::new(
+                db.clone(),
+                storage_dir.clone(),
+                sync_dir,
+                identity.device_id.clone(),
+                ignore_set,
+                localcloud::CollisionQueue::new(),
+            ),
             event_tx,
         ));
 

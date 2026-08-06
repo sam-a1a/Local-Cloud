@@ -30,6 +30,7 @@ pub struct AppState {
     pub ignore_set: IgnoreSet,
     pub trust: TrustStore,
     pub pairing: PairingState,
+    pub indexer: crate::watcher::Indexer,
     pub event_tx: mpsc::Sender<EngineEvent>,
 }
 
@@ -153,6 +154,7 @@ pub async fn start_server(
     ignore_set: IgnoreSet,
     trust: TrustStore,
     pairing: PairingState,
+    indexer: crate::watcher::Indexer,
     event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<()> {
     let (certs, key) = crate::tls::load_certs_and_key(&cert_pem, &key_pem)?;
@@ -177,6 +179,7 @@ pub async fn start_server(
         ignore_set,
         trust,
         pairing,
+        indexer,
         event_tx,
     };
 
@@ -201,6 +204,7 @@ pub async fn start_server(
         .route("/push_metadata", post(push_metadata))
         .route("/push_block/{block_id}", post(push_block))
         .route("/finalize_file/{file_id}", post(finalize_file))
+        .route("/request_delete", post(request_delete))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_paired_peer,
@@ -315,6 +319,8 @@ async fn get_catalog(State(state): State<AppState>) -> Json<crate::db::Catalog> 
         // keep listing the item as live.
         files: db.get_catalog_files().unwrap_or_default(),
         holders: db.get_all_holders().unwrap_or_default(),
+        // So a delete aimed at a device that was away still reaches it.
+        delete_requests: db.get_delete_requests().unwrap_or_default(),
     })
 }
 
@@ -326,6 +332,52 @@ async fn get_block(
         Ok(data) => Bytes::from(data).into_response(),
         Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteRequestBody {
+    file_id: String,
+    requested_by: String,
+}
+
+/// Another device asking this one to drop its copy.
+///
+/// Recorded before being acted on, so a failure part-way through does not lose
+/// the instruction - it is retried from the catalog on the next sync.
+async fn request_delete(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteRequestBody>,
+) -> impl IntoResponse {
+    {
+        let db = state.db.lock().unwrap();
+        if let Err(e) = db.record_delete_request(&crate::db::DeleteRequest {
+            file_id: req.file_id.clone(),
+            target_device: state.device_id.clone(),
+            requested_by: req.requested_by,
+            requested_at: crate::watcher::now_secs(),
+        }) {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not record the request: {}", e),
+            );
+        }
+    }
+
+    for outcome in state.indexer.apply_pending_delete_requests() {
+        let event = if outcome.trashed {
+            EngineEvent::FileTrashed {
+                file_id: outcome.file_id,
+            }
+        } else {
+            EngineEvent::CopyDeleted {
+                file_id: outcome.file_id,
+                device_id: state.device_id.clone(),
+            }
+        };
+        let _ = state.event_tx.send(event);
+    }
+
+    (axum::http::StatusCode::OK, String::new())
 }
 
 #[derive(serde::Deserialize)]

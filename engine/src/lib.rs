@@ -356,11 +356,13 @@ impl Engine {
         let my_id = self.identity.device_id.clone();
         let ignore = self.ignore_set.clone();
         let collisions = self.collisions.clone();
+        let indexer = self.indexer();
         let tx = self.event_tx.clone();
 
         self.runtime.spawn(async move {
             discovery::sync_with_peer(
-                peer_url, peer_id, my_id, db, storage, sync, cert, key, ignore, collisions, tx,
+                peer_url, peer_id, my_id, db, storage, sync, cert, key, ignore, collisions,
+                indexer, tx,
             )
             .await;
         });
@@ -394,6 +396,7 @@ impl Engine {
         db::Catalog {
             files: db.get_all_files().unwrap_or_default(),
             holders: db.get_all_holders().unwrap_or_default(),
+            delete_requests: db.get_delete_requests().unwrap_or_default(),
         }
     }
 
@@ -472,6 +475,126 @@ impl Engine {
             path: collision.requested_path,
         });
         Ok(())
+    }
+
+    // ---- Deleting copies ----
+
+    /// Deletes a copy of an item from one device.
+    ///
+    /// This is the only delete there is: it removes one device's copy, never
+    /// the item itself. Every other copy is untouched, and the item stays in
+    /// the catalog for as long as anyone still holds it.
+    ///
+    /// `device_id` may be any device, including ones this one cannot currently
+    /// reach. Only a holder can erase its own disk, so a delete aimed elsewhere
+    /// is recorded and delivered - immediately if the target is reachable,
+    /// otherwise through the catalog when it returns.
+    pub fn delete_copy(&self, file_id: String, device_id: String) -> Result<(), EngineError> {
+        if device_id == self.identity.device_id {
+            self.delete_local_copy(file_id)?;
+            return Ok(());
+        }
+
+        {
+            let db = self.db.lock().unwrap();
+            if !db.is_paired(&device_id).map_err(EngineError::from)? {
+                return Err(EngineError::from("That device is not paired"));
+            }
+            if !db
+                .is_holder(&file_id, &device_id)
+                .map_err(EngineError::from)?
+            {
+                return Err(EngineError::from("That device does not hold that item"));
+            }
+
+            // Recorded before any attempt to deliver it, so the instruction
+            // survives the target being unreachable.
+            db.record_delete_request(&db::DeleteRequest {
+                file_id: file_id.clone(),
+                target_device: device_id.clone(),
+                requested_by: self.identity.device_id.clone(),
+                requested_at: watcher::now_secs(),
+            })
+            .map_err(EngineError::from)?;
+        }
+
+        let url = {
+            let peers = self.known_peers.lock().unwrap();
+            peers.get(&device_id).map(|d| d.url.clone())
+        };
+
+        // If it is not reachable the request simply waits; the catalog carries
+        // it there whenever the device next syncs with anyone.
+        if let Some(url) = url {
+            let storage = self.storage_dir.clone();
+            let cert = self.identity.cert_pem.clone();
+            let key = self.identity.key_pem.clone();
+            let requested_by = self.identity.device_id.clone();
+            let tx = self.event_tx.clone();
+
+            self.runtime.spawn(async move {
+                let trusted = match storage::load_all_trusted_certs(&storage) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let client = match discovery::build_mtls_client(&cert, &key, &trusted) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+
+                let sent = client
+                    .post(format!("{}/request_delete", url))
+                    .json(&serde_json::json!({
+                        "file_id": file_id,
+                        "requested_by": requested_by,
+                    }))
+                    .send()
+                    .await;
+
+                if let Err(e) = sent {
+                    let _ = tx.send(EngineEvent::ErrorEvent {
+                        message: format!("Delete queued; {} was not reachable: {}", device_id, e),
+                    });
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Deletes this device's own copy.
+    ///
+    /// Frees the space at once when other copies exist. When it is the last
+    /// copy the bytes are kept and the item moves to trash instead, because an
+    /// item nobody holds could not be restored.
+    pub fn delete_local_copy(
+        &self,
+        file_id: String,
+    ) -> Result<watcher::DeleteOutcome, EngineError> {
+        let outcome = self
+            .indexer()
+            .delete_local_copy(&file_id, true)
+            .map_err(EngineError::from)?;
+
+        let event = if outcome.trashed {
+            EngineEvent::FileTrashed {
+                file_id: outcome.file_id.clone(),
+            }
+        } else {
+            EngineEvent::CopyDeleted {
+                file_id: outcome.file_id.clone(),
+                device_id: self.identity.device_id.clone(),
+            }
+        };
+        let _ = self.event_tx.send(event);
+
+        Ok(outcome)
+    }
+
+    /// Deletes still waiting on a device that has not been reachable.
+    pub fn pending_delete_requests(&self) -> Vec<db::DeleteRequest> {
+        let db = self.db.lock().unwrap();
+        db.get_delete_requests().unwrap_or_default()
     }
 
     /// Items that have been moved aside. Their bytes are still on whichever
@@ -650,6 +773,7 @@ impl Engine {
         let server_ignore = self.ignore_set.clone();
         let server_trust = self.trust.clone();
         let server_pairing = self.pairing.clone();
+        let server_indexer = self.indexer();
         let server_device_name = self.identity.device_name.clone();
 
         let server_task = handle.spawn(async move {
@@ -665,6 +789,7 @@ impl Engine {
                 server_ignore,
                 server_trust,
                 server_pairing,
+                server_indexer,
                 server_tx,
             ).await {
                 let _ = server_tx_err.send(EngineEvent::ErrorEvent {

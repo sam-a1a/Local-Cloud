@@ -62,6 +62,15 @@ pub struct FileHolder {
     pub received_at: i64,
 }
 
+/// A standing instruction for one device to drop its copy of an item.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRequest {
+    pub file_id: String,
+    pub target_device: String,
+    pub requested_by: String,
+    pub requested_at: i64,
+}
+
 /// What happened when a peer's item was merged into the local catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -81,6 +90,8 @@ pub enum MergeOutcome {
 pub struct Catalog {
     pub files: Vec<FileMetadata>,
     pub holders: Vec<FileHolder>,
+    #[serde(default)]
+    pub delete_requests: Vec<DeleteRequest>,
 }
 
 /// A device this one has paired with. Its certificate is pinned, so it is the
@@ -164,6 +175,17 @@ impl Database {
                 PRIMARY KEY (file_id, device_id)
             );
             CREATE INDEX IF NOT EXISTS idx_file_holders_file ON file_holders(file_id);
+            -- A device can delete a copy it does not itself hold, but only the
+            -- holder can erase its own disk. Requests are recorded and travel
+            -- through the catalog, so an offline target carries them out when
+            -- it comes back.
+            CREATE TABLE IF NOT EXISTS delete_requests (
+                file_id TEXT NOT NULL,
+                target_device TEXT NOT NULL,
+                requested_by TEXT NOT NULL,
+                requested_at INTEGER NOT NULL,
+                PRIMARY KEY (file_id, target_device)
+            );
             CREATE TABLE IF NOT EXISTS tombstones (
                 file_id TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL,
                 deleted_by TEXT NOT NULL, version INTEGER NOT NULL
@@ -853,6 +875,90 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // ---- Delete requests ----
+
+    pub fn record_delete_request(&self, request: &DeleteRequest) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO delete_requests (file_id, target_device, requested_by, requested_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_id, target_device) DO NOTHING",
+            rusqlite::params![
+                request.file_id,
+                request.target_device,
+                request.requested_by,
+                request.requested_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_delete_requests(&self) -> Result<Vec<DeleteRequest>> {
+        self.query_delete_requests(
+            "SELECT file_id, target_device, requested_by, requested_at FROM delete_requests",
+            [],
+        )
+    }
+
+    pub fn get_delete_requests_for(&self, device_id: &str) -> Result<Vec<DeleteRequest>> {
+        self.query_delete_requests(
+            "SELECT file_id, target_device, requested_by, requested_at
+             FROM delete_requests WHERE target_device = ?1",
+            rusqlite::params![device_id],
+        )
+    }
+
+    fn query_delete_requests(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<DeleteRequest>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params, |row| {
+            Ok(DeleteRequest {
+                file_id: row.get(0)?,
+                target_device: row.get(1)?,
+                requested_by: row.get(2)?,
+                requested_at: row.get(3)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn clear_delete_request(&self, file_id: &str, target_device: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM delete_requests WHERE file_id = ?1 AND target_device = ?2",
+            rusqlite::params![file_id, target_device],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets requests that have been carried out.
+    ///
+    /// A request is satisfied once the target is no longer a live holder -
+    /// either it dropped the copy, or the item went to trash because that was
+    /// the last one. Deriving this from the holder set rather than tracking
+    /// acknowledgements means no extra round trip and no way for a request to
+    /// be applied twice.
+    pub fn prune_satisfied_delete_requests(&self) -> Result<usize> {
+        let removed = self.conn.execute(
+            "DELETE FROM delete_requests
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM file_holders h
+                 JOIN files f ON f.id = h.file_id
+                 WHERE h.file_id = delete_requests.file_id
+                   AND h.device_id = delete_requests.target_device
+                   AND f.trashed_at = 0
+             )",
+            [],
+        )?;
+        Ok(removed)
     }
 
     /// Drops every holder row for a file, used when an item leaves the catalog.

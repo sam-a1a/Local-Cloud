@@ -5,7 +5,7 @@
 //! filesystem events, so nothing here depends on timing.
 
 use localcloud::collision::CollisionQueue;
-use localcloud::db::{Database, FileHolder};
+use localcloud::db::{Database, DeleteRequest, FileHolder};
 use localcloud::watcher::{IndexOutcome, Indexer};
 use localcloud::{new_ignore_set, storage};
 use std::sync::{Arc, Mutex};
@@ -331,6 +331,191 @@ async fn a_file_leaving_the_folder_deletes_this_devices_copy() {
 
     assert_eq!(outcome.file_id, file_id);
     assert!(outcome.trashed, "it was the only copy");
+}
+
+#[tokio::test]
+async fn a_queued_request_deletes_this_devices_copy_when_it_returns() {
+    let device = Device::new("macos");
+    let path = device.write("photo.jpg", "bytes");
+    let IndexOutcome::Indexed { file_id, .. } = device.indexer.index(&path) else {
+        panic!("expected Indexed");
+    };
+
+    // Another device also holds it, so this delete frees space rather than
+    // going to trash.
+    {
+        let db = device.db.lock().unwrap();
+        db.set_holder(&FileHolder {
+            file_id: file_id.clone(),
+            device_id: "android".into(),
+            content_hash: "whatever".into(),
+            received_at: 1,
+        })
+        .unwrap();
+
+        // The iPhone asked for the macOS copy while macOS was asleep; the
+        // request reached it through the catalog.
+        db.record_delete_request(&DeleteRequest {
+            file_id: file_id.clone(),
+            target_device: "macos".into(),
+            requested_by: "iphone".into(),
+            requested_at: 10,
+        })
+        .unwrap();
+    }
+
+    let carried_out = device.indexer.apply_pending_delete_requests();
+    assert_eq!(carried_out.len(), 1);
+    assert!(!device.exists("photo.jpg"));
+
+    let db = device.db.lock().unwrap();
+    assert!(!db.is_holder(&file_id, "macos").unwrap());
+    assert!(db.is_holder(&file_id, "android").unwrap());
+    assert!(
+        db.get_delete_requests().unwrap().is_empty(),
+        "a carried-out request must not linger"
+    );
+}
+
+#[tokio::test]
+async fn a_request_is_never_carried_out_twice() {
+    let device = Device::new("macos");
+    let path = device.write("photo.jpg", "bytes");
+    let IndexOutcome::Indexed { file_id, .. } = device.indexer.index(&path) else {
+        panic!("expected Indexed");
+    };
+
+    {
+        let db = device.db.lock().unwrap();
+        db.record_delete_request(&DeleteRequest {
+            file_id: file_id.clone(),
+            target_device: "macos".into(),
+            requested_by: "iphone".into(),
+            requested_at: 10,
+        })
+        .unwrap();
+    }
+
+    // This is the last copy, so it goes to trash and the holder row stays -
+    // which is exactly the case where a naive check would re-run forever.
+    assert_eq!(device.indexer.apply_pending_delete_requests().len(), 1);
+    assert!(device.indexer.apply_pending_delete_requests().is_empty());
+
+    let db = device.db.lock().unwrap();
+    assert_eq!(db.get_trashed_files().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn requests_aimed_at_other_devices_are_left_alone() {
+    let device = Device::new("macos");
+    let path = device.write("photo.jpg", "bytes");
+    let IndexOutcome::Indexed { file_id, .. } = device.indexer.index(&path) else {
+        panic!("expected Indexed");
+    };
+
+    {
+        let db = device.db.lock().unwrap();
+        db.record_delete_request(&DeleteRequest {
+            file_id: file_id.clone(),
+            target_device: "android".into(),
+            requested_by: "iphone".into(),
+            requested_at: 10,
+        })
+        .unwrap();
+    }
+
+    assert!(device.indexer.apply_pending_delete_requests().is_empty());
+    assert!(device.exists("photo.jpg"));
+
+    let db = device.db.lock().unwrap();
+    assert!(db.is_holder(&file_id, "macos").unwrap());
+    assert_eq!(
+        db.get_delete_requests().unwrap().len(),
+        1,
+        "the request must be carried forward for its actual target"
+    );
+}
+
+#[tokio::test]
+async fn a_satisfied_request_is_pruned_on_the_requesting_device() {
+    // The iPhone's view: it asked macOS to drop a copy, and later learns from
+    // the catalog that macOS is no longer a holder.
+    let device = Device::new("iphone");
+
+    {
+        let db = device.db.lock().unwrap();
+        db.insert_file(&localcloud::FileMetadata {
+            id: "item".into(),
+            path: "photo.jpg".into(),
+            size: 1,
+            content_hash: "hash".into(),
+            modified_time: 1,
+            created_by: "macos".into(),
+            trashed_at: 0,
+            trashed_by: String::new(),
+        })
+        .unwrap();
+        db.set_holder(&FileHolder {
+            file_id: "item".into(),
+            device_id: "macos".into(),
+            content_hash: "hash".into(),
+            received_at: 1,
+        })
+        .unwrap();
+        db.record_delete_request(&DeleteRequest {
+            file_id: "item".into(),
+            target_device: "macos".into(),
+            requested_by: "iphone".into(),
+            requested_at: 10,
+        })
+        .unwrap();
+
+        // Still outstanding while macOS holds it.
+        assert_eq!(db.prune_satisfied_delete_requests().unwrap(), 0);
+
+        // macOS carried it out, which the next catalog sync reflects.
+        db.remove_holder("item", "macos").unwrap();
+        assert_eq!(db.prune_satisfied_delete_requests().unwrap(), 1);
+        assert!(db.get_delete_requests().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_last_copy_delete_also_settles_the_request() {
+    // The target held the only copy, so it went to trash rather than being
+    // dropped. The holder row survives, so satisfaction cannot be judged on
+    // holders alone.
+    let device = Device::new("iphone");
+
+    let db = device.db.lock().unwrap();
+    db.insert_file(&localcloud::FileMetadata {
+        id: "item".into(),
+        path: "photo.jpg".into(),
+        size: 1,
+        content_hash: "hash".into(),
+        modified_time: 1,
+        created_by: "macos".into(),
+        trashed_at: 0,
+        trashed_by: String::new(),
+    })
+    .unwrap();
+    db.set_holder(&FileHolder {
+        file_id: "item".into(),
+        device_id: "macos".into(),
+        content_hash: "hash".into(),
+        received_at: 1,
+    })
+    .unwrap();
+    db.record_delete_request(&DeleteRequest {
+        file_id: "item".into(),
+        target_device: "macos".into(),
+        requested_by: "iphone".into(),
+        requested_at: 10,
+    })
+    .unwrap();
+
+    db.trash_file("item", "macos", 20).unwrap();
+    assert_eq!(db.prune_satisfied_delete_requests().unwrap(), 1);
 }
 
 #[tokio::test]

@@ -210,6 +210,7 @@ pub async fn sync_with_peer(
     key_pem: String,
     ignore_set: IgnoreSet,
     collisions: crate::collision::CollisionQueue,
+    indexer: crate::watcher::Indexer,
     event_tx: mpsc::Sender<EngineEvent>,
 ) {
     // 1. Sync only with devices that have been through pairing.
@@ -334,6 +335,33 @@ pub async fn sync_with_peer(
             continue;
         }
         let _ = db.set_holder(holder);
+    }
+
+    // Deletes aimed at a device that was away travel through the catalog, so
+    // they have to be carried forward even when they concern neither of us.
+    for request in &catalog.delete_requests {
+        let _ = db.record_delete_request(request);
+    }
+
+    drop(db);
+
+    // Anything aimed at this device is carried out now.
+    for outcome in indexer.apply_pending_delete_requests() {
+        let event = if outcome.trashed {
+            EngineEvent::FileTrashed { file_id: outcome.file_id }
+        } else {
+            EngineEvent::CopyDeleted {
+                file_id: outcome.file_id,
+                device_id: my_device_id.clone(),
+            }
+        };
+        let _ = event_tx.send(event);
+    }
+
+    // Requests whose target is no longer a live holder are done with.
+    {
+        let db = db_clone.lock().unwrap();
+        let _ = db.prune_satisfied_delete_requests();
     }
 
     println!("[Sync] Finished catalog sync with {}", peer_id);

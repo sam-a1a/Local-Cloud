@@ -369,6 +369,45 @@ impl Indexer {
         })
     }
 
+    /// Carries out any standing requests for this device to drop a copy.
+    ///
+    /// Only the holder can erase its own disk, so a delete aimed at this device
+    /// arrives as a request - directly if it was reachable, otherwise through
+    /// the catalog once it comes back. Applied requests are cleared so they
+    /// cannot run twice.
+    pub fn apply_pending_delete_requests(&self) -> Vec<DeleteOutcome> {
+        let requests = {
+            let db = self.db.lock().unwrap();
+            db.get_delete_requests_for(&self.device_id).unwrap_or_default()
+        };
+
+        let mut carried_out = Vec::new();
+        for request in requests {
+            let holds = {
+                let db = self.db.lock().unwrap();
+                db.is_holder(&request.file_id, &self.device_id)
+                    .unwrap_or(false)
+            };
+
+            if holds {
+                match self.delete_local_copy(&request.file_id, true) {
+                    Ok(outcome) => carried_out.push(outcome),
+                    Err(e) => {
+                        println!("[Delete] Could not carry out request: {}", e);
+                        continue;
+                    }
+                }
+            }
+
+            // Either done, or there was no copy here to remove. Settled either
+            // way, so the request should not linger.
+            let db = self.db.lock().unwrap();
+            let _ = db.clear_delete_request(&request.file_id, &self.device_id);
+        }
+
+        carried_out
+    }
+
     /// Handles a file disappearing from the folder, which means the same thing
     /// as deleting this device's copy.
     pub fn forget(&self, absolute_path: &str) -> Result<DeleteOutcome> {
