@@ -30,10 +30,10 @@ async fn main() -> Result<()> {
 
                 // Automatically synchronize metadata when a peer is discovered
                 // Use a reference (&event) to avoid moving the values out
-                if let EngineEvent::PeerDiscovered { peer_id, addr } = &event {
+                if let EngineEvent::PeerDiscovered { device } = &event {
                     let engine_sync = engine_events.clone();
-                    let peer_id = peer_id.clone();
-                    let addr = addr.clone();
+                    let peer_id = device.device_id.clone();
+                    let addr = device.url.clone();
                     tokio::spawn(async move {
                         let _ = engine_sync.sync_with_peer(peer_id, addr);
                     });
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         let peers = engine_pin.get_known_peers();
         let files = engine_pin.get_local_files();
         if !peers.is_empty() && !files.is_empty() {
-            let peer_id = peers.first().unwrap().clone();
+            let peer_id = peers.first().unwrap().device_id.clone();
             let file_id = files.first().unwrap().id.clone();
             println!("[Demo] Auto-pinning file {} to peer {}", file_id, peer_id);
             let _ = engine_pin.set_file_pinned_devices(file_id, vec![peer_id]);

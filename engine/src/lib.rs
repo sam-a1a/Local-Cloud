@@ -14,6 +14,7 @@ pub use db::BlockMetadata;
 pub use db::FileBlock;
 pub use db::Tombstone;
 pub use crypto::DeviceIdentity;
+pub use discovery::{DiscoveredDevice, PeerMap};
 pub use ignore::{new_ignore_set, IgnoreSet};
 
 use serde::Serialize;
@@ -39,7 +40,7 @@ impl EngineError {
 pub enum EngineEvent {
     EngineStarted,
     EngineStopped,
-    PeerDiscovered { peer_id: String, addr: String },
+    PeerDiscovered { device: DiscoveredDevice },
     FileIndexed { path: String },
     FileSent { path: String },
     FileDownloaded { path: String },
@@ -58,7 +59,7 @@ pub struct Engine {
     watcher: StdMutex<Option<RecommendedWatcher>>,
     mdns_daemon: StdMutex<Option<ServiceDaemon>>,
     server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
-    known_peers: Arc<StdMutex<HashMap<String, String>>>,
+    known_peers: PeerMap,
 }
 
 impl Engine {
@@ -111,6 +112,14 @@ impl Engine {
         self.identity.device_id[..8].to_string()
     }
 
+    pub fn device_name(&self) -> String {
+        self.identity.device_name.clone()
+    }
+
+    pub fn device_platform(&self) -> String {
+        crypto::platform_name().to_string()
+    }
+
     pub fn get_sync_dir(&self) -> String {
         self.sync_dir.clone()
     }
@@ -121,9 +130,12 @@ impl Engine {
         rx.recv_timeout(timeout).ok()
     }
 
-    pub fn get_known_peers(&self) -> Vec<String> {
+    /// Every device currently visible on the network, paired or not.
+    pub fn get_known_peers(&self) -> Vec<DiscoveredDevice> {
         let peers = self.known_peers.lock().unwrap();
-        peers.keys().cloned().collect()
+        let mut devices: Vec<DiscoveredDevice> = peers.values().cloned().collect();
+        devices.sort_by(|a, b| a.name.cmp(&b.name));
+        devices
     }
 
     pub fn get_local_files(&self) -> Vec<FileMetadata> {
@@ -217,7 +229,8 @@ impl Engine {
 
             let we_have_data = blocks.iter().all(|b| b.is_present == 1);
 
-            for (peer_id, peer_url) in peers {
+            for (peer_id, peer) in peers {
+                let peer_url = &peer.url;
                 let _ = client.post(format!("{}/push_metadata", peer_url)).json(&push_req).send().await;
 
                 let peer_is_pinned = file.pinned_devices.contains(&peer_id);
@@ -276,10 +289,12 @@ impl Engine {
 
         let disc_tx = self.event_tx.clone();
         let disc_device_id = self.identity.device_id.clone();
+        let disc_device_name = self.identity.device_name.clone();
         let disc_peers = self.known_peers.clone();
 
         let daemon = discovery::start_discovery(
             disc_device_id,
+            disc_device_name,
             port,
             disc_tx,
             disc_peers,

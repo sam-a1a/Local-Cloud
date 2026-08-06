@@ -2,7 +2,7 @@
 use anyhow::Result;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use rand::rngs::OsRng;
 
 #[derive(Serialize, Deserialize)]
@@ -10,6 +10,31 @@ struct IdentityFile {
     signing_key_hex: String,
     cert_pem: String,
     key_pem: String,
+    /// Absent in identities written before device naming existed.
+    #[serde(default)]
+    device_name: String,
+}
+
+/// Human-readable platform label, shown beside the device name when picking
+/// devices to pair with.
+pub fn platform_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "android" => "Android",
+        "ios" => "iOS",
+        other => other,
+    }
+}
+
+/// Best-effort name for this device, e.g. "Sam's MacBook Pro". Users can
+/// override it, since some platforms only report something like "localhost".
+fn default_device_name() -> String {
+    match whoami::devicename() {
+        Ok(name) if !name.trim().is_empty() => name,
+        _ => format!("Unnamed {}", platform_name()),
+    }
 }
 
 /// Represents the permanent cryptographic identity of a device on the mesh
@@ -18,6 +43,8 @@ pub struct DeviceIdentity {
     pub signing_key: SigningKey, // Ed25519 private key (keep secret!)
     pub cert_pem: String,        // TLS self-signed certificate
     pub key_pem: String,         // TLS private key
+    pub device_name: String,     // Shown to peers during pairing
+    base_dir: PathBuf,           // Where identity.json lives, for renames
 }
 
 impl DeviceIdentity {
@@ -27,7 +54,7 @@ impl DeviceIdentity {
 
         if id_path.exists() {
             let data = std::fs::read_to_string(&id_path)?;
-            let file: IdentityFile = serde_json::from_str(&data)?;
+            let mut file: IdentityFile = serde_json::from_str(&data)?;
 
             let key_bytes = hex::decode(&file.signing_key_hex)?;
             let arr: [u8; 32] = key_bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("Invalid key length"))?;
@@ -35,18 +62,27 @@ impl DeviceIdentity {
             let verifying_key: VerifyingKey = signing_key.verifying_key();
             let device_id = hex::encode(verifying_key.to_bytes());
 
+            // Backfill the name for identities created before this field existed.
+            if file.device_name.trim().is_empty() {
+                file.device_name = default_device_name();
+                std::fs::write(&id_path, serde_json::to_string_pretty(&file)?)?;
+            }
+
             Ok(Self {
                 device_id,
                 signing_key,
                 cert_pem: file.cert_pem,
                 key_pem: file.key_pem,
+                device_name: file.device_name,
+                base_dir: PathBuf::from(base_dir),
             })
         } else {
-            let identity = Self::generate()?;
+            let identity = Self::generate(base_dir)?;
             let file = IdentityFile {
                 signing_key_hex: hex::encode(identity.signing_key.to_bytes()),
                 cert_pem: identity.cert_pem.clone(),
                 key_pem: identity.key_pem.clone(),
+                device_name: identity.device_name.clone(),
             };
             std::fs::write(&id_path, serde_json::to_string_pretty(&file)?)?;
             Ok(identity)
@@ -54,7 +90,7 @@ impl DeviceIdentity {
     }
 
     /// Generates a new random identity and self-signed TLS cert
-    pub fn generate() -> Result<Self> {
+    pub fn generate(base_dir: &str) -> Result<Self> {
         let mut csprng = OsRng;
         let signing_key = SigningKey::generate(&mut csprng);
         let verifying_key: VerifyingKey = signing_key.verifying_key();
@@ -69,6 +105,26 @@ impl DeviceIdentity {
             signing_key,
             cert_pem,
             key_pem,
+            device_name: default_device_name(),
+            base_dir: PathBuf::from(base_dir),
         })
+    }
+
+    /// Renames this device. Peers see the new name the next time they resolve
+    /// it over mDNS; already-paired devices update it on their next contact.
+    pub fn set_device_name(&mut self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("Device name cannot be empty");
+        }
+
+        let id_path = self.base_dir.join("identity.json");
+        let data = std::fs::read_to_string(&id_path)?;
+        let mut file: IdentityFile = serde_json::from_str(&data)?;
+        file.device_name = name.to_string();
+        std::fs::write(&id_path, serde_json::to_string_pretty(&file)?)?;
+
+        self.device_name = name.to_string();
+        Ok(())
     }
 }

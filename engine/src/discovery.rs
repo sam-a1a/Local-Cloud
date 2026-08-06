@@ -3,6 +3,7 @@ use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex, mpsc};
@@ -12,6 +13,20 @@ use crate::tls::TrustedCerts;
 use crate::EngineEvent;
 
 const SERVICE_TYPE: &str = "_local-cloud._tcp.local.";
+
+/// A device seen on the local network. Being discovered says nothing about
+/// trust: unpaired devices appear here so they can be picked for pairing, and
+/// get no catalog or data access until that completes.
+#[derive(Clone, Debug, Serialize)]
+pub struct DiscoveredDevice {
+    pub device_id: String,
+    pub name: String,
+    pub platform: String,
+    pub url: String,
+}
+
+/// device_id -> most recently resolved advertisement for that device.
+pub type PeerMap = Arc<Mutex<HashMap<String, DiscoveredDevice>>>;
 
 fn get_local_ip() -> String {
     let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -76,9 +91,10 @@ pub(crate) fn build_mtls_client(
 
 pub fn start_discovery(
     device_id: String,
+    device_name: String,
     port: u16,
     event_tx: mpsc::Sender<EngineEvent>,
-    known_peers: Arc<Mutex<HashMap<String, String>>>,
+    known_peers: PeerMap,
 ) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
@@ -86,6 +102,8 @@ pub fn start_discovery(
     let host_name = format!("{}.local.", short_id);
     let mut properties = HashMap::new();
     properties.insert("device_id".to_string(), device_id.clone());
+    properties.insert("name".to_string(), device_name);
+    properties.insert("platform".to_string(), crate::crypto::platform_name().to_string());
 
     let local_ip = get_local_ip();
     let my_properties = Some(properties);
@@ -112,22 +130,39 @@ pub fn start_discovery(
                     continue;
                 }
 
-                let peer_id = info
-                    .get_property("device_id")
-                    .map(|p| p.val_str().to_string());
+                let peer_id = match info.get_property("device_id") {
+                    Some(p) => p.val_str().to_string(),
+                    None => continue,
+                };
+
+                // Fall back to the short id so a device with a malformed
+                // advertisement is still selectable rather than nameless.
+                let name = info
+                    .get_property("name")
+                    .map(|p| p.val_str().to_string())
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| peer_id.chars().take(8).collect());
+                let platform = info
+                    .get_property("platform")
+                    .map(|p| p.val_str().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+
                 let peer_port = info.get_port();
 
                 if let Some(peer_ip) = info.get_addresses().iter().next() {
-                    if let Some(pid) = peer_id.clone() {
-                        let url = format!("https://{}:{}", peer_ip, peer_port);
+                    let device = DiscoveredDevice {
+                        device_id: peer_id.clone(),
+                        name,
+                        platform,
+                        url: format!("https://{}:{}", peer_ip, peer_port),
+                    };
 
-                        {
-                            let mut peers = known_peers.lock().unwrap();
-                            peers.insert(pid.clone(), url.clone());
-                        }
-
-                        let _ = event_tx.send(EngineEvent::PeerDiscovered { peer_id: pid, addr: url });
+                    {
+                        let mut peers = known_peers.lock().unwrap();
+                        peers.insert(peer_id, device.clone());
                     }
+
+                    let _ = event_tx.send(EngineEvent::PeerDiscovered { device });
                 }
             }
         }
@@ -286,7 +321,7 @@ pub async fn download_file_on_demand(
     sync_dir_clone: String,
     cert_pem: String,
     key_pem: String,
-    known_peers: Arc<Mutex<HashMap<String, String>>>,
+    known_peers: PeerMap,
     ignore_set: IgnoreSet,
     event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<(), String> {
@@ -316,7 +351,8 @@ pub async fn download_file_on_demand(
     let client = build_mtls_client(&cert_pem, &key_pem, &trusted_certs).map_err(|e| e.to_string())?;
 
     // Try peers until one works
-    for (_peer_id, peer_url) in peers {
+    for (_peer_id, peer) in peers {
+        let peer_url = peer.url;
         let success = fetch_blocks_from_peer(&client, &peer_url, &missing, &db_clone, &storage_dir_clone).await;
 
         if success {

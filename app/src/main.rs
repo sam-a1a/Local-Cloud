@@ -124,12 +124,14 @@ fn app() -> Element {
     rsx! {
         div { padding: "20px", font_family: "sans-serif",
             h1 { "LocalCloud Mesh" }
-            p { font_size: "12px", color: "gray", "Device: {engine.device_short_id()}" }
+            p { font_size: "12px", color: "gray",
+                "{engine.device_name()} · {engine.device_platform()} · {engine.device_short_id()}"
+            }
 
-            h2 { "Peers ({peers.read().len()})" }
+            h2 { "Devices on this network ({peers.read().len()})" }
             ul {
                 for peer in peers.read().iter() {
-                    li { "{peer}" }
+                    li { "{peer.name} · {peer.platform}" }
                 }
             }
 
@@ -160,7 +162,7 @@ fn app() -> Element {
                             let p = peers.read();
                             if !f.is_empty() && !p.is_empty() {
                                 let file_id = f[0].id.clone();
-                                let peer_id = p[0].clone();
+                                let peer_id = p[0].device_id.clone();
                                 println!("[UI] Pinning {} to {}", file_id, peer_id);
                                 let _ = engine.set_file_pinned_devices(file_id, vec![peer_id]);
                             }
