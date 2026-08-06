@@ -1227,6 +1227,24 @@ mod tests {
     }
 
     #[test]
+    fn a_push_into_a_stale_catalog_is_accepted_rather_than_refused() {
+        // The recipient has not synced yet, so it still believes an older item
+        // owns the name. Delivery must not depend on that having caught up.
+        let db = db();
+        db.insert_file(&file("aaa", "photo.jpg")).unwrap();
+
+        let incoming = file("bbb", "photo.jpg");
+        assert!(db.merge_catalog_file(&incoming).is_ok());
+
+        // Landed under a free name, and both items are present.
+        assert_eq!(
+            db.get_file_by_path("photo 1.jpg").unwrap().unwrap().id,
+            "bbb"
+        );
+        assert_eq!(db.get_all_files().unwrap().len(), 2);
+    }
+
+    #[test]
     fn a_trashed_incoming_item_never_contends_for_a_name() {
         let db = db();
         db.insert_file(&file("aaa", "notes.txt")).unwrap();

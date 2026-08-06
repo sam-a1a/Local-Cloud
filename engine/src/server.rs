@@ -336,13 +336,18 @@ struct PushMetadataRequest {
 
 /// Announces an item about to be sent. The sender is describing the content it
 /// is transferring, so its block list replaces whatever we had for that item.
+///
+/// Goes through the same merge as a catalog sync rather than a plain insert. A
+/// recipient whose catalog has not caught up may still have the name assigned
+/// elsewhere, and refusing the push over that would make delivery depend on
+/// sync ordering.
 async fn push_metadata(
     State(state): State<AppState>,
     Json(req): Json<PushMetadataRequest>,
 ) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
 
-    if let Err(e) = db.upsert_file_from_catalog(&req.file) {
+    if let Err(e) = db.merge_catalog_file(&req.file) {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save metadata: {}", e));
     }
 
