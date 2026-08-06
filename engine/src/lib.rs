@@ -348,13 +348,19 @@ impl Engine {
     pub fn sync_with_peer(&self, peer_id: String, peer_url: String) -> Result<(), EngineError> {
         let db = self.db.clone();
         let storage = self.storage_dir.clone();
+        let sync = self.sync_dir.clone();
         let cert = self.identity.cert_pem.clone();
         let key = self.identity.key_pem.clone();
         let my_id = self.identity.device_id.clone();
+        let ignore = self.ignore_set.clone();
+        let collisions = self.collisions.clone();
         let tx = self.event_tx.clone();
 
         self.runtime.spawn(async move {
-            discovery::sync_with_peer(peer_url, peer_id, my_id, db, storage, cert, key, tx).await;
+            discovery::sync_with_peer(
+                peer_url, peer_id, my_id, db, storage, sync, cert, key, ignore, collisions, tx,
+            )
+            .await;
         });
         Ok(())
     }

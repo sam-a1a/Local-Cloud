@@ -55,8 +55,18 @@ impl CollisionQueue {
         Self::default()
     }
 
+    /// Records a conflict, ignoring one already asked about. Catalog merges
+    /// re-derive the same conflict on every sync, and the user should be asked
+    /// once, not once per sync.
     pub fn record(&self, collision: PendingCollision) {
-        self.inner.lock().unwrap().push(collision);
+        let mut queue = self.inner.lock().unwrap();
+        let duplicate = queue.iter().any(|c| {
+            c.incoming_file_id == collision.incoming_file_id
+                && c.existing_file_id == collision.existing_file_id
+        });
+        if !duplicate {
+            queue.push(collision);
+        }
     }
 
     pub fn pending(&self) -> Vec<PendingCollision> {

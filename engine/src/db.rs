@@ -62,6 +62,20 @@ pub struct FileHolder {
     pub received_at: i64,
 }
 
+/// What happened when a peer's item was merged into the local catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Applied,
+    /// A name conflict was settled by tie-break, moving one item aside.
+    Renamed {
+        file_id: String,
+        from: String,
+        to: String,
+        /// The item that kept the contested name.
+        conflicting_file_id: String,
+    },
+}
+
 /// The whole shared namespace as one device knows it.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Catalog {
@@ -385,6 +399,78 @@ impl Database {
             anyhow::bail!("No live item with that id");
         }
         Ok(())
+    }
+
+    /// The first numbered variant of `path` that no live item claims.
+    /// A failed lookup counts as taken, so an error can never cause an
+    /// overwrite.
+    fn free_path(&self, path: &str) -> String {
+        crate::collision::next_available_path(path, |candidate| {
+            self.is_path_taken(candidate).unwrap_or(true)
+        })
+    }
+
+    /// Merges one item from a peer's catalog, resolving name conflicts.
+    ///
+    /// Two devices that were apart can each create an item with the same name,
+    /// and a sync cannot stop to ask which should win. The tie-break is the
+    /// item id: the smaller one keeps the name. Both devices hold both ids, so
+    /// each reaches the same answer alone and they converge without a round
+    /// trip. The loser is placed under a numbered name, and stays there on
+    /// later syncs rather than being bumped again.
+    pub fn merge_catalog_file(&self, incoming: &FileMetadata) -> Result<MergeOutcome> {
+        // A trashed item does not own its name, so it never contends.
+        if incoming.is_trashed() {
+            self.upsert_file_from_catalog(incoming)?;
+            return Ok(MergeOutcome::Applied);
+        }
+
+        let incumbent = match self.get_file_by_path(&incoming.path)? {
+            Some(existing) if existing.id != incoming.id => existing,
+            _ => {
+                self.upsert_file_from_catalog(incoming)?;
+                return Ok(MergeOutcome::Applied);
+            }
+        };
+
+        if incumbent.id < incoming.id {
+            // The incoming item yields. If a previous sync already placed it,
+            // leave it there so the number does not creep upward.
+            let target = match self.get_file_by_id(&incoming.id)? {
+                Some(local) if !local.is_trashed() => local.path,
+                _ => self.free_path(&incoming.path),
+            };
+
+            let mut placed = incoming.clone();
+            placed.path = target.clone();
+            self.upsert_file_from_catalog(&placed)?;
+
+            Ok(MergeOutcome::Renamed {
+                file_id: incoming.id.clone(),
+                from: incoming.path.clone(),
+                to: target,
+                conflicting_file_id: incumbent.id,
+            })
+        } else {
+            // The incoming item wins, so ours moves aside to free the name.
+            let target = self.free_path(&incumbent.path);
+
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE files SET path = ?1 WHERE id = ?2",
+                rusqlite::params![target, incumbent.id],
+            )?;
+            tx.commit()?;
+
+            self.upsert_file_from_catalog(incoming)?;
+
+            Ok(MergeOutcome::Renamed {
+                file_id: incumbent.id.clone(),
+                from: incumbent.path,
+                to: target,
+                conflicting_file_id: incoming.id.clone(),
+            })
+        }
     }
 
     /// Hands a name from one item to another, atomically.
@@ -1011,6 +1097,126 @@ mod tests {
             db.get_file_by_path("example 1.txt").unwrap().unwrap().id,
             "incoming"
         );
+    }
+
+    #[test]
+    fn merging_a_new_item_just_applies_it() {
+        let db = db();
+        assert_eq!(
+            db.merge_catalog_file(&file("f1", "notes.txt")).unwrap(),
+            MergeOutcome::Applied
+        );
+        assert_eq!(db.get_all_files().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_smaller_id_keeps_a_contested_name() {
+        // Device A already has item "aaa" at notes.txt and receives "bbb".
+        let db = db();
+        db.insert_file(&file("aaa", "notes.txt")).unwrap();
+
+        let outcome = db.merge_catalog_file(&file("bbb", "notes.txt")).unwrap();
+        assert_eq!(
+            outcome,
+            MergeOutcome::Renamed {
+                file_id: "bbb".into(),
+                from: "notes.txt".into(),
+                to: "notes 1.txt".into(),
+                conflicting_file_id: "aaa".into(),
+            }
+        );
+
+        assert_eq!(db.get_file_by_path("notes.txt").unwrap().unwrap().id, "aaa");
+        assert_eq!(
+            db.get_file_by_path("notes 1.txt").unwrap().unwrap().id,
+            "bbb"
+        );
+    }
+
+    #[test]
+    fn a_smaller_incoming_id_displaces_the_local_item() {
+        // Device B has "bbb" at notes.txt and receives "aaa". It must move its
+        // own item aside so both devices end up agreeing.
+        let db = db();
+        db.insert_file(&file("bbb", "notes.txt")).unwrap();
+
+        let outcome = db.merge_catalog_file(&file("aaa", "notes.txt")).unwrap();
+        assert_eq!(
+            outcome,
+            MergeOutcome::Renamed {
+                file_id: "bbb".into(),
+                from: "notes.txt".into(),
+                to: "notes 1.txt".into(),
+                conflicting_file_id: "aaa".into(),
+            }
+        );
+
+        assert_eq!(db.get_file_by_path("notes.txt").unwrap().unwrap().id, "aaa");
+        assert_eq!(
+            db.get_file_by_path("notes 1.txt").unwrap().unwrap().id,
+            "bbb"
+        );
+    }
+
+    #[test]
+    fn both_devices_reach_the_same_layout_without_talking() {
+        // The whole point of the tie-break: each side decides alone.
+        let device_a = db();
+        device_a.insert_file(&file("aaa", "notes.txt")).unwrap();
+        device_a.merge_catalog_file(&file("bbb", "notes.txt")).unwrap();
+
+        let device_b = db();
+        device_b.insert_file(&file("bbb", "notes.txt")).unwrap();
+        device_b.merge_catalog_file(&file("aaa", "notes.txt")).unwrap();
+
+        let layout = |db: &Database| {
+            let mut rows: Vec<(String, String)> = db
+                .get_all_files()
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.path, f.id))
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        assert_eq!(layout(&device_a), layout(&device_b));
+    }
+
+    #[test]
+    fn resyncing_does_not_keep_bumping_the_number() {
+        let db = db();
+        db.insert_file(&file("aaa", "notes.txt")).unwrap();
+
+        // The peer still calls it notes.txt until it learns about ours, so the
+        // same record arrives repeatedly.
+        for _ in 0..5 {
+            db.merge_catalog_file(&file("bbb", "notes.txt")).unwrap();
+        }
+
+        assert_eq!(
+            db.get_file_by_path("notes 1.txt").unwrap().unwrap().id,
+            "bbb"
+        );
+        assert!(db.get_file_by_path("notes 2.txt").unwrap().is_none());
+        assert_eq!(db.get_all_files().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_trashed_incoming_item_never_contends_for_a_name() {
+        let db = db();
+        db.insert_file(&file("aaa", "notes.txt")).unwrap();
+
+        let mut deleted = file("bbb", "notes.txt");
+        deleted.trashed_at = 1_700_000_900;
+        deleted.trashed_by = "macos".into();
+
+        assert_eq!(
+            db.merge_catalog_file(&deleted).unwrap(),
+            MergeOutcome::Applied
+        );
+        assert_eq!(db.get_file_by_path("notes.txt").unwrap().unwrap().id, "aaa");
+        assert_eq!(db.get_trashed_files().unwrap().len(), 1);
     }
 
     #[test]

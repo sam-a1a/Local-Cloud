@@ -205,8 +205,11 @@ pub async fn sync_with_peer(
     my_device_id: String,
     db_clone: Arc<Mutex<Database>>,
     storage_dir_clone: String,
+    sync_dir: String,
     cert_pem: String,
     key_pem: String,
+    ignore_set: IgnoreSet,
+    collisions: crate::collision::CollisionQueue,
     event_tx: mpsc::Sender<EngineEvent>,
 ) {
     // 1. Sync only with devices that have been through pairing.
@@ -265,10 +268,49 @@ pub async fn sync_with_peer(
     let db = db_clone.lock().unwrap();
 
     for file in &catalog.files {
-        // A path collision between two different items is a name clash that
-        // the sender resolves with the user, not something to merge blindly.
-        if let Err(e) = db.upsert_file_from_catalog(file) {
-            println!("[Sync] Skipped {}: {}", file.path, e);
+        match db.merge_catalog_file(file) {
+            Ok(crate::db::MergeOutcome::Applied) => {}
+            Ok(crate::db::MergeOutcome::Renamed {
+                file_id,
+                from,
+                to,
+                conflicting_file_id,
+            }) => {
+                println!("[Sync] \"{}\" was taken; \"{}\" kept as \"{}\"", from, from, to);
+
+                // If the item that moved is one we hold, the sync folder has to
+                // follow, or it would disagree with the catalog about the name.
+                if db.is_holder(&file_id, &my_device_id).unwrap_or(false) {
+                    let from_abs = format!("{}/{}", sync_dir, from);
+                    let to_abs = format!("{}/{}", sync_dir, to);
+                    if std::path::Path::new(&from_abs).exists() {
+                        crate::ignore::mark_ignored(&ignore_set, &from_abs);
+                        crate::ignore::mark_ignored(&ignore_set, &to_abs);
+                        if let Err(e) = std::fs::rename(&from_abs, &to_abs) {
+                            println!("[Sync] Renamed in catalog but not on disk: {}", e);
+                        }
+                        crate::ignore::schedule_unmark_ignored(ignore_set.clone(), from_abs, 3);
+                        crate::ignore::schedule_unmark_ignored(ignore_set.clone(), to_abs, 3);
+                    }
+                }
+
+                let (incoming_file_id, existing_file_id) = (file_id, conflicting_file_id);
+                collisions.record(crate::collision::PendingCollision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    incoming_file_id,
+                    requested_path: from.clone(),
+                    current_path: to.clone(),
+                    existing_file_id,
+                    existing_created_by: file.created_by.clone(),
+                    detected_at: file.modified_time,
+                });
+
+                let _ = event_tx.send(EngineEvent::NameCollision {
+                    requested_path: from,
+                    kept_as: to,
+                });
+            }
+            Err(e) => println!("[Sync] Skipped {}: {}", file.path, e),
         }
     }
 
@@ -295,7 +337,6 @@ pub async fn sync_with_peer(
     }
 
     println!("[Sync] Finished catalog sync with {}", peer_id);
-    let _ = event_tx;
 }
 
 pub async fn download_file_on_demand(
