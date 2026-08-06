@@ -5,7 +5,7 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::net::UdpSocket;
+
 use std::sync::{Arc, Mutex, mpsc};
 use crate::db::Database;
 use crate::ignore::IgnoreSet;
@@ -28,10 +28,50 @@ pub struct DiscoveredDevice {
 /// device_id -> most recently resolved advertisement for that device.
 pub type PeerMap = Arc<Mutex<HashMap<String, DiscoveredDevice>>>;
 
-fn get_local_ip() -> String {
-    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-    socket.connect("8.8.8.8:80").unwrap();
-    socket.local_addr().unwrap().ip().to_string()
+/// Picks the address to reach a peer on, and formats it as a base URL.
+///
+/// A device advertises every address it has, and they arrive as an unordered
+/// set, so simply taking the first gives a different answer each time and makes
+/// one device look like several. Ranking them keeps it stable, and the order
+/// reflects what actually works:
+///
+/// - routable IPv4 first, which is what a home network hands out
+/// - then global IPv6
+/// - loopback only as a last resort, which is really two instances on one
+///   machine
+/// - link-local IPv6 never: it is meaningless without a scope id, and a scope
+///   id does not survive being put in a URL
+pub(crate) fn peer_url(
+    addresses: impl IntoIterator<Item = std::net::IpAddr>,
+    port: u16,
+) -> Option<String> {
+    use std::net::IpAddr;
+
+    let rank = |addr: &IpAddr| -> Option<u8> {
+        match addr {
+            IpAddr::V4(v4) if v4.is_unspecified() => None,
+            IpAddr::V4(v4) if v4.is_loopback() => Some(2),
+            IpAddr::V4(_) => Some(0),
+            IpAddr::V6(v6) if v6.is_unspecified() => None,
+            // fe80::/10
+            IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => None,
+            IpAddr::V6(v6) if v6.is_loopback() => Some(3),
+            IpAddr::V6(_) => Some(1),
+        }
+    };
+
+    let best = addresses
+        .into_iter()
+        .filter_map(|addr| rank(&addr).map(|r| (r, addr)))
+        // Tie-break on the address itself so repeated resolutions agree.
+        .min_by_key(|(r, addr)| (*r, addr.to_string()))
+        .map(|(_, addr)| addr)?;
+
+    Some(match best {
+        // IPv6 in a URL has to be bracketed or the port is unparseable.
+        IpAddr::V6(v6) => format!("https://[{}]:{}", v6, port),
+        IpAddr::V4(v4) => format!("https://{}:{}", v4, port),
+    })
 }
 
 #[derive(Debug)]
@@ -105,17 +145,17 @@ pub fn start_discovery(
     properties.insert("name".to_string(), device_name);
     properties.insert("platform".to_string(), crate::crypto::platform_name().to_string());
 
-    let local_ip = get_local_ip();
-    let my_properties = Some(properties);
-
-    let service_info = ServiceInfo::new(
-        SERVICE_TYPE,
-        short_id,
-        &host_name,
-        &local_ip,
-        port,
-        my_properties,
-    )?;
+    // Addresses are left to the daemon rather than guessed.
+    //
+    // Picking one by opening a socket towards the internet returns whichever
+    // address carries the default route, which on any machine with a VPN up is
+    // the tunnel rather than the LAN. The daemon then holds a service whose
+    // address belongs to no interface it broadcasts on and silently never
+    // announces it - no error, just a mesh where nothing ever finds anything.
+    // Letting it fill them in also covers multi-homed hosts and addresses that
+    // change while running.
+    let service_info = ServiceInfo::new(SERVICE_TYPE, short_id, &host_name, (), port, Some(properties))?
+        .enable_addr_auto();
 
     daemon.register(service_info)?;
 
@@ -147,21 +187,34 @@ pub fn start_discovery(
                     .map(|p| p.val_str().to_string())
                     .unwrap_or_else(|| "unknown".to_string());
 
-                let peer_port = info.get_port();
+                let Some(url) = peer_url(
+                    info.get_addresses().iter().map(|scoped| scoped.to_ip_addr()),
+                    info.get_port(),
+                ) else {
+                    continue;
+                };
 
-                if let Some(peer_ip) = info.get_addresses().iter().next() {
-                    let device = DiscoveredDevice {
-                        device_id: peer_id.clone(),
-                        name,
-                        platform,
-                        url: format!("https://{}:{}", peer_ip, peer_port),
-                    };
+                let device = DiscoveredDevice {
+                    device_id: peer_id.clone(),
+                    name,
+                    platform,
+                    url,
+                };
 
-                    {
-                        let mut peers = known_peers.lock().unwrap();
-                        peers.insert(peer_id, device.clone());
+                // mDNS re-resolves periodically, so only announce a device that
+                // is new or has actually moved.
+                let changed = {
+                    let mut peers = known_peers.lock().unwrap();
+                    match peers.get(&peer_id) {
+                        Some(known) if known.url == device.url && known.name == device.name => false,
+                        _ => {
+                            peers.insert(peer_id, device.clone());
+                            true
+                        }
                     }
+                };
 
+                if changed {
                     let _ = event_tx.send(EngineEvent::PeerDiscovered { device });
                 }
             }
@@ -495,4 +548,66 @@ pub async fn pull_copy(
 
     let _ = event_tx.send(EngineEvent::FileDownloaded { path: file.path });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_url;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("address")
+    }
+
+    #[test]
+    fn a_routable_ipv4_is_preferred() {
+        let url = peer_url([ip("::1"), ip("127.0.0.1"), ip("10.234.3.171")], 8080);
+        assert_eq!(url.as_deref(), Some("https://10.234.3.171:8080"));
+    }
+
+    #[test]
+    fn ipv6_is_bracketed_or_the_port_cannot_be_parsed() {
+        let url = peer_url([ip("2001:db8::1")], 8080);
+        assert_eq!(url.as_deref(), Some("https://[2001:db8::1]:8080"));
+    }
+
+    #[test]
+    fn link_local_ipv6_is_never_used() {
+        // Meaningless without a scope id, and a scope id does not survive a URL.
+        assert_eq!(peer_url([ip("fe80::1")], 8080), None);
+        assert_eq!(
+            peer_url([ip("fe80::1"), ip("192.168.1.5")], 8080).as_deref(),
+            Some("https://192.168.1.5:8080")
+        );
+    }
+
+    #[test]
+    fn loopback_is_a_last_resort_but_still_works() {
+        // Two instances on one machine, which is how this gets tested.
+        assert_eq!(
+            peer_url([ip("127.0.0.1")], 8080).as_deref(),
+            Some("https://127.0.0.1:8080")
+        );
+        assert_eq!(
+            peer_url([ip("127.0.0.1"), ip("10.0.0.4")], 8080).as_deref(),
+            Some("https://10.0.0.4:8080")
+        );
+    }
+
+    #[test]
+    fn the_same_addresses_always_give_the_same_url() {
+        // Addresses arrive as an unordered set, so an arbitrary pick would make
+        // one device look like it keeps moving between resolutions.
+        let addresses = [ip("10.0.0.9"), ip("10.0.0.4"), ip("192.168.1.5")];
+        let first = peer_url(addresses, 8080);
+        for _ in 0..20 {
+            assert_eq!(peer_url(addresses, 8080), first);
+        }
+    }
+
+    #[test]
+    fn a_device_advertising_nothing_usable_is_skipped() {
+        assert_eq!(peer_url([], 8080), None);
+        assert_eq!(peer_url([ip("0.0.0.0"), ip("fe80::abc")], 8080), None);
+    }
 }

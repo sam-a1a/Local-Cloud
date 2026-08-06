@@ -313,6 +313,9 @@ from each platform's own idioms — and making large files fast.
   committed to. Acceptable on a home network; not on a hostile one.
 - Block size is 4 KB (`storage.rs`) and each block moves in its own HTTP
   round-trip. A 1 GB file is 262,144 requests. This is the largest thing left.
+- Discovery has only been exercised with two instances on one machine. It has
+  never run across two physical devices, or on Android or iOS, where multicast
+  needs an entitlement (iOS) and a multicast lock (Android).
 - The desktop app never syncs the catalog on peer discovery; only the CLI does
   (`cli/src/main.rs`).
 - File identity is path-based at creation, so renaming a file in the folder reads
