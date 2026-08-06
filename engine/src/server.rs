@@ -47,7 +47,7 @@ impl AppState {
 /// Pins a device's certificate and records the pairing. Reloading the trust
 /// store is what actually grants access, and it takes effect immediately
 /// because the running TLS server shares this store.
-pub(crate) fn pin_paired_device(
+pub fn pin_paired_device(
     db: &Arc<Mutex<Database>>,
     storage_dir: &str,
     trust: &TrustStore,

@@ -68,7 +68,7 @@ impl ServerCertVerifier for TrustedPeerServerVerifier {
     crate::impl_tls_verifier_methods!();
 }
 
-pub(crate) fn build_mtls_client(
+pub fn build_mtls_client(
     cert_pem: &str,
     key_pem: &str,
     trusted_cert_pems: &[String],
