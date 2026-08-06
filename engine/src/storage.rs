@@ -94,6 +94,16 @@ pub fn save_peer_cert(base_dir: &str, peer_id: &str, cert_pem: &str) -> Result<(
     Ok(())
 }
 
+/// Drops a pinned certificate. The trust store must be reloaded afterwards for
+/// the revocation to take effect.
+pub fn remove_peer_cert(base_dir: &str, peer_id: &str) -> Result<()> {
+    let path = get_trusted_peers_dir(base_dir).join(format!("{}.pem", peer_id));
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 pub fn load_all_trusted_certs(base_dir: &str) -> Result<Vec<String>> {
     let dir = get_trusted_peers_dir(base_dir);
     if !dir.exists() {

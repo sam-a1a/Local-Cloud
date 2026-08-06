@@ -45,6 +45,9 @@ pub enum EngineEvent {
     EngineStarted,
     EngineStopped,
     PeerDiscovered { device: DiscoveredDevice },
+    PairingRequested { device_id: String, name: String, platform: String },
+    DevicePaired { device_id: String, name: String },
+    PairingFailed { device_id: String, reason: String },
     FileIndexed { path: String },
     FileSent { path: String },
     FileDownloaded { path: String },
@@ -65,6 +68,7 @@ pub struct Engine {
     server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     known_peers: PeerMap,
     trust: TrustStore,
+    pairing: PairingState,
 }
 
 impl Engine {
@@ -114,6 +118,7 @@ impl Engine {
             server_task: StdMutex::new(None),
             known_peers,
             trust,
+            pairing: PairingState::new(),
         })
     }
 
@@ -127,6 +132,184 @@ impl Engine {
 
     pub fn device_platform(&self) -> String {
         crypto::platform_name().to_string()
+    }
+
+    // ---- Pairing ----
+
+    fn own_device_info(&self) -> pairing::DeviceInfo {
+        pairing::DeviceInfo {
+            device_id: self.identity.device_id.clone(),
+            name: self.identity.device_name.clone(),
+            platform: crypto::platform_name().to_string(),
+            cert_pem: self.identity.cert_pem.clone(),
+        }
+    }
+
+    /// Initiator: pick devices from the discovery list to pair with.
+    ///
+    /// Returns the 6-digit code to put on screen. Each selected device is asked
+    /// to prompt for it; pairing completes as each one enters it correctly.
+    pub fn start_pairing(&self, target_device_ids: Vec<String>) -> Result<String, EngineError> {
+        if target_device_ids.is_empty() {
+            return Err(EngineError::from("Select at least one device to pair with"));
+        }
+
+        let targets: Vec<(String, String)> = {
+            let peers = self.known_peers.lock().unwrap();
+            target_device_ids
+                .iter()
+                .filter_map(|id| peers.get(id).map(|d| (id.clone(), d.url.clone())))
+                .collect()
+        };
+
+        if targets.is_empty() {
+            return Err(EngineError::from(
+                "None of those devices are visible on the network",
+            ));
+        }
+
+        let code = self
+            .pairing
+            .begin(targets.iter().map(|(id, _)| id.clone()).collect());
+
+        let me = self.own_device_info();
+        let tx = self.event_tx.clone();
+
+        self.runtime.spawn(async move {
+            let client = match pairing::build_pairing_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(EngineEvent::ErrorEvent {
+                        message: format!("Could not start pairing: {}", e),
+                    });
+                    return;
+                }
+            };
+
+            for (device_id, url) in targets {
+                if let Err(e) = pairing::send_pair_request(&client, &url, &me).await {
+                    let _ = tx.send(EngineEvent::PairingFailed {
+                        device_id,
+                        reason: format!("Could not reach device: {}", e),
+                    });
+                }
+            }
+        });
+
+        Ok(code)
+    }
+
+    /// The code currently displayed, if one is still valid.
+    pub fn pairing_code(&self) -> Option<String> {
+        self.pairing.active_code()
+    }
+
+    /// Selected devices that have not yet entered the code.
+    pub fn devices_awaiting_code(&self) -> Vec<String> {
+        self.pairing.awaiting()
+    }
+
+    pub fn cancel_pairing(&self) {
+        self.pairing.cancel();
+    }
+
+    /// Target: devices asking to pair, awaiting a code from the user.
+    pub fn pairing_offers(&self) -> Vec<PairingOffer> {
+        self.pairing.offers()
+    }
+
+    /// Target: submit the code the initiator is displaying.
+    ///
+    /// Runs in the background; the outcome arrives as `DevicePaired` or
+    /// `PairingFailed` rather than being returned, so this is safe to call from
+    /// inside another async runtime.
+    pub fn confirm_pairing(
+        &self,
+        initiator_device_id: String,
+        code: String,
+    ) -> Result<(), EngineError> {
+        let initiator = self
+            .pairing
+            .offer_details(&initiator_device_id)
+            .ok_or_else(|| EngineError::from("No pending pairing request from that device"))?;
+
+        let url = {
+            let peers = self.known_peers.lock().unwrap();
+            peers
+                .get(&initiator_device_id)
+                .map(|d| d.url.clone())
+                .ok_or_else(|| {
+                    EngineError::from("That device is no longer visible on the network")
+                })?
+        };
+
+        let me = self.own_device_info();
+        // Order matters: the initiator hashes its own certificate first.
+        let proof = pairing::pairing_proof(&code, &initiator.cert_pem, &me.cert_pem);
+
+        let db = self.db.clone();
+        let storage_dir = self.storage_dir.clone();
+        let trust = self.trust.clone();
+        let pairing_state = self.pairing.clone();
+        let tx = self.event_tx.clone();
+
+        self.runtime.spawn(async move {
+            let client = match pairing::build_pairing_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(EngineEvent::PairingFailed {
+                        device_id: initiator_device_id,
+                        reason: e.to_string(),
+                    });
+                    return;
+                }
+            };
+
+            let peer = match pairing::send_pair_confirm(&client, &url, &me, &proof).await {
+                Ok(info) => info,
+                Err(e) => {
+                    let _ = tx.send(EngineEvent::PairingFailed {
+                        device_id: initiator_device_id,
+                        reason: e.to_string(),
+                    });
+                    return;
+                }
+            };
+
+            // The initiator accepted, so pin it in return.
+            if let Err(e) = server::pin_paired_device(&db, &storage_dir, &trust, &peer) {
+                let _ = tx.send(EngineEvent::PairingFailed {
+                    device_id: initiator_device_id,
+                    reason: format!("Paired, but failed to record it locally: {}", e),
+                });
+                return;
+            }
+
+            pairing_state.clear_offer(&initiator_device_id);
+            let _ = tx.send(EngineEvent::DevicePaired {
+                device_id: peer.device_id,
+                name: peer.name,
+            });
+        });
+
+        Ok(())
+    }
+
+    pub fn paired_devices(&self) -> Vec<PairedDevice> {
+        let db = self.db.lock().unwrap();
+        db.get_paired_devices().unwrap_or_default()
+    }
+
+    /// Revokes a pairing. The device stays visible on the network but loses all
+    /// catalog and block access immediately.
+    pub fn unpair(&self, device_id: String) -> Result<(), EngineError> {
+        {
+            let db = self.db.lock().unwrap();
+            db.remove_paired_device(&device_id).map_err(EngineError::from)?;
+        }
+        storage::remove_peer_cert(&self.storage_dir, &device_id).map_err(EngineError::from)?;
+        self.trust.reload(&self.storage_dir).map_err(EngineError::from)?;
+        Ok(())
     }
 
     pub fn get_sync_dir(&self) -> String {
@@ -277,11 +460,14 @@ impl Engine {
         let server_tx_err = self.event_tx.clone();
         let server_ignore = self.ignore_set.clone();
         let server_trust = self.trust.clone();
+        let server_pairing = self.pairing.clone();
+        let server_device_name = self.identity.device_name.clone();
 
         let server_task = handle.spawn(async move {
             if let Err(e) = server::start_server(
                 listener,
                 server_device_id,
+                server_device_name,
                 server_cert,
                 server_key,
                 server_db,
@@ -289,6 +475,7 @@ impl Engine {
                 server_sync,
                 server_ignore,
                 server_trust,
+                server_pairing,
                 server_tx,
             ).await {
                 let _ = server_tx_err.send(EngineEvent::ErrorEvent {

@@ -212,13 +212,12 @@ pub async fn sync_with_peer(
     println!("[Sync] Starting metadata sync with {}", peer_id);
 
     // 1. Fetch peer cert and build mTLS client
-    let peer_cert_filename = format!("{}.pem", peer_id);
     let untrusted_client = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
     let peer_cert_pem = match untrusted_client.get(format!("{}/hello", peer_url)).send().await {
         Ok(res) => match res.text().await { Ok(pem) => pem, Err(_) => return },
         Err(_) => return,
     };
-    let _ = crate::storage::save_peer_cert(&storage_dir_clone, &peer_cert_filename, &peer_cert_pem);
+    let _ = crate::storage::save_peer_cert(&storage_dir_clone, &peer_id, &peer_cert_pem);
 
     let trusted_certs = match crate::storage::load_all_trusted_certs(&storage_dir_clone) {
         Ok(c) => c,

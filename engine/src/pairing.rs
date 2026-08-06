@@ -259,6 +259,60 @@ impl PairingState {
     }
 }
 
+/// HTTP client for the pairing exchange only.
+///
+/// It presents no client certificate and accepts whatever the far end offers,
+/// because neither side trusts the other yet - that is the entire point of
+/// pairing. What makes the exchange safe is the proof binding it to the
+/// certificates actually presented, not the transport.
+pub fn build_pairing_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(10))
+        .build()?)
+}
+
+/// Initiator -> target: "I would like to pair, here is who I am."
+pub async fn send_pair_request(
+    client: &reqwest::Client,
+    peer_url: &str,
+    me: &DeviceInfo,
+) -> anyhow::Result<()> {
+    let response = client
+        .post(format!("{}/pair_request", peer_url))
+        .json(me)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Pairing request rejected: {}", response.status());
+    }
+    Ok(())
+}
+
+/// Target -> initiator: "here is proof I know the code you are showing."
+/// Returns the initiator's details so the target can pin them in turn.
+pub async fn send_pair_confirm(
+    client: &reqwest::Client,
+    peer_url: &str,
+    me: &DeviceInfo,
+    proof: &str,
+) -> anyhow::Result<DeviceInfo> {
+    let response = client
+        .post(format!("{}/pair_confirm", peer_url))
+        .json(&serde_json::json!({ "device": me, "proof": proof }))
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        anyhow::bail!("{}", if detail.is_empty() { status.to_string() } else { detail });
+    }
+
+    Ok(response.json().await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

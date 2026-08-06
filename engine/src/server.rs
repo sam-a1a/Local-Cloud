@@ -1,6 +1,7 @@
 // engine/src/server.rs
 use crate::db::Database;
 use crate::ignore::IgnoreSet;
+use crate::pairing::{DeviceInfo, PairingState};
 use crate::tls::TrustStore;
 use crate::EngineEvent;
 use anyhow::Result;
@@ -23,10 +24,55 @@ pub struct AppState {
     pub db: Arc<Mutex<Database>>,
     pub storage_dir: String,
     pub sync_dir: String,
+    pub device_id: String,
+    pub device_name: String,
     pub cert_pem: String,
     pub ignore_set: IgnoreSet,
     pub trust: TrustStore,
+    pub pairing: PairingState,
     pub event_tx: mpsc::Sender<EngineEvent>,
+}
+
+impl AppState {
+    fn own_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            device_id: self.device_id.clone(),
+            name: self.device_name.clone(),
+            platform: crate::crypto::platform_name().to_string(),
+            cert_pem: self.cert_pem.clone(),
+        }
+    }
+}
+
+/// Pins a device's certificate and records the pairing. Reloading the trust
+/// store is what actually grants access, and it takes effect immediately
+/// because the running TLS server shares this store.
+pub(crate) fn pin_paired_device(
+    db: &Arc<Mutex<Database>>,
+    storage_dir: &str,
+    trust: &TrustStore,
+    info: &DeviceInfo,
+) -> Result<()> {
+    crate::storage::save_peer_cert(storage_dir, &info.device_id, &info.cert_pem)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+
+    {
+        let db = db.lock().unwrap();
+        db.upsert_paired_device(&crate::db::PairedDevice {
+            id: info.device_id.clone(),
+            name: info.name.clone(),
+            platform: info.platform.clone(),
+            cert_pem: info.cert_pem.clone(),
+            paired_at: now,
+            last_seen: now,
+        })?;
+    }
+
+    trust.reload(storage_dir)?;
+    Ok(())
 }
 
 /// The client certificate presented on the connection a request arrived over,
@@ -98,6 +144,7 @@ async fn require_paired_peer(
 pub async fn start_server(
     listener: TcpListener,
     device_id: String,
+    device_name: String,
     cert_pem: String,
     key_pem: String,
     db: Arc<Mutex<Database>>,
@@ -105,6 +152,7 @@ pub async fn start_server(
     sync_dir: String,
     ignore_set: IgnoreSet,
     trust: TrustStore,
+    pairing: PairingState,
     event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<()> {
     let (certs, key) = crate::tls::load_certs_and_key(&cert_pem, &key_pem)?;
@@ -123,9 +171,12 @@ pub async fn start_server(
         db,
         storage_dir,
         sync_dir,
+        device_id: device_id.clone(),
+        device_name,
         cert_pem: cert_pem_state,
         ignore_set,
         trust,
+        pairing,
         event_tx,
     };
 
@@ -139,6 +190,8 @@ pub async fn start_server(
             }
         }))
         .route("/hello", get(get_hello))
+        .route("/pair_request", post(pair_request))
+        .route("/pair_confirm", post(pair_confirm))
         .with_state(state.clone());
 
     // Reachable only over a connection authenticated with a pinned certificate.
@@ -193,6 +246,65 @@ pub async fn start_server(
 
 async fn get_hello(State(state): State<AppState>) -> String {
     state.cert_pem.clone()
+}
+
+/// Target side, step one: an initiator announces it wants to pair. Nothing is
+/// trusted here - this only surfaces a prompt so the user can enter the code
+/// the initiator is displaying.
+async fn pair_request(
+    State(state): State<AppState>,
+    Json(info): Json<DeviceInfo>,
+) -> impl IntoResponse {
+    if info.device_id.trim().is_empty() || info.cert_pem.trim().is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, "Incomplete device info").into_response();
+    }
+
+    let _ = state.event_tx.send(EngineEvent::PairingRequested {
+        device_id: info.device_id.clone(),
+        name: info.name.clone(),
+        platform: info.platform.clone(),
+    });
+    state.pairing.record_offer(info);
+
+    axum::http::StatusCode::OK.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PairConfirmRequest {
+    device: DeviceInfo,
+    proof: String,
+}
+
+/// Initiator side, step two: a target proves it knows the displayed code.
+/// A valid proof is the only thing that causes a certificate to be pinned.
+async fn pair_confirm(
+    State(state): State<AppState>,
+    Json(req): Json<PairConfirmRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = state.pairing.verify(
+        &req.device.device_id,
+        &req.proof,
+        &state.cert_pem,
+        &req.device.cert_pem,
+    ) {
+        return (axum::http::StatusCode::FORBIDDEN, e.to_string()).into_response();
+    }
+
+    if let Err(e) = pin_paired_device(&state.db, &state.storage_dir, &state.trust, &req.device) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to record pairing: {}", e),
+        )
+            .into_response();
+    }
+
+    let _ = state.event_tx.send(EngineEvent::DevicePaired {
+        device_id: req.device.device_id.clone(),
+        name: req.device.name.clone(),
+    });
+
+    // Returned so the target can pin us from the same exchange.
+    Json(state.own_info()).into_response()
 }
 
 async fn list_files(State(state): State<AppState>) -> Json<Vec<crate::FileMetadata>> {
