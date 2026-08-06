@@ -51,6 +51,21 @@ pub fn chunk_and_store_file(base_dir: &str, db: &Database, file_id: &str, file_p
     Ok(())
 }
 
+/// Identifies the exact content of a file as an ordered manifest of its blocks.
+///
+/// Block ids are already SHA-256 of block contents, so hashing them in order
+/// pins both the bytes and their arrangement. Two copies of a file are the same
+/// content precisely when this matches, which is what lets the catalog say
+/// which devices hold a current copy and which are behind.
+pub fn content_hash(blocks: &[FileBlock]) -> String {
+    let mut hasher = Sha256::new();
+    for block in blocks {
+        hasher.update(block.block_id.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
+}
+
 pub fn read_block(base_dir: &str, block_id: &str) -> Result<Vec<u8>> {
     let path = get_block_path(base_dir, block_id);
     let mut file = File::open(path)?;

@@ -34,6 +34,19 @@ pub struct FileBlock {
     pub is_present: i64,
 }
 
+/// One device's copy of one file.
+///
+/// `content_hash` records *which* content that device has, not merely that it
+/// has something. Copies are snapshots and never update themselves, so a
+/// holder whose hash differs from the file's current hash is simply behind.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileHolder {
+    pub file_id: String,
+    pub device_id: String,
+    pub content_hash: String,
+    pub received_at: i64,
+}
+
 /// A device this one has paired with. Its certificate is pinned, so it is the
 /// only kind of device allowed to touch the catalog or block storage.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -52,6 +65,15 @@ pub struct Tombstone {
     pub deleted_at: i64,
     pub deleted_by: String,
     pub version: i64,
+}
+
+fn holder_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileHolder> {
+    Ok(FileHolder {
+        file_id: row.get(0)?,
+        device_id: row.get(1)?,
+        content_hash: row.get(2)?,
+        received_at: row.get(3)?,
+    })
 }
 
 fn file_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileMetadata> {
@@ -94,6 +116,14 @@ impl Database {
                 FOREIGN KEY (file_id) REFERENCES files(id),
                 FOREIGN KEY (block_id) REFERENCES blocks(id)
             );
+            CREATE TABLE IF NOT EXISTS file_holders (
+                file_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                received_at INTEGER NOT NULL,
+                PRIMARY KEY (file_id, device_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_holders_file ON file_holders(file_id);
             CREATE TABLE IF NOT EXISTS tombstones (
                 file_id TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL,
                 deleted_by TEXT NOT NULL, version INTEGER NOT NULL
@@ -111,6 +141,7 @@ impl Database {
     /// columns have to be applied separately.
     fn migrate(&self) -> Result<()> {
         self.add_column_if_missing("devices", "platform", "TEXT NOT NULL DEFAULT ''")?;
+        self.add_column_if_missing("files", "content_hash", "TEXT NOT NULL DEFAULT ''")?;
         Ok(())
     }
 
@@ -378,6 +409,99 @@ impl Database {
         Ok(())
     }
 
+    // ---- Holder set ----
+    //
+    // Which devices actually have a file's bytes, and which content each one
+    // has. Copies never update themselves, so a holder can legitimately be
+    // behind; recording the hash per copy is what keeps the catalog honest
+    // about that instead of implying every holder is current.
+    //
+    // A device only ever writes its own row. Removing another device's copy is
+    // a request that device carries out and then publishes, so there is never
+    // more than one writer per row and nothing needs merging.
+
+    pub fn set_holder(&self, holder: &FileHolder) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO file_holders (file_id, device_id, content_hash, received_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_id, device_id) DO UPDATE SET
+                content_hash = excluded.content_hash,
+                received_at = excluded.received_at",
+            rusqlite::params![
+                holder.file_id,
+                holder.device_id,
+                holder.content_hash,
+                holder.received_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_holder(&self, file_id: &str, device_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_holders WHERE file_id = ?1 AND device_id = ?2",
+            rusqlite::params![file_id, device_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_holders(&self, file_id: &str) -> Result<Vec<FileHolder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, device_id, content_hash, received_at
+             FROM file_holders WHERE file_id = ?1 ORDER BY received_at",
+        )?;
+        let holders = stmt.query_map(rusqlite::params![file_id], holder_from_row)?;
+
+        let mut result = Vec::new();
+        for holder in holders {
+            result.push(holder?);
+        }
+        Ok(result)
+    }
+
+    /// Every holder row known, for replicating the catalog to a peer.
+    pub fn get_all_holders(&self) -> Result<Vec<FileHolder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, device_id, content_hash, received_at FROM file_holders",
+        )?;
+        let holders = stmt.query_map([], holder_from_row)?;
+
+        let mut result = Vec::new();
+        for holder in holders {
+            result.push(holder?);
+        }
+        Ok(result)
+    }
+
+    pub fn is_holder(&self, file_id: &str, device_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM file_holders WHERE file_id = ?1 AND device_id = ?2",
+            rusqlite::params![file_id, device_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// How many devices still hold this file. Reaching zero is what sends an
+    /// item to trash rather than freeing it outright.
+    pub fn holder_count(&self, file_id: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM file_holders WHERE file_id = ?1",
+            rusqlite::params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Drops every holder row for a file, used when an item leaves the catalog.
+    pub fn clear_holders(&self, file_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_holders WHERE file_id = ?1",
+            rusqlite::params![file_id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
         let result = self.conn.query_row(
             "SELECT id, path, size, modified_time, version, created_by, pinned_devices FROM files WHERE path = ?1",
@@ -385,5 +509,134 @@ impl Database {
             file_from_row,
         ).optional()?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Database {
+        Database::init(":memory:").expect("in-memory database")
+    }
+
+    fn holder(file_id: &str, device_id: &str, hash: &str) -> FileHolder {
+        FileHolder {
+            file_id: file_id.to_string(),
+            device_id: device_id.to_string(),
+            content_hash: hash.to_string(),
+            received_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn sharing_adds_a_holder_without_removing_the_sender() {
+        let db = db();
+        db.set_holder(&holder("f1", "android", "hash-a")).unwrap();
+        db.set_holder(&holder("f1", "macos", "hash-a")).unwrap();
+
+        assert_eq!(db.holder_count("f1").unwrap(), 2);
+        assert!(db.is_holder("f1", "android").unwrap());
+        assert!(db.is_holder("f1", "macos").unwrap());
+    }
+
+    #[test]
+    fn deleting_one_copy_leaves_the_others() {
+        let db = db();
+        db.set_holder(&holder("f1", "android", "hash-a")).unwrap();
+        db.set_holder(&holder("f1", "macos", "hash-a")).unwrap();
+
+        // The iPhone deletes the Mac's copy; Android is untouched.
+        db.remove_holder("f1", "macos").unwrap();
+
+        assert_eq!(db.holder_count("f1").unwrap(), 1);
+        assert!(db.is_holder("f1", "android").unwrap());
+        assert!(!db.is_holder("f1", "macos").unwrap());
+    }
+
+    #[test]
+    fn removing_the_last_copy_empties_the_holder_set() {
+        let db = db();
+        db.set_holder(&holder("f1", "android", "hash-a")).unwrap();
+        db.remove_holder("f1", "android").unwrap();
+
+        // Zero holders is the signal to send an item to trash rather than
+        // freeing it outright.
+        assert_eq!(db.holder_count("f1").unwrap(), 0);
+        assert!(db.get_holders("f1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_copy_that_was_never_resent_reads_as_behind() {
+        let db = db();
+        db.set_holder(&holder("f1", "android", "hash-v2")).unwrap();
+        db.set_holder(&holder("f1", "macos", "hash-v1")).unwrap();
+
+        let current = "hash-v2";
+        let holders = db.get_holders("f1").unwrap();
+
+        let stale: Vec<&str> = holders
+            .iter()
+            .filter(|h| h.content_hash != current)
+            .map(|h| h.device_id.as_str())
+            .collect();
+
+        assert_eq!(stale, vec!["macos"]);
+    }
+
+    #[test]
+    fn resending_updates_that_copy_in_place() {
+        let db = db();
+        db.set_holder(&holder("f1", "macos", "hash-v1")).unwrap();
+        db.set_holder(&FileHolder {
+            received_at: 1_700_000_500,
+            ..holder("f1", "macos", "hash-v2")
+        })
+        .unwrap();
+
+        // Overriding replaces the copy rather than adding a second one.
+        assert_eq!(db.holder_count("f1").unwrap(), 1);
+        let holders = db.get_holders("f1").unwrap();
+        assert_eq!(holders[0].content_hash, "hash-v2");
+        assert_eq!(holders[0].received_at, 1_700_000_500);
+    }
+
+    #[test]
+    fn holder_sets_are_per_file() {
+        let db = db();
+        db.set_holder(&holder("f1", "android", "hash-a")).unwrap();
+        db.set_holder(&holder("f2", "android", "hash-b")).unwrap();
+        db.set_holder(&holder("f2", "macos", "hash-b")).unwrap();
+
+        assert_eq!(db.holder_count("f1").unwrap(), 1);
+        assert_eq!(db.holder_count("f2").unwrap(), 2);
+        assert_eq!(db.get_all_holders().unwrap().len(), 3);
+
+        db.clear_holders("f2").unwrap();
+        assert_eq!(db.holder_count("f1").unwrap(), 1);
+        assert_eq!(db.holder_count("f2").unwrap(), 0);
+    }
+
+    #[test]
+    fn pairing_records_survive_a_round_trip() {
+        let db = db();
+        let device = PairedDevice {
+            id: "abc".into(),
+            name: "MacBook".into(),
+            platform: "macOS".into(),
+            cert_pem: "cert".into(),
+            paired_at: 1,
+            last_seen: 1,
+        };
+        db.upsert_paired_device(&device).unwrap();
+
+        assert!(db.is_paired("abc").unwrap());
+        assert_eq!(db.get_paired_devices().unwrap()[0].name, "MacBook");
+
+        db.touch_device("abc", 99).unwrap();
+        assert_eq!(db.get_paired_devices().unwrap()[0].last_seen, 99);
+
+        db.remove_paired_device("abc").unwrap();
+        assert!(!db.is_paired("abc").unwrap());
     }
 }
