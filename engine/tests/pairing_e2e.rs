@@ -121,7 +121,7 @@ async fn unpaired_device_reaches_pairing_but_nothing_else() {
     assert_eq!(hello.status(), 200, "pairing bootstrap must be reachable");
 
     let catalog = anon
-        .get(format!("{}/list_files", device.url))
+        .get(format!("{}/catalog", device.url))
         .send()
         .await
         .expect("request completes");
@@ -176,7 +176,7 @@ async fn correct_code_pairs_and_grants_access() {
 
     let client = target.mtls_client_for(&initiator);
     let catalog = client
-        .get(format!("{}/list_files", initiator.url))
+        .get(format!("{}/catalog", initiator.url))
         .send()
         .await
         .expect("request completes");

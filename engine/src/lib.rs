@@ -122,6 +122,10 @@ impl Engine {
         })
     }
 
+    pub fn device_id(&self) -> String {
+        self.identity.device_id.clone()
+    }
+
     pub fn device_short_id(&self) -> String {
         self.identity.device_id[..8].to_string()
     }
@@ -370,75 +374,156 @@ impl Engine {
         Ok(())
     }
 
-    pub fn set_file_pinned_devices(&self, file_id: String, devices: Vec<String>) -> Result<(), EngineError> {
-        let db = self.db.clone();
+    /// The shared namespace as this device currently knows it.
+    pub fn get_catalog(&self) -> db::Catalog {
+        let db = self.db.lock().unwrap();
+        db::Catalog {
+            files: db.get_all_files().unwrap_or_default(),
+            holders: db.get_all_holders().unwrap_or_default(),
+        }
+    }
+
+    /// Which devices hold this item, and which content each one has.
+    pub fn get_file_holders(&self, file_id: &str) -> Vec<db::FileHolder> {
+        let db = self.db.lock().unwrap();
+        db.get_holders(file_id).unwrap_or_default()
+    }
+
+    /// Sends a copy of an item to specific devices.
+    ///
+    /// This is the primary way bytes move. The sender keeps its own copy; each
+    /// recipient claims a holder row once it has assembled the content.
+    ///
+    /// Name collisions are not handled yet: a recipient that already has a
+    /// different item at the same path will reject the metadata rather than
+    /// prompting to override or keep both.
+    pub fn share_to(
+        &self,
+        file_id: String,
+        target_device_ids: Vec<String>,
+    ) -> Result<(), EngineError> {
+        if target_device_ids.is_empty() {
+            return Err(EngineError::from("Select at least one device to share with"));
+        }
+
+        let (file, blocks) = {
+            let db = self.db.lock().unwrap();
+            let file = db
+                .get_file_by_id(&file_id)
+                .map_err(EngineError::from)?
+                .ok_or_else(|| EngineError::from("No such item in the catalog"))?;
+            let blocks = db.get_blocks_for_file(&file_id).unwrap_or_default();
+            (file, blocks)
+        };
+
+        if blocks.is_empty() || !blocks.iter().all(|b| b.is_present == 1) {
+            return Err(EngineError::from(
+                "This device does not hold the data for that item",
+            ));
+        }
+
+        // Only paired, currently visible devices can receive anything.
+        let targets: Vec<(String, String)> = {
+            let peers = self.known_peers.lock().unwrap();
+            let db = self.db.lock().unwrap();
+            target_device_ids
+                .iter()
+                .filter(|id| db.is_paired(id).unwrap_or(false))
+                .filter_map(|id| peers.get(id).map(|d| (id.clone(), d.url.clone())))
+                .collect()
+        };
+
+        if targets.is_empty() {
+            return Err(EngineError::from(
+                "None of those devices are paired and reachable",
+            ));
+        }
+
         let storage = self.storage_dir.clone();
         let cert = self.identity.cert_pem.clone();
         let key = self.identity.key_pem.clone();
-        let peers = self.known_peers.clone();
         let tx = self.event_tx.clone();
 
-        // Update local DB first
-        {
-            let db = db.lock().unwrap();
-            if let Ok(Some(mut file)) = db.get_file_by_id(&file_id) {
-                file.pinned_devices = devices.clone();
-                file.version += 1; // bump version
-                if let Err(e) = db.insert_file(&file) {
-                    return Err(EngineError::from(e.to_string()));
-                }
-            } else {
-                return Err(EngineError::from("File not found"));
-            }
-        }
-
-        // Push updated metadata to all peers
         self.runtime.spawn(async move {
-            let peers = peers.lock().unwrap().clone();
             let trusted_certs = match storage::load_all_trusted_certs(&storage) {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(e) => {
+                    let _ = tx.send(EngineEvent::ErrorEvent { message: e.to_string() });
+                    return;
+                }
             };
             let client = match discovery::build_mtls_client(&cert, &key, &trusted_certs) {
                 Ok(c) => c,
-                Err(_) => return,
-            };
-
-            let (file, blocks) = {
-                let db = db.lock().unwrap();
-                let file = match db.get_file_by_id(&file_id).ok().flatten() {
-                    Some(f) => f,
-                    None => return,
-                };
-                let blocks = db.get_blocks_for_file(&file_id).unwrap_or_default();
-                (file, blocks)
-            };
-
-            let push_req = serde_json::json!({
-                "file": file.clone(),
-                "blocks": blocks.clone()
-            });
-
-            let we_have_data = blocks.iter().all(|b| b.is_present == 1);
-
-            for (peer_id, peer) in peers {
-                let peer_url = &peer.url;
-                let _ = client.post(format!("{}/push_metadata", peer_url)).json(&push_req).send().await;
-
-                let peer_is_pinned = file.pinned_devices.contains(&peer_id);
-
-                if peer_is_pinned && we_have_data {
-                    for b in &blocks {
-                        if let Ok(data) = storage::read_block(&storage, &b.block_id) {
-                            let _ = client.post(format!("{}/push_block/{}", peer_url, b.block_id)).body(data).send().await;
-                        }
-                    }
-                    let _ = client.post(format!("{}/finalize_file/{}", peer_url, file_id)).send().await;
+                Err(e) => {
+                    let _ = tx.send(EngineEvent::ErrorEvent { message: e.to_string() });
+                    return;
                 }
-            }
+            };
 
-            let _ = tx.send(EngineEvent::FileSent { path: file.path.clone() });
+            let announce = serde_json::json!({ "file": file, "blocks": blocks });
+
+            for (device_id, url) in targets {
+                let announced = client
+                    .post(format!("{}/push_metadata", url))
+                    .json(&announce)
+                    .send()
+                    .await;
+
+                match announced {
+                    Ok(r) if r.status().is_success() => {}
+                    Ok(r) => {
+                        let _ = tx.send(EngineEvent::ErrorEvent {
+                            message: format!("{} refused {}: {}", device_id, file.path, r.status()),
+                        });
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(EngineEvent::ErrorEvent {
+                            message: format!("Could not reach {}: {}", device_id, e),
+                        });
+                        continue;
+                    }
+                }
+
+                let mut sent_all = true;
+                for b in &blocks {
+                    let data = match storage::read_block(&storage, &b.block_id) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let _ = tx.send(EngineEvent::ErrorEvent {
+                                message: format!("Missing block for {}: {}", file.path, e),
+                            });
+                            sent_all = false;
+                            break;
+                        }
+                    };
+                    if client
+                        .post(format!("{}/push_block/{}", url, b.block_id))
+                        .body(data)
+                        .send()
+                        .await
+                        .is_err()
+                    {
+                        sent_all = false;
+                        break;
+                    }
+                }
+
+                if !sent_all {
+                    continue;
+                }
+
+                // The recipient claims its holder row on finalize; until then it
+                // has the blocks but is not recorded as holding the item.
+                let _ = client
+                    .post(format!("{}/finalize_file/{}", url, file.id))
+                    .send()
+                    .await;
+
+                let _ = tx.send(EngineEvent::FileSent { path: file.path.clone() });
+            }
         });
+
         Ok(())
     }
 

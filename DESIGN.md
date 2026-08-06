@@ -250,36 +250,46 @@ pinned at pairing time.
 
 ## 13. Build order
 
-1. **Pairing** — 6-digit code protocol replacing trust-on-first-use.
-2. **Holder sets** — `file_holders` with per-copy content hashes.
-3. **Push** — `share_to(item, targets)` plus the collision prompt.
-4. **Pull, delete, trash** — including offline delete queueing and the 30-day sweep.
+1. ~~**Pairing** — 6-digit code protocol replacing trust-on-first-use.~~ **Done.**
+2. ~~**Holder sets** — `file_holders` with per-copy content hashes.~~ **Done.**
+3. **Push** — the collision prompt. `share_to(item, targets)` transfers, but a
+   recipient that already has a different item at the same path rejects the
+   metadata instead of offering Override or Keep both.
+4. **Pull, delete, trash** — `/request_delete` with offline queueing, the
+   30-day retention and its sweep, and restore.
 5. **Platform surfaces** — folder invariant on desktop, `import_file()` on mobile.
 6. **Performance and cleanup** — block size, batched transfer, catalog sync on
    peer discovery.
 
-Steps 1 and 2 are load-bearing: everything after assumes trusted peers and a
+Steps 1 and 2 were load-bearing: everything after assumes trusted peers and a
 truthful holder set.
+
+Until step 4 lands, deleting the last copy of an item leaves the catalog entry
+in place with an empty holder set rather than moving it to trash. Nothing is
+silently destroyed, but nothing is recoverable either.
 
 ---
 
 ## 14. Known issues in the code as it stands
 
-- `identity.json` — containing the Ed25519 signing key and the TLS private key —
-  is committed to the repository.
-- `TrustedCerts::is_trusted` returns `true` when the trusted list is empty
-  (`tls.rs:29`), and `start_server` falls back to `with_no_client_auth` when no
-  peers are known (`server.rs:79`). Both fail open.
-- `sync_with_peer` fetches a peer certificate over an unverified connection and
-  saves it as trusted (`discovery.rs:180`) — trust on first use.
-- Block size is 4 KB (`storage.rs:8`) and each block is fetched in its own HTTP
-  round-trip (`discovery.rs:139`). A 1 GB file is 262,144 requests.
+- **Pairing is not man-in-the-middle proof.** The proof binds the code to both
+  certificates, which defeats eavesdropping and naive relaying, but an active
+  attacker who captures a proof can brute-force six digits offline in
+  milliseconds. The expiry and attempt cap bound *online* guessing only.
+  Closing it properly needs a PAKE such as SPAKE2, where the code is never
+  committed to. Acceptable on a home network; not on a hostile one.
+- Block size is 4 KB (`storage.rs`) and each block moves in its own HTTP
+  round-trip. A 1 GB file is 262,144 requests.
 - Tombstones are dead code: the table and helpers exist, nothing writes or reads
-  them, and no endpoint serves them.
-- The pinned-file download path writes to a hardcoded `/tmp/local_cloud_sync/`
-  (`discovery.rs:227`) instead of the configured sync directory.
-- The desktop app never syncs on peer discovery; only the CLI does
-  (`cli/src/main.rs:38`).
+  them, and no endpoint serves them. They come alive with trash in step 4.
+- The desktop app never syncs the catalog on peer discovery; only the CLI does
+  (`cli/src/main.rs`).
 - File identity is path-based, so a rename is indistinguishable from
   delete-plus-create.
 - Blocks are stored unencrypted at rest.
+- A device's certificate is pinned for good; there is no rotation path, so a
+  compromised key means unpairing and pairing again.
+
+Fixed since the first draft: the committed `identity.json`, the two fail-open
+TLS paths, trust-on-first-use in `sync_with_peer`, and the hardcoded
+`/tmp/local_cloud_sync/` download path.

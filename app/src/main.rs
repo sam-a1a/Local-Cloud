@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use localcloud::db::{FileHolder, PairedDevice};
 use localcloud::{Engine, FileMetadata};
 use std::sync::Arc;
 
@@ -94,7 +95,9 @@ fn app() -> Element {
 
     // UI State
     let mut files = use_signal(Vec::new);
+    let mut holders = use_signal(Vec::new);
     let mut peers = use_signal(Vec::new);
+    let mut paired = use_signal(Vec::new);
     let mut logs = use_signal(Vec::new);
 
     // Dedicated clone for the background poller so `engine` stays usable
@@ -115,8 +118,11 @@ fn app() -> Element {
                     }
                 }
 
-                files.write().clone_from(&poll_engine.get_local_files());
+                let catalog = poll_engine.get_catalog();
+                files.write().clone_from(&catalog.files);
+                holders.write().clone_from(&catalog.holders);
                 peers.write().clone_from(&poll_engine.get_known_peers());
+                paired.write().clone_from(&poll_engine.paired_devices());
             }
         }
     });
@@ -131,24 +137,30 @@ fn app() -> Element {
             h2 { "Devices on this network ({peers.read().len()})" }
             ul {
                 for peer in peers.read().iter() {
-                    li { "{peer.name} · {peer.platform}" }
+                    li {
+                        "{peer.name} · {peer.platform}"
+                        if paired.read().iter().any(|d: &PairedDevice| d.id == peer.device_id) {
+                            span { color: "green", " · paired" }
+                        } else {
+                            span { color: "gray", " · not paired" }
+                        }
+                    }
                 }
             }
 
-            h2 { "Files ({files.read().len()})" }
+            h2 { "Catalog ({files.read().len()})" }
             table { border_collapse: "collapse", width: "100%",
                 thead {
                     tr {
-                        th { text_align: "left", border_bottom: "1px solid black", "Path" }
+                        th { text_align: "left", border_bottom: "1px solid black", "Name" }
                         th { text_align: "left", border_bottom: "1px solid black", "Size" }
-                        th { text_align: "left", border_bottom: "1px solid black", "Version" }
-                        th { text_align: "left", border_bottom: "1px solid black", "Pinned Devices" }
+                        th { text_align: "left", border_bottom: "1px solid black", "Copies on" }
                         th { text_align: "left", border_bottom: "1px solid black", "Actions" }
                     }
                 }
                 tbody {
-                    for file in files.read().iter().cloned() {
-                        { file_row(file, engine.clone()) }
+                    for row in catalog_rows(&files.read(), &holders.read(), &paired.read(), &engine) {
+                        { file_row(row.0, row.1, engine.clone()) }
                     }
                 }
             }
@@ -159,16 +171,23 @@ fn app() -> Element {
                         let engine = engine.clone();
                         move |_| {
                             let f = files.read();
-                            let p = peers.read();
-                            if !f.is_empty() && !p.is_empty() {
-                                let file_id = f[0].id.clone();
-                                let peer_id = p[0].device_id.clone();
-                                println!("[UI] Pinning {} to {}", file_id, peer_id);
-                                let _ = engine.set_file_pinned_devices(file_id, vec![peer_id]);
+                            let d = paired.read();
+                            match (f.first(), d.first()) {
+                                (Some(file), Some(device)) => {
+                                    let device: &PairedDevice = device;
+                                    println!("[UI] Sharing {} with {}", file.path, device.name);
+                                    if let Err(e) =
+                                        engine.share_to(file.id.clone(), vec![device.id.clone()])
+                                    {
+                                        println!("[UI] Share failed: {}", e);
+                                    }
+                                }
+                                (None, _) => println!("[UI] Nothing in the catalog yet"),
+                                (_, None) => println!("[UI] No paired devices yet"),
                             }
                         }
                     },
-                    "Pin First File to First Peer"
+                    "Share first item with first paired device"
                 }
             }
 
@@ -182,19 +201,68 @@ fn app() -> Element {
     }
 }
 
-fn file_row(file: FileMetadata, engine: Arc<Engine>) -> Element {
+/// Pairs each catalog item with a readable summary of who holds it.
+///
+/// A copy whose content hash differs from the item's is marked, because copies
+/// are snapshots that never update themselves - a device can hold a version
+/// several edits behind, and the catalog should say so rather than implying
+/// every holder is current.
+fn catalog_rows(
+    files: &[FileMetadata],
+    holders: &[FileHolder],
+    devices: &[PairedDevice],
+    engine: &Engine,
+) -> Vec<(FileMetadata, String)> {
+    let my_id = engine.device_id();
+    let my_name = engine.device_name();
+
+    files
+        .iter()
+        .map(|file| {
+            let mut names: Vec<String> = holders
+                .iter()
+                .filter(|h| h.file_id == file.id)
+                .map(|h| {
+                    let name = if h.device_id == my_id {
+                        my_name.clone()
+                    } else {
+                        devices
+                            .iter()
+                            .find(|d| d.id == h.device_id)
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| h.device_id.chars().take(8).collect())
+                    };
+
+                    if h.content_hash == file.content_hash {
+                        name
+                    } else {
+                        format!("{} (older)", name)
+                    }
+                })
+                .collect();
+            names.sort();
+
+            let summary = if names.is_empty() {
+                "no copies".to_string()
+            } else {
+                names.join(", ")
+            };
+
+            (file.clone(), summary)
+        })
+        .collect()
+}
+
+fn file_row(file: FileMetadata, holders: String, engine: Arc<Engine>) -> Element {
     let path = file.path.clone();
     let size = file.size;
-    let version = file.version;
-    let pinned = file.pinned_devices.join(", ");
     let file_id = file.id.clone();
 
     rsx! {
         tr {
             td { "{path}" }
             td { "{size}" }
-            td { "{version}" }
-            td { "{pinned}" }
+            td { "{holders}" }
             td {
                 button {
                     onclick: move |_| {

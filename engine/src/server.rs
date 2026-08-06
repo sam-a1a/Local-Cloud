@@ -196,7 +196,7 @@ pub async fn start_server(
 
     // Reachable only over a connection authenticated with a pinned certificate.
     let protected = Router::new()
-        .route("/list_files", get(list_files))
+        .route("/catalog", get(get_catalog))
         .route("/get_block/{block_id}", get(get_block))
         .route("/push_metadata", post(push_metadata))
         .route("/push_block/{block_id}", post(push_block))
@@ -307,9 +307,13 @@ async fn pair_confirm(
     Json(state.own_info()).into_response()
 }
 
-async fn list_files(State(state): State<AppState>) -> Json<Vec<crate::FileMetadata>> {
+/// The full shared namespace: every item, and who holds which content of it.
+async fn get_catalog(State(state): State<AppState>) -> Json<crate::db::Catalog> {
     let db = state.db.lock().unwrap();
-    Json(db.get_all_files().unwrap_or_default())
+    Json(crate::db::Catalog {
+        files: db.get_all_files().unwrap_or_default(),
+        holders: db.get_all_holders().unwrap_or_default(),
+    })
 }
 
 async fn get_block(
@@ -328,22 +332,19 @@ struct PushMetadataRequest {
     blocks: Vec<crate::db::FileBlock>,
 }
 
+/// Announces an item about to be sent. The sender is describing the content it
+/// is transferring, so its block list replaces whatever we had for that item.
 async fn push_metadata(
     State(state): State<AppState>,
     Json(req): Json<PushMetadataRequest>,
 ) -> impl IntoResponse {
     let db = state.db.lock().unwrap();
 
-    // Clear old block mappings if we are updating an existing file
-    if let Ok(Some(existing)) = db.get_file_by_id(&req.file.id) {
-        if req.file.version > existing.version {
-            let _ = db.clear_blocks_for_file(&req.file.id);
-        }
-    }
-
-    if let Err(e) = db.upsert_file_from_peer(&req.file) {
+    if let Err(e) = db.upsert_file_from_catalog(&req.file) {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save metadata: {}", e));
     }
+
+    let _ = db.clear_blocks_for_file(&req.file.id);
     for b in &req.blocks {
         let block_meta = crate::db::BlockMetadata {
             id: b.block_id.clone(),
@@ -398,6 +399,19 @@ async fn finalize_file(
 
         match crate::storage::assemble_file_from_blocks(&state.storage_dir, &output_path, &blocks) {
             Ok(_) => {
+                // We now hold this content, so claim our own holder row. Only
+                // this device may write it.
+                let received_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let _ = db.set_holder(&crate::db::FileHolder {
+                    file_id: file_id.clone(),
+                    device_id: state.device_id.clone(),
+                    content_hash: crate::storage::content_hash(&blocks),
+                    received_at,
+                });
+
                 let _ = state.event_tx.send(EngineEvent::FileDownloaded { path: file.path.clone() });
 
                 crate::ignore::schedule_unmark_ignored(state.ignore_set.clone(), output_path, 3);

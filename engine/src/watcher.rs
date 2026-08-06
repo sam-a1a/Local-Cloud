@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use crate::db::{Database, FileMetadata};
+use crate::db::{Database, FileHolder, FileMetadata};
 use crate::ignore::IgnoreSet;
 use crate::storage;
 use crate::EngineEvent;
@@ -116,46 +116,84 @@ async fn handle_fs_event(
                     Err(_) => 0,
                 };
 
-                let (file_id, new_version, should_process, existing_pinned) = {
+                let (file_id, known_hash) = {
                     let db = db.lock().unwrap();
                     match db.get_file_by_path(&relative_path) {
-                        Ok(Some(existing)) => {
-                            if existing.size == file_size {
-                                (existing.id.clone(), existing.version, false, existing.pinned_devices)
-                            } else {
-                                (existing.id.clone(), existing.version + 1, true, existing.pinned_devices)
-                            }
-                        }
+                        Ok(Some(existing)) => (existing.id, existing.content_hash),
                         _ => {
-                            let new_id = format!("{}-{}", device_id, uuid::Uuid::new_v4().to_string().replace("-", ""));
-                            (new_id, 1, true, vec![device_id.clone()])
+                            let new_id = format!(
+                                "{}-{}",
+                                device_id,
+                                uuid::Uuid::new_v4().to_string().replace("-", "")
+                            );
+                            (new_id, String::new())
                         }
                     }
                 };
 
-                if !should_process { continue; }
-
-                let file_meta = FileMetadata {
-                    id: file_id.clone(),
-                    path: relative_path.clone(),
-                    size: file_size,
-                    modified_time,
-                    version: new_version,
-                    created_by: device_id.clone(),
-                    pinned_devices: existing_pinned, // Inherit pins on modifications
-                };
-
-                {
+                let content_hash = {
                     let db = db.lock().unwrap();
-                    if let Err(e) = db.insert_file(&file_meta) {
+
+                    // file_blocks references files(id), so the row has to exist
+                    // before blocks can be mapped to it.
+                    let placeholder = FileMetadata {
+                        id: file_id.clone(),
+                        path: relative_path.clone(),
+                        size: file_size,
+                        content_hash: known_hash.clone(),
+                        modified_time,
+                        created_by: device_id.clone(),
+                    };
+                    if let Err(e) = db.insert_file(&placeholder) {
                         println!("[Watcher] Failed to insert file metadata: {}", e);
                         continue;
                     }
-                    // Clear old blocks because the file changed
+
                     let _ = db.clear_blocks_for_file(&file_id);
-                    if let Err(e) = storage::chunk_and_store_file(&storage_dir, &db, &file_id, &path_str) {
+                    if let Err(e) =
+                        storage::chunk_and_store_file(&storage_dir, &db, &file_id, &path_str)
+                    {
                         println!("[Watcher] Failed to chunk file: {}", e);
                         continue;
+                    }
+
+                    let blocks = db.get_blocks_for_file(&file_id).unwrap_or_default();
+                    storage::content_hash(&blocks)
+                };
+
+                // Editors touch files without changing them. Comparing the
+                // block manifest rather than mtime or size means a rewrite with
+                // identical content is correctly treated as a non-event.
+                if content_hash == known_hash {
+                    continue;
+                }
+
+                {
+                    let db = db.lock().unwrap();
+                    let file_meta = FileMetadata {
+                        id: file_id.clone(),
+                        path: relative_path.clone(),
+                        size: file_size,
+                        content_hash: content_hash.clone(),
+                        modified_time,
+                        created_by: device_id.clone(),
+                    };
+                    if let Err(e) = db.insert_file(&file_meta) {
+                        println!("[Watcher] Failed to record content hash: {}", e);
+                        continue;
+                    }
+
+                    // On desktop the sync folder holds exactly what this device
+                    // holds, so a file appearing in it makes this device a
+                    // holder of that content.
+                    let holder = FileHolder {
+                        file_id: file_id.clone(),
+                        device_id: device_id.clone(),
+                        content_hash,
+                        received_at: modified_time,
+                    };
+                    if let Err(e) = db.set_holder(&holder) {
+                        println!("[Watcher] Failed to record holder: {}", e);
                     }
                 }
 
@@ -176,12 +214,14 @@ async fn handle_fs_event(
                 let relative_path = path_str.strip_prefix(&watch_dir).unwrap_or(&path_str).trim_start_matches('/').to_string();
                 if relative_path.is_empty() { continue; }
 
-                println!("[Watcher] Detected local delete (freeing space): {}", relative_path);
+                println!("[Watcher] Detected local delete: {}", relative_path);
 
+                // Dragging a file out of the sync folder deletes *this device's
+                // copy*. Other devices' copies are untouched, and the item
+                // stays in the catalog for as long as anyone still holds it.
                 let db = db.lock().unwrap();
                 match db.get_file_by_path(&relative_path) {
                     Ok(Some(file)) => {
-                        // "Free up space": Keep metadata, but mark blocks as missing and delete physical blocks
                         let blocks = match db.get_blocks_for_file(&file.id) {
                             Ok(b) => b,
                             Err(e) => {
@@ -195,7 +235,27 @@ async fn handle_fs_event(
                             let block_path = storage::get_block_path(&storage_dir, &b.block_id);
                             let _ = std::fs::remove_file(block_path);
                         }
-                        println!("[Watcher] Freed up space for file locally (metadata kept): {}", relative_path);
+
+                        if let Err(e) = db.remove_holder(&file.id, &device_id) {
+                            println!("[Watcher] Failed to drop holder row: {}", e);
+                        }
+
+                        let remaining = db.holder_count(&file.id).unwrap_or(0);
+                        if remaining == 0 {
+                            // Last copy. Trash and the 30-day retention that
+                            // should catch this are not built yet, so the
+                            // catalog entry is kept and simply has no holders
+                            // rather than the item disappearing outright.
+                            println!(
+                                "[Watcher] Last copy of {} removed; item now has no holders",
+                                relative_path
+                            );
+                        } else {
+                            println!(
+                                "[Watcher] Dropped local copy of {}; {} copies remain",
+                                relative_path, remaining
+                            );
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => println!("[Watcher] DB lookup failed: {}", e),

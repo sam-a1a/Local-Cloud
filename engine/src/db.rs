@@ -8,15 +8,19 @@ pub struct Database {
     pub conn: Connection,
 }
 
+/// An item in the shared catalog.
+///
+/// Carries no version number and no list of devices. Copies never merge, so
+/// there is nothing for a version to order; `content_hash` says what this item
+/// currently is, and `file_holders` says who has which content.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileMetadata {
     pub id: String,
     pub path: String,
     pub size: i64,
+    pub content_hash: String,
     pub modified_time: i64,
-    pub version: i64,
     pub created_by: String,
-    pub pinned_devices: Vec<String>, // NEW: Tracks which devices should hold the data
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -45,6 +49,13 @@ pub struct FileHolder {
     pub device_id: String,
     pub content_hash: String,
     pub received_at: i64,
+}
+
+/// The whole shared namespace as one device knows it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Catalog {
+    pub files: Vec<FileMetadata>,
+    pub holders: Vec<FileHolder>,
 }
 
 /// A device this one has paired with. Its certificate is pinned, so it is the
@@ -76,17 +87,16 @@ fn holder_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileHolder> {
     })
 }
 
+const FILE_COLUMNS: &str = "id, path, size, content_hash, modified_time, created_by";
+
 fn file_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileMetadata> {
-    let pinned_str: String = row.get(6)?;
-    let pinned_devices: Vec<String> = serde_json::from_str(&pinned_str).unwrap_or_default();
     Ok(FileMetadata {
         id: row.get(0)?,
         path: row.get(1)?,
         size: row.get(2)?,
-        modified_time: row.get(3)?,
-        version: row.get(4)?,
+        content_hash: row.get(3)?,
+        modified_time: row.get(4)?,
         created_by: row.get(5)?,
-        pinned_devices,
     })
 }
 
@@ -104,8 +114,8 @@ impl Database {
             );
             CREATE TABLE IF NOT EXISTS files (
                 id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, size INTEGER NOT NULL,
-                modified_time INTEGER NOT NULL, version INTEGER NOT NULL, created_by TEXT NOT NULL,
-                pinned_devices TEXT NOT NULL DEFAULT '[]'
+                content_hash TEXT NOT NULL DEFAULT '',
+                modified_time INTEGER NOT NULL, created_by TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS blocks (
                 id TEXT PRIMARY KEY, size INTEGER NOT NULL, is_present INTEGER NOT NULL DEFAULT 0
@@ -142,20 +152,38 @@ impl Database {
     fn migrate(&self) -> Result<()> {
         self.add_column_if_missing("devices", "platform", "TEXT NOT NULL DEFAULT ''")?;
         self.add_column_if_missing("files", "content_hash", "TEXT NOT NULL DEFAULT ''")?;
+
+        // Both belonged to the merge-and-pin model that no longer exists.
+        // version ordered concurrent edits, which cannot happen now that copies
+        // never propagate on their own; pinned_devices recorded where data
+        // *should* go, which file_holders replaces with where it actually is.
+        self.drop_column_if_present("files", "version")?;
+        self.drop_column_if_present("files", "pinned_devices")?;
         Ok(())
     }
 
-    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+    fn column_names(&self, table: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
-        let existing: Vec<String> = stmt
+        let names = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(names)
+    }
 
-        if !existing.iter().any(|c| c == column) {
+    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        if !self.column_names(table)?.iter().any(|c| c == column) {
             self.conn.execute_batch(&format!(
                 "ALTER TABLE {} ADD COLUMN {} {}",
                 table, column, definition
             ))?;
+        }
+        Ok(())
+    }
+
+    fn drop_column_if_present(&self, table: &str, column: &str) -> Result<()> {
+        if self.column_names(table)?.iter().any(|c| c == column) {
+            self.conn
+                .execute_batch(&format!("ALTER TABLE {} DROP COLUMN {}", table, column))?;
         }
         Ok(())
     }
@@ -232,18 +260,25 @@ impl Database {
     }
 
     pub fn insert_file(&self, file: &FileMetadata) -> Result<()> {
-        let pinned_str = serde_json::to_string(&file.pinned_devices)?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO files (id, path, size, modified_time, version, created_by, pinned_devices) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![file.id, file.path, file.size, file.modified_time, file.version, file.created_by, pinned_str],
+            "INSERT OR REPLACE INTO files (id, path, size, content_hash, modified_time, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                file.id,
+                file.path,
+                file.size,
+                file.content_hash,
+                file.modified_time,
+                file.created_by
+            ],
         )?;
         Ok(())
     }
 
     pub fn get_all_files(&self) -> Result<Vec<FileMetadata>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, path, size, modified_time, version, created_by, pinned_devices FROM files"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {} FROM files", FILE_COLUMNS))?;
         let files = stmt.query_map([], file_from_row)?;
 
         let mut result = Vec::new();
@@ -254,35 +289,43 @@ impl Database {
     }
 
     pub fn get_file_by_id(&self, file_id: &str) -> Result<Option<FileMetadata>> {
-        let result = self.conn.query_row(
-            "SELECT id, path, size, modified_time, version, created_by, pinned_devices FROM files WHERE id = ?1",
-            rusqlite::params![file_id],
-            file_from_row,
-        ).optional()?;
+        let result = self
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM files WHERE id = ?1", FILE_COLUMNS),
+                rusqlite::params![file_id],
+                file_from_row,
+            )
+            .optional()?;
         Ok(result)
     }
 
-    pub fn upsert_file_from_peer(&self, file: &FileMetadata) -> Result<()> {
-        let pinned_str = serde_json::to_string(&file.pinned_devices)?;
-        let existing_version: Option<i64> = self.conn.query_row(
-            "SELECT version FROM files WHERE path = ?1",
-            rusqlite::params![file.path],
-            |row| row.get(0),
-        ).optional()?;
-
-        if let Some(existing_version) = existing_version {
-            if file.version > existing_version {
-                self.conn.execute(
-                    "UPDATE files SET id = ?1, size = ?2, modified_time = ?3, version = ?4, created_by = ?5, pinned_devices = ?6 WHERE path = ?7",
-                    rusqlite::params![file.id, file.size, file.modified_time, file.version, file.created_by, pinned_str, file.path],
-                )?;
-            }
-        } else {
-            self.conn.execute(
-                "INSERT INTO files (id, path, size, modified_time, version, created_by, pinned_devices) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![file.id, file.path, file.size, file.modified_time, file.version, file.created_by, pinned_str],
-            )?;
-        }
+    /// Accepts an item as described by a peer's catalog.
+    ///
+    /// There is no version comparison, because there is nothing to order:
+    /// copies never propagate on their own, so two devices cannot concurrently
+    /// advance the same item. Items are keyed by id; a second item claiming an
+    /// already-taken path is a name collision, which the sender resolves with
+    /// the user at send time rather than being silently merged here.
+    pub fn upsert_file_from_catalog(&self, file: &FileMetadata) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO files (id, path, size, content_hash, modified_time, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                path = excluded.path,
+                size = excluded.size,
+                content_hash = excluded.content_hash,
+                modified_time = excluded.modified_time,
+                created_by = excluded.created_by",
+            rusqlite::params![
+                file.id,
+                file.path,
+                file.size,
+                file.content_hash,
+                file.modified_time,
+                file.created_by
+            ],
+        )?;
         Ok(())
     }
 
@@ -493,6 +536,38 @@ impl Database {
         Ok(count)
     }
 
+    /// Replaces everything known about one device's copies.
+    ///
+    /// Used when merging a peer's catalog: that peer is the only authority on
+    /// what it holds, so its rows are taken wholesale rather than merged. This
+    /// is what lets a deletion propagate - a copy the peer no longer reports is
+    /// a copy it no longer has.
+    pub fn replace_holders_for_device(
+        &self,
+        device_id: &str,
+        holders: &[FileHolder],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM file_holders WHERE device_id = ?1",
+            rusqlite::params![device_id],
+        )?;
+        for holder in holders {
+            tx.execute(
+                "INSERT OR REPLACE INTO file_holders (file_id, device_id, content_hash, received_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    holder.file_id,
+                    holder.device_id,
+                    holder.content_hash,
+                    holder.received_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drops every holder row for a file, used when an item leaves the catalog.
     pub fn clear_holders(&self, file_id: &str) -> Result<()> {
         self.conn.execute(
@@ -503,11 +578,14 @@ impl Database {
     }
 
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
-        let result = self.conn.query_row(
-            "SELECT id, path, size, modified_time, version, created_by, pinned_devices FROM files WHERE path = ?1",
-            rusqlite::params![path],
-            file_from_row,
-        ).optional()?;
+        let result = self
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM files WHERE path = ?1", FILE_COLUMNS),
+                rusqlite::params![path],
+                file_from_row,
+            )
+            .optional()?;
         Ok(result)
     }
 }
@@ -615,6 +693,52 @@ mod tests {
         db.clear_holders("f2").unwrap();
         assert_eq!(db.holder_count("f1").unwrap(), 1);
         assert_eq!(db.holder_count("f2").unwrap(), 0);
+    }
+
+    #[test]
+    fn an_old_database_migrates_without_losing_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("old.db");
+        let path = path.to_string_lossy().to_string();
+
+        // The schema as it was under the merge-and-pin model.
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, size INTEGER NOT NULL,
+                    modified_time INTEGER NOT NULL, version INTEGER NOT NULL,
+                    created_by TEXT NOT NULL, pinned_devices TEXT NOT NULL DEFAULT '[]'
+                 );
+                 CREATE TABLE devices (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, cert_pem TEXT NOT NULL,
+                    paired_at INTEGER NOT NULL, last_seen INTEGER NOT NULL
+                 );
+                 INSERT INTO files VALUES ('f1', 'notes.txt', 10, 111, 3, 'android', '[\"macos\"]');
+                 INSERT INTO devices VALUES ('d1', 'MacBook', 'cert', 1, 2);",
+            )
+            .expect("seed old schema");
+        }
+
+        let db = Database::init(&path).expect("migrate");
+
+        // Nothing was dropped on the way.
+        let file = db.get_file_by_path("notes.txt").expect("query").expect("row");
+        assert_eq!(file.id, "f1");
+        assert_eq!(file.created_by, "android");
+        assert_eq!(file.size, 10);
+        assert!(db.is_paired("d1").expect("query"));
+        assert_eq!(db.get_paired_devices().expect("query")[0].name, "MacBook");
+
+        // The merge-and-pin columns are gone and the content hash is in place.
+        let columns = db.column_names("files").expect("columns");
+        assert!(!columns.iter().any(|c| c == "version"));
+        assert!(!columns.iter().any(|c| c == "pinned_devices"));
+        assert!(columns.iter().any(|c| c == "content_hash"));
+
+        // Migrating twice must be a no-op rather than an error.
+        drop(db);
+        Database::init(&path).expect("second migration is idempotent");
     }
 
     #[test]

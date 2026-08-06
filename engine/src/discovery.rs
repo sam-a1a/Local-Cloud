@@ -239,89 +239,63 @@ pub async fn sync_with_peer(
         Err(_) => return,
     };
 
-    // 2. Fetch peer's file list
-    let remote_files: Vec<crate::FileMetadata> = match mtls_client.get(format!("{}/list_files", peer_url)).send().await {
-        Ok(res) => match res.json().await { Ok(f) => f, Err(e) => { println!("[Sync] Failed to parse list_files: {}", e); return; } },
-        Err(e) => { println!("[Sync] Failed to fetch list_files: {}", e); return; }
+    // 2. Pull the peer's view of the shared namespace.
+    //
+    // Catalog replication is pull-only in both directions: each device asks its
+    // peers what they know rather than broadcasting. Nothing here moves file
+    // data - bytes only ever move because a person shared or pulled something.
+    let catalog: crate::db::Catalog = match mtls_client
+        .get(format!("{}/catalog", peer_url))
+        .send()
+        .await
+    {
+        Ok(res) => match res.json().await {
+            Ok(c) => c,
+            Err(e) => {
+                println!("[Sync] Failed to parse catalog: {}", e);
+                return;
+            }
+        },
+        Err(e) => {
+            println!("[Sync] Failed to fetch catalog: {}", e);
+            return;
+        }
     };
 
-    // 3. Upsert remote files and auto-download if we are pinned
-    for remote_file in &remote_files {
-        let (need_blocks, missing_blocks) = {
-            let db = db_clone.lock().unwrap();
-            let _ = db.upsert_file_from_peer(remote_file);
+    let db = db_clone.lock().unwrap();
 
-            // If we are pinned, check if we are missing blocks
-            if remote_file.pinned_devices.contains(&my_device_id) {
-                let local_blocks = db.get_blocks_for_file(&remote_file.id).unwrap_or_default();
-                let missing: Vec<crate::db::FileBlock> = local_blocks.into_iter().filter(|b| b.is_present == 0).collect();
-                (!missing.is_empty(), missing)
-            } else {
-                (false, vec![])
-            }
-        }; // db lock dropped
-
-        if need_blocks {
-            println!("[Sync] Auto-downloading pinned file: {}", remote_file.path);
-            let success = fetch_blocks_from_peer(&mtls_client, &peer_url, &missing_blocks, &db_clone, &storage_dir_clone).await;
-
-            if success {
-                // Assemble the file locally so the user sees it
-                let db = db_clone.lock().unwrap();
-                let blocks = db.get_blocks_for_file(&remote_file.id).unwrap_or_default();
-                let output_path = format!("/tmp/local_cloud_sync/{}", remote_file.path);
-                let _ = crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks);
-
-                let _ = event_tx.send(EngineEvent::FileDownloaded { path: remote_file.path.clone() });
-            }
+    for file in &catalog.files {
+        // A path collision between two different items is a name clash that
+        // the sender resolves with the user, not something to merge blindly.
+        if let Err(e) = db.upsert_file_from_catalog(file) {
+            println!("[Sync] Skipped {}: {}", file.path, e);
         }
     }
 
-    // 4. Push our local files that the peer doesn't have or is outdated on
-    let local_files = {
-        let db = db_clone.lock().unwrap();
-        db.get_all_files().unwrap_or_default()
-    };
-
-    for local_file in &local_files {
-        let remote_version = remote_files.iter().find(|f| f.path == local_file.path).map(|f| f.version);
-
-        let needs_push = match remote_version {
-            Some(v) => local_file.version > v,
-            None => true,
-        };
-
-        if needs_push {
-            let (blocks, blocks_data_present) = {
-                let db = db_clone.lock().unwrap();
-                let blocks = db.get_blocks_for_file(&local_file.id).unwrap_or_default();
-                let all_present = blocks.iter().all(|b| b.is_present == 1);
-                (blocks, all_present)
-            };
-
-            let push_req = serde_json::json!({
-                "file": local_file,
-                "blocks": blocks.clone()
-            });
-
-            if let Err(e) = mtls_client.post(format!("{}/push_metadata", peer_url)).json(&push_req).send().await {
-                println!("[Sync] Failed to push metadata: {}", e);
-                continue;
-            }
-
-            // If we have the data and peer is pinned to it, push blocks automatically
-            if blocks_data_present && local_file.pinned_devices.contains(&peer_id) {
-                for b in &blocks {
-                    if let Ok(data) = crate::storage::read_block(&storage_dir_clone, &b.block_id) {
-                        let _ = mtls_client.post(format!("{}/push_block/{}", peer_url, b.block_id)).body(data).send().await;
-                    }
-                }
-                let _ = mtls_client.post(format!("{}/finalize_file/{}", peer_url, local_file.id)).send().await;
-            }
-        }
+    // The peer is the sole authority on its own copies, so its rows replace
+    // ours wholesale - that is how a copy it deleted stops being listed.
+    let peer_holders: Vec<crate::db::FileHolder> = catalog
+        .holders
+        .iter()
+        .filter(|h| h.device_id == peer_id)
+        .cloned()
+        .collect();
+    if let Err(e) = db.replace_holders_for_device(&peer_id, &peer_holders) {
+        println!("[Sync] Failed to record {}'s copies: {}", peer_id, e);
     }
 
-    println!("[Sync] Finished metadata sync with {}", peer_id);
+    // What it reports about third devices is useful for discovering copies on
+    // devices we cannot currently reach, but it is never allowed to overwrite
+    // what we know about ourselves.
+    for holder in &catalog.holders {
+        if holder.device_id == peer_id || holder.device_id == my_device_id {
+            continue;
+        }
+        let _ = db.set_holder(holder);
+    }
+
+    println!("[Sync] Finished catalog sync with {}", peer_id);
+    let _ = event_tx;
 }
 
 pub async fn download_file_on_demand(

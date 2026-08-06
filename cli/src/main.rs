@@ -63,18 +63,24 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Demo: Auto-pin the first file to the first peer after 5 seconds
-    // This will force the peer to automatically download the data blocks
-    let engine_pin = engine.clone();
+    // Demo: share the first file with the first paired device after 5 seconds.
+    // Nothing is transferred unless a person asks for it, and only paired
+    // devices can receive anything, so this does nothing until pairing has run.
+    let engine_share = engine.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        let peers = engine_pin.get_known_peers();
-        let files = engine_pin.get_local_files();
-        if !peers.is_empty() && !files.is_empty() {
-            let peer_id = peers.first().unwrap().device_id.clone();
-            let file_id = files.first().unwrap().id.clone();
-            println!("[Demo] Auto-pinning file {} to peer {}", file_id, peer_id);
-            let _ = engine_pin.set_file_pinned_devices(file_id, vec![peer_id]);
+        let devices = engine_share.paired_devices();
+        let files = engine_share.get_local_files();
+
+        match (devices.first(), files.first()) {
+            (Some(device), Some(file)) => {
+                println!("[Demo] Sharing {} with {}", file.path, device.name);
+                if let Err(e) = engine_share.share_to(file.id.clone(), vec![device.id.clone()]) {
+                    println!("[Demo] Share failed: {}", e);
+                }
+            }
+            (None, _) => println!("[Demo] No paired devices yet - pair one first"),
+            (_, None) => println!("[Demo] No files indexed yet"),
         }
     });
 
