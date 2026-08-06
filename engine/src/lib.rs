@@ -16,6 +16,7 @@ pub use db::Tombstone;
 pub use crypto::DeviceIdentity;
 pub use discovery::{DiscoveredDevice, PeerMap};
 pub use ignore::{new_ignore_set, IgnoreSet};
+pub use tls::TrustStore;
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -60,6 +61,7 @@ pub struct Engine {
     mdns_daemon: StdMutex<Option<ServiceDaemon>>,
     server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     known_peers: PeerMap,
+    trust: TrustStore,
 }
 
 impl Engine {
@@ -92,6 +94,9 @@ impl Engine {
         let (event_tx, event_rx) = mpsc::channel();
         let known_peers = Arc::new(StdMutex::new(HashMap::new()));
 
+        let trust = TrustStore::new();
+        trust.reload(&storage_dir).map_err(EngineError::from)?;
+
         Ok(Self {
             db: db_state,
             identity,
@@ -105,6 +110,7 @@ impl Engine {
             mdns_daemon: StdMutex::new(None),
             server_task: StdMutex::new(None),
             known_peers,
+            trust,
         })
     }
 
@@ -267,6 +273,7 @@ impl Engine {
         let server_tx = self.event_tx.clone();
         let server_tx_err = self.event_tx.clone();
         let server_ignore = self.ignore_set.clone();
+        let server_trust = self.trust.clone();
 
         let server_task = handle.spawn(async move {
             if let Err(e) = server::start_server(
@@ -278,6 +285,7 @@ impl Engine {
                 server_storage,
                 server_sync,
                 server_ignore,
+                server_trust,
                 server_tx,
             ).await {
                 let _ = server_tx_err.send(EngineEvent::ErrorEvent {

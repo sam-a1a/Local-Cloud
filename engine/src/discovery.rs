@@ -9,7 +9,7 @@ use std::net::UdpSocket;
 use std::sync::{Arc, Mutex, mpsc};
 use crate::db::Database;
 use crate::ignore::IgnoreSet;
-use crate::tls::TrustedCerts;
+use crate::tls::TrustStore;
 use crate::EngineEvent;
 
 const SERVICE_TYPE: &str = "_local-cloud._tcp.local.";
@@ -36,13 +36,13 @@ fn get_local_ip() -> String {
 
 #[derive(Debug)]
 struct TrustedPeerServerVerifier {
-    certs: TrustedCerts,
+    trust: TrustStore,
 }
 
 impl TrustedPeerServerVerifier {
     fn new(trusted_cert_pems: &[String]) -> Self {
         Self {
-            certs: TrustedCerts::new(trusted_cert_pems),
+            trust: TrustStore::from_pems(trusted_cert_pems),
         }
     }
 }
@@ -56,7 +56,7 @@ impl ServerCertVerifier for TrustedPeerServerVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if self.certs.is_trusted(end_entity) {
+        if self.trust.is_trusted(end_entity) {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(

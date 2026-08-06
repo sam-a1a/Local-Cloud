@@ -3,36 +3,70 @@ use rustls::pki_types::CertificateDer;
 use std::io::Cursor;
 use anyhow::Result;
 use rustls::pki_types::PrivateKeyDer;
+use std::sync::{Arc, RwLock};
 
-#[derive(Debug)]
-pub struct TrustedCerts {
-    trusted_cert_ders: Vec<Vec<u8>>,
+/// The set of peer certificates this device has pinned through pairing.
+///
+/// Shared and reloadable: the running TLS server holds one of these, and
+/// completing a pairing must take effect immediately rather than at the next
+/// restart. An empty store trusts nobody.
+#[derive(Debug, Clone, Default)]
+pub struct TrustStore {
+    certs: Arc<RwLock<Vec<Vec<u8>>>>,
 }
 
-impl TrustedCerts {
-    pub fn new(trusted_cert_pems: &[String]) -> Self {
-        let mut trusted_cert_ders = Vec::new();
-        for pem in trusted_cert_pems {
+impl TrustStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds a point-in-time store from PEM strings.
+    pub fn from_pems(pems: &[String]) -> Self {
+        let store = Self::new();
+        store.replace_with(pems);
+        store
+    }
+
+    /// Reads every pinned certificate from disk, replacing the current set.
+    pub fn reload(&self, storage_dir: &str) -> Result<()> {
+        let pems = crate::storage::load_all_trusted_certs(storage_dir)?;
+        self.replace_with(&pems);
+        Ok(())
+    }
+
+    fn replace_with(&self, pems: &[String]) {
+        let mut ders = Vec::new();
+        for pem in pems {
             let mut cursor = Cursor::new(pem.as_bytes());
             if let Ok(certs) = rustls_pemfile::certs(&mut cursor)
                 .collect::<Result<Vec<CertificateDer<'static>>, _>>()
             {
                 for cert in certs {
-                    trusted_cert_ders.push(cert.to_vec());
+                    ders.push(cert.to_vec());
                 }
             }
         }
-        Self { trusted_cert_ders }
+        *self.certs.write().unwrap() = ders;
+    }
+
+    /// Exact-match against a pinned certificate.
+    ///
+    /// Fails closed. An empty store means no device has been paired yet, which
+    /// is precisely when nothing should be trusted.
+    pub fn is_trusted_der(&self, presented: &[u8]) -> bool {
+        self.certs
+            .read()
+            .unwrap()
+            .iter()
+            .any(|trusted| trusted.as_slice() == presented)
     }
 
     pub fn is_trusted(&self, end_entity: &CertificateDer<'_>) -> bool {
-        if self.trusted_cert_ders.is_empty() {
-            return true;
-        }
-        let presented = end_entity.as_ref();
-        self.trusted_cert_ders
-            .iter()
-            .any(|trusted| trusted.as_slice() == presented)
+        self.is_trusted_der(end_entity.as_ref())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.certs.read().unwrap().is_empty()
     }
 }
 
@@ -47,7 +81,8 @@ pub fn load_certs_and_key(
         .collect::<Result<Vec<_>, _>>()?;
 
     let key = PrivateKeyDer::from(
-        rustls_pemfile::private_key(&mut key_cursor)?.unwrap(),
+        rustls_pemfile::private_key(&mut key_cursor)?
+            .ok_or_else(|| anyhow::anyhow!("No private key found in PEM"))?,
     );
 
     Ok((certs, key))

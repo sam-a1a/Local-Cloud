@@ -1,11 +1,12 @@
 // engine/src/server.rs
 use crate::db::Database;
 use crate::ignore::IgnoreSet;
-use crate::tls::TrustedCerts;
+use crate::tls::TrustStore;
 use crate::EngineEvent;
 use anyhow::Result;
 use axum::{
-    body::Bytes, extract::Path, extract::State, response::IntoResponse, routing::{get, post}, Json, Router,
+    body::Bytes, extract::Path, extract::Request, extract::State, middleware::Next,
+    response::IntoResponse, response::Response, routing::{get, post}, Json, Router,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -24,25 +25,35 @@ pub struct AppState {
     pub sync_dir: String,
     pub cert_pem: String,
     pub ignore_set: IgnoreSet,
+    pub trust: TrustStore,
     pub event_tx: mpsc::Sender<EngineEvent>,
 }
 
+/// The client certificate presented on the connection a request arrived over,
+/// if any. Absent means the peer connected anonymously, which only pairing
+/// endpoints permit.
+#[derive(Clone, Debug)]
+pub struct PeerCertificate(pub Option<Vec<u8>>);
+
 #[derive(Debug)]
 struct TrustedPeerVerifier {
-    certs: TrustedCerts,
-}
-
-impl TrustedPeerVerifier {
-    fn new(trusted_cert_pems: &[String]) -> Self {
-        Self {
-            certs: TrustedCerts::new(trusted_cert_pems),
-        }
-    }
+    trust: TrustStore,
 }
 
 impl ClientCertVerifier for TrustedPeerVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &[]
+    }
+
+    /// Unpaired devices must be able to reach the pairing endpoints, so a
+    /// missing client certificate is allowed at the TLS layer and rejected
+    /// per-route instead. A certificate that *is* presented must be pinned.
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn offer_client_auth(&self) -> bool {
+        true
     }
 
     fn verify_client_cert(
@@ -51,7 +62,7 @@ impl ClientCertVerifier for TrustedPeerVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        if self.certs.is_trusted(end_entity) {
+        if self.trust.is_trusted(end_entity) {
             Ok(rustls::server::danger::ClientCertVerified::assertion())
         } else {
             Err(rustls::Error::General("Certificate not in trusted peers list".into()))
@@ -59,6 +70,29 @@ impl ClientCertVerifier for TrustedPeerVerifier {
     }
 
     crate::impl_tls_verifier_methods!();
+}
+
+/// Gate for everything that touches the catalog or block storage.
+async fn require_paired_peer(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let paired = req
+        .extensions()
+        .get::<PeerCertificate>()
+        .and_then(|p| p.0.as_deref())
+        .is_some_and(|der| state.trust.is_trusted_der(der));
+
+    if paired {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            "Device is not paired with this one",
+        )
+            .into_response()
+    }
 }
 
 pub async fn start_server(
@@ -70,22 +104,17 @@ pub async fn start_server(
     storage_dir: String,
     sync_dir: String,
     ignore_set: IgnoreSet,
+    trust: TrustStore,
     event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<()> {
     let (certs, key) = crate::tls::load_certs_and_key(&cert_pem, &key_pem)?;
 
-    let trusted_certs = crate::storage::load_all_trusted_certs(&storage_dir)?;
-
-    let config = if trusted_certs.is_empty() {
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?
-    } else {
-        let verifier = Arc::new(TrustedPeerVerifier::new(&trusted_certs));
-        ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)?
-    };
+    // The verifier holds the shared store, so a pairing completed while the
+    // server is running takes effect on the next connection.
+    let verifier = Arc::new(TrustedPeerVerifier { trust: trust.clone() });
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?;
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let cert_pem_state = cert_pem.clone();
@@ -96,10 +125,12 @@ pub async fn start_server(
         sync_dir,
         cert_pem: cert_pem_state,
         ignore_set,
+        trust,
         event_tx,
     };
 
-    let app = Router::new()
+    // Reachable by any device on the network; used to bootstrap pairing.
+    let public = Router::new()
         .route("/ping", get({
             let id = device_id.clone();
             move || {
@@ -108,12 +139,22 @@ pub async fn start_server(
             }
         }))
         .route("/hello", get(get_hello))
+        .with_state(state.clone());
+
+    // Reachable only over a connection authenticated with a pinned certificate.
+    let protected = Router::new()
         .route("/list_files", get(list_files))
         .route("/get_block/{block_id}", get(get_block))
         .route("/push_metadata", post(push_metadata))
         .route("/push_block/{block_id}", post(push_block))
         .route("/finalize_file/{file_id}", post(finalize_file))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_paired_peer,
+        ))
         .with_state(state);
+
+    let app = public.merge(protected);
 
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -126,11 +167,24 @@ pub async fn start_server(
                 Err(_) => return,
             };
 
+            // Captured once per connection and attached to every request on it,
+            // so handlers and middleware can tell who they are talking to.
+            let peer_cert = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|cert| cert.as_ref().to_vec());
+
             let io = TokioIo::new(tls_stream);
             let _ = Builder::new(TokioExecutor::new())
-                .serve_connection(io, hyper::service::service_fn(move |req| {
+                .serve_connection(io, hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                     let app = app.clone();
-                    async move { app.oneshot(req).await }
+                    let peer_cert = peer_cert.clone();
+                    async move {
+                        req.extensions_mut().insert(PeerCertificate(peer_cert));
+                        app.oneshot(req).await
+                    }
                 }))
                 .await;
         });
