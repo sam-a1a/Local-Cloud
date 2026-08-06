@@ -116,15 +116,21 @@ An item leaves the catalog only when its last copy is deleted.
 Deleting the **last** copy is the only operation that can destroy data, so it is
 the only one that goes through trash.
 
-- The bytes stay on the deleting device for **30 days**.
+- The bytes stay on the deleting device for **30 days**, and so does its holder
+  row. This is not an oversight: an item nobody holds could not be restored.
 - The item is marked trashed across the whole mesh and can be restored from any
   device.
 - Restoring makes it live again where the bytes already are. It does not pull a
   copy to the device you restored from; do that separately if you want one.
 - The deleting device does not get its space back during those 30 days. A
   **Delete permanently** option is offered prominently for when space is the point.
-- After 30 days the holder purges the blocks and propagates a tombstone. Every
+- After 30 days the holder releases the blocks and propagates a tombstone. Every
   device drops the catalog entry.
+
+An hourly sweep applies the retention, and runs once at startup so trash that
+expired while a device was switched off is still cleared. Only blocks nothing
+else references are released — blocks are shared by content, so two identical
+files hold the same ones.
 
 ---
 
@@ -243,6 +249,14 @@ pinned at pairing time.
 | `GET /get_block/{id}` | Serve a block to a puller |
 | `POST /request_delete` | Ask a device to drop its copy |
 
+The catalog carries four things: items, holder rows, outstanding delete requests
+and tombstones. The last two are what make deletion survive a device being away —
+a request reaches a target that was offline, and a tombstone stops a device that
+missed a destruction from handing the item back.
+
+Blocks are verified on arrival: a block id *is* the SHA-256 of its contents, so
+one that does not hash to its own id is refused rather than assembled into a file.
+
 ---
 
 ## 12. Worked example
@@ -274,20 +288,18 @@ pinned at pairing time.
 2. ~~**Holder sets** — `file_holders` with per-copy content hashes.~~ **Done.**
 3. ~~**Push** — the collision prompt, and the trash storage Override needs.~~
    **Done.**
-4. **Pull, delete, trash** — `/request_delete` with offline queueing, the 30-day
-   retention and its sweep, and permanent delete. Restore already works.
-5. **Platform surfaces** — folder invariant on desktop, `import_file()` on mobile.
+4. ~~**Pull, delete, trash** — `/request_delete` with offline queueing, the
+   30-day retention and its sweep, permanent delete and restore.~~ **Done.**
+5. **Platform surfaces** — folder invariant on desktop, `import_file()` on mobile,
+   the watcher compiled desktop-only, an iOS Files provider extension.
 6. **Performance and cleanup** — block size, batched transfer, catalog sync on
    peer discovery.
 
 Steps 1 and 2 were load-bearing: everything after assumes trusted peers and a
 truthful holder set.
 
-Until step 4 lands, deleting the last copy of an item leaves the catalog entry in
-place with an empty holder set rather than moving it to trash. Nothing is
-silently destroyed. Trash itself exists and is reachable — Override puts content
-there and Restore brings it back — but only Override currently routes anything
-into it, and nothing is ever purged.
+The model in sections 1–7 is complete. What remains is reach — making it usable
+from each platform's own idioms — and making large files fast.
 
 ---
 
@@ -300,23 +312,27 @@ into it, and nothing is ever purged.
   Closing it properly needs a PAKE such as SPAKE2, where the code is never
   committed to. Acceptable on a home network; not on a hostile one.
 - Block size is 4 KB (`storage.rs`) and each block moves in its own HTTP
-  round-trip. A 1 GB file is 262,144 requests.
-- Tombstones are dead code: the table and helpers exist, nothing writes or reads
-  them, and no endpoint serves them. They come alive with trash in step 4.
+  round-trip. A 1 GB file is 262,144 requests. This is the largest thing left.
 - The desktop app never syncs the catalog on peer discovery; only the CLI does
   (`cli/src/main.rs`).
-- File identity is path-based, so a rename is indistinguishable from
-  delete-plus-create.
+- File identity is path-based at creation, so renaming a file in the folder reads
+  as delete-plus-create rather than a rename.
 - Blocks are stored unencrypted at rest.
 - A device's certificate is pinned for good; there is no rotation path, so a
   compromised key means unpairing and pairing again.
-- `share_to` does not consult the collision rules. Since the catalog is shared,
-  an item being sent already owns its name everywhere, so a send cannot create a
-  conflict — but a recipient whose catalog has not caught up will reject the
-  metadata until its next sync.
-- The on-disk renames that keep the sync folder in step with the catalog have no
-  automated test, because driving real filesystem events is timing-dependent.
+- Tombstones are never garbage-collected. They are one small row per destroyed
+  item and are kept deliberately, since dropping one lets a device that was away
+  long enough reintroduce what it names. Worth revisiting only if the count ever
+  becomes a problem.
+- A delete request aimed at a device that never returns waits forever. It costs
+  one row and is visible in the app, which seems better than expiring it and
+  silently leaving the copy in place.
+- Concurrent edits of the same item on two devices both set the item's content
+  hash, and the last catalog sync wins for that field. Each holder row still
+  records truthfully what that device has, so nothing is lost and the divergence
+  is visible — but the catalog's idea of "current" is last-writer-wins.
 
-Fixed since the first draft: the committed `identity.json`, the two fail-open
-TLS paths, trust-on-first-use in `sync_with_peer`, and the hardcoded
-`/tmp/local_cloud_sync/` download path.
+Fixed along the way: the committed `identity.json`, the two fail-open TLS paths,
+trust-on-first-use in `sync_with_peer`, the hardcoded `/tmp/local_cloud_sync/`
+download path, deleting blocks that another item still needed, pushes being
+refused by a stale catalog, and unverified block contents.

@@ -188,13 +188,28 @@ async fn fetch_blocks_from_peer(
             return false;
         }
 
-        if let Ok(data) = resp.bytes().await {
-            let _ = crate::storage::write_block(storage_dir_clone, &b.block_id, &data);
-            let db = db_clone.lock().unwrap();
-            let _ = db.set_block_present(&b.block_id, true);
-        } else {
+        let Ok(data) = resp.bytes().await else {
+            return false;
+        };
+
+        // Block ids are the SHA-256 of their contents, so what arrived can be
+        // checked against what was asked for. Without this a peer could serve
+        // anything and it would be assembled into the file unnoticed.
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&data);
+        let actual = hex::encode(hasher.finalize());
+        if actual != b.block_id {
+            println!(
+                "[Sync] Refusing block from {}: content does not match its id",
+                peer_url
+            );
             return false;
         }
+
+        let _ = crate::storage::write_block(storage_dir_clone, &b.block_id, &data);
+        let db = db_clone.lock().unwrap();
+        let _ = db.set_block_present(&b.block_id, true);
     }
     true
 }
@@ -383,70 +398,101 @@ pub async fn sync_with_peer(
     println!("[Sync] Finished catalog sync with {}", peer_id);
 }
 
-pub async fn download_file_on_demand(
+/// Takes a copy of an item for this device.
+///
+/// The counterpart to sharing: instead of a sender choosing a destination, a
+/// device helps itself to something it can see. Both are deliberate acts by a
+/// person; nothing here runs on its own.
+pub async fn pull_copy(
     file_id: String,
+    my_device_id: String,
     db_clone: Arc<Mutex<Database>>,
-    storage_dir_clone: String,
-    sync_dir_clone: String,
+    storage_dir: String,
+    sync_dir: String,
     cert_pem: String,
     key_pem: String,
     known_peers: PeerMap,
     ignore_set: IgnoreSet,
     event_tx: mpsc::Sender<EngineEvent>,
 ) -> Result<(), String> {
-    // 1. Check if we already have it locally
     let (file, blocks, missing) = {
         let db = db_clone.lock().unwrap();
-        let file = db.get_file_by_id(&file_id).map_err(|e| e.to_string())?
-            .ok_or("File not in DB")?;
+        let file = db
+            .get_file_by_id(&file_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("No such item in the catalog")?;
+        if file.is_trashed() {
+            return Err("That item is in the trash; restore it first".to_string());
+        }
         let blocks = db.get_blocks_for_file(&file_id).map_err(|e| e.to_string())?;
-        let missing: Vec<crate::db::FileBlock> = blocks.iter().filter(|b| b.is_present == 0).cloned().collect();
+        let missing: Vec<crate::db::FileBlock> =
+            blocks.iter().filter(|b| b.is_present == 0).cloned().collect();
         (file, blocks, missing)
     };
 
-    if missing.is_empty() {
-        let output_path = format!("{}/{}", sync_dir_clone, file.path);
-        crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks).map_err(|e| e.to_string())?;
-        return Ok(());
+    if blocks.is_empty() {
+        return Err("No content is recorded for that item yet".to_string());
     }
 
-    // 2. Find a paired device that has the blocks. Unpaired devices on the
-    // network are not candidates, and would refuse the request anyway.
-    let peers: Vec<DiscoveredDevice> = {
-        let visible = known_peers.lock().unwrap().clone();
-        let db = db_clone.lock().unwrap();
-        visible
-            .into_values()
-            .filter(|d| db.is_paired(&d.device_id).unwrap_or(false))
-            .collect()
-    };
+    if !missing.is_empty() {
+        // Only paired devices that actually hold this item are worth asking.
+        // Anything else either has nothing to give or would refuse.
+        let sources: Vec<DiscoveredDevice> = {
+            let visible = known_peers.lock().unwrap().clone();
+            let db = db_clone.lock().unwrap();
+            visible
+                .into_values()
+                .filter(|d| db.is_paired(&d.device_id).unwrap_or(false))
+                .filter(|d| db.is_holder(&file_id, &d.device_id).unwrap_or(false))
+                .collect()
+        };
 
-    if peers.is_empty() {
-        return Err("No paired devices are available".to_string());
-    }
+        if sources.is_empty() {
+            return Err("No device holding that item is reachable".to_string());
+        }
 
-    let trusted_certs = crate::storage::load_all_trusted_certs(&storage_dir_clone).map_err(|e| e.to_string())?;
-    let client = build_mtls_client(&cert_pem, &key_pem, &trusted_certs).map_err(|e| e.to_string())?;
+        let trusted_certs =
+            crate::storage::load_all_trusted_certs(&storage_dir).map_err(|e| e.to_string())?;
+        let client =
+            build_mtls_client(&cert_pem, &key_pem, &trusted_certs).map_err(|e| e.to_string())?;
 
-    // Try peers until one works
-    for peer in peers {
-        let peer_url = peer.url;
-        let success = fetch_blocks_from_peer(&client, &peer_url, &missing, &db_clone, &storage_dir_clone).await;
-
-        if success {
-            let output_path = format!("{}/{}", sync_dir_clone, file.path);
-            if let Some(parent) = std::path::Path::new(&output_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
+        let mut fetched = false;
+        for source in sources {
+            if fetch_blocks_from_peer(&client, &source.url, &missing, &db_clone, &storage_dir).await
+            {
+                fetched = true;
+                break;
             }
-            crate::ignore::mark_ignored(&ignore_set, &output_path);
-            crate::storage::assemble_file_from_blocks(&storage_dir_clone, &output_path, &blocks).map_err(|e| e.to_string())?;
+            println!("[Pull] {} could not supply the content", source.name);
+        }
 
-            crate::ignore::schedule_unmark_ignored(ignore_set.clone(), output_path, 3);
-
-            let _ = event_tx.send(EngineEvent::FileDownloaded { path: file.path.clone() });
-            return Ok(());
+        if !fetched {
+            return Err("Could not get the content from any holder".to_string());
         }
     }
 
-    Err("Failed to download from all peers".to_string())
+    // On desktop the folder holds exactly what this device holds, so a pulled
+    // item has to appear in it.
+    let output_path = format!("{}/{}", sync_dir, file.path);
+    if let Some(parent) = std::path::Path::new(&output_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    crate::ignore::mark_ignored(&ignore_set, &output_path);
+    crate::storage::assemble_file_from_blocks(&storage_dir, &output_path, &blocks)
+        .map_err(|e| e.to_string())?;
+    crate::ignore::schedule_unmark_ignored(ignore_set.clone(), output_path, 3);
+
+    // Claiming the holder row is what makes the copy visible to everyone else.
+    {
+        let db = db_clone.lock().unwrap();
+        let _ = db.set_holder(&crate::db::FileHolder {
+            file_id,
+            device_id: my_device_id,
+            content_hash: crate::storage::content_hash(&blocks),
+            received_at: crate::watcher::now_secs(),
+        });
+    }
+
+    let _ = event_tx.send(EngineEvent::FileDownloaded { path: file.path });
+    Ok(())
 }

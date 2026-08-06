@@ -100,6 +100,7 @@ fn app() -> Element {
     let mut paired = use_signal(Vec::new);
     let mut collisions = use_signal(Vec::new);
     let mut trashed = use_signal(Vec::new);
+    let mut queued_deletes = use_signal(Vec::new);
     let mut logs = use_signal(Vec::new);
 
     // Dedicated clone for the background poller so `engine` stays usable
@@ -127,6 +128,9 @@ fn app() -> Element {
                 paired.write().clone_from(&poll_engine.paired_devices());
                 collisions.write().clone_from(&poll_engine.pending_collisions());
                 trashed.write().clone_from(&poll_engine.get_trashed_files());
+                queued_deletes
+                    .write()
+                    .clone_from(&poll_engine.pending_delete_requests());
             }
         }
     });
@@ -148,6 +152,18 @@ fn app() -> Element {
                         } else {
                             span { color: "gray", " · not paired" }
                         }
+                    }
+                }
+            }
+
+            if !queued_deletes.read().is_empty() {
+                h2 { "Deletes waiting ({queued_deletes.read().len()})" }
+                p { font_size: "12px", color: "gray",
+                    "These devices were not reachable. Each will drop its copy when it comes back."
+                }
+                ul {
+                    for request in queued_deletes.read().iter() {
+                        li { "{request.file_id} on {request.target_device}" }
                     }
                 }
             }
@@ -208,7 +224,7 @@ fn app() -> Element {
             if !trashed.read().is_empty() {
                 h2 { "Trash ({trashed.read().len()})" }
                 p { font_size: "12px", color: "gray",
-                    "Still held by whichever devices had them, so these can be brought back."
+                    "Still held by whichever devices had them, so these can be brought back. Destroyed automatically once their 30 days run out."
                 }
                 for file in trashed.read().iter().cloned() {
                     { trashed_row(file, engine.clone()) }
@@ -314,19 +330,37 @@ fn collision_row(collision: PendingCollision, engine: Arc<Engine>) -> Element {
 
 fn trashed_row(file: FileMetadata, engine: Arc<Engine>) -> Element {
     let path = file.path.clone();
-    let file_id = file.id.clone();
+
+    let days_left = engine
+        .trash_seconds_remaining(&file.id)
+        .map(|secs| (secs + 86_399) / 86_400)
+        .unwrap_or(0);
+
+    let restore_engine = engine.clone();
+    let restore_id = file.id.clone();
+    let purge_id = file.id.clone();
 
     rsx! {
         div { padding: "4px 0",
             span { "{path}" }
+            span { color: "gray", font_size: "12px", " · {days_left} days left" }
             button {
                 margin_left: "8px",
                 onclick: move |_| {
-                    if let Err(e) = engine.restore_file(file_id.clone()) {
+                    if let Err(e) = restore_engine.restore_file(restore_id.clone()) {
                         println!("[UI] Restore failed: {}", e);
                     }
                 },
                 "Restore"
+            }
+            button {
+                margin_left: "8px",
+                onclick: move |_| {
+                    if let Err(e) = engine.delete_permanently(purge_id.clone()) {
+                        println!("[UI] Permanent delete failed: {}", e);
+                    }
+                },
+                "Delete permanently"
             }
         }
     }
@@ -335,7 +369,15 @@ fn trashed_row(file: FileMetadata, engine: Arc<Engine>) -> Element {
 fn file_row(file: FileMetadata, holders: String, engine: Arc<Engine>) -> Element {
     let path = file.path.clone();
     let size = file.size;
-    let file_id = file.id.clone();
+
+    let held_here = engine
+        .get_file_holders(&file.id)
+        .iter()
+        .any(|h| h.device_id == engine.device_id());
+
+    let pull_engine = engine.clone();
+    let pull_id = file.id.clone();
+    let delete_id = file.id.clone();
 
     rsx! {
         tr {
@@ -343,15 +385,24 @@ fn file_row(file: FileMetadata, holders: String, engine: Arc<Engine>) -> Element
             td { "{size}" }
             td { "{holders}" }
             td {
-                button {
-                    onclick: move |_| {
-                        let fid = file_id.clone();
-                        let eng = engine.clone();
-                        tokio::spawn(async move {
-                            let _ = eng.fetch_file_on_demand(fid);
-                        });
-                    },
-                    "Fetch"
+                if held_here {
+                    button {
+                        onclick: move |_| {
+                            if let Err(e) = engine.delete_local_copy(delete_id.clone()) {
+                                println!("[UI] Delete failed: {}", e);
+                            }
+                        },
+                        "Delete my copy"
+                    }
+                } else {
+                    button {
+                        onclick: move |_| {
+                            if let Err(e) = pull_engine.pull_copy(pull_id.clone()) {
+                                println!("[UI] Pull failed: {}", e);
+                            }
+                        },
+                        "Get a copy"
+                    }
                 }
             }
         }

@@ -383,22 +383,29 @@ impl Engine {
         Ok(())
     }
 
-    pub fn fetch_file_on_demand(&self, file_id: String) -> Result<(), EngineError> {
+    /// Takes a copy of an item for this device.
+    ///
+    /// The counterpart to `share_to`: instead of a sender choosing where
+    /// something goes, a device helps itself to something it can see. Both are
+    /// deliberate acts by a person - nothing copies itself.
+    pub fn pull_copy(&self, file_id: String) -> Result<(), EngineError> {
         let db = self.db.clone();
         let storage = self.storage_dir.clone();
         let sync = self.sync_dir.clone();
         let cert = self.identity.cert_pem.clone();
         let key = self.identity.key_pem.clone();
+        let my_id = self.identity.device_id.clone();
         let peers = self.known_peers.clone();
         let ignore = self.ignore_set.clone();
         let tx = self.event_tx.clone();
 
         self.runtime.spawn(async move {
-            match discovery::download_file_on_demand(
-                file_id, db, storage, sync, cert, key, peers, ignore, tx
-            ).await {
-                Ok(_) => println!("[Engine] On-demand fetch successful"),
-                Err(e) => println!("[Engine] On-demand fetch failed: {}", e),
+            if let Err(e) = discovery::pull_copy(
+                file_id, my_id, db, storage, sync, cert, key, peers, ignore, tx.clone(),
+            )
+            .await
+            {
+                let _ = tx.send(EngineEvent::ErrorEvent { message: e });
             }
         });
         Ok(())
