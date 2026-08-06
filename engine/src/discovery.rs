@@ -266,6 +266,16 @@ pub async fn sync_with_peer(
         }
     };
 
+    // Destructions are applied first, so an item the peer already destroyed is
+    // not merged back in only to be removed again.
+    for tombstone in &catalog.tombstones {
+        match indexer.apply_tombstone(tombstone) {
+            Ok(true) => println!("[Sync] {} was destroyed elsewhere", tombstone.file_id),
+            Ok(false) => {}
+            Err(e) => println!("[Sync] Could not apply tombstone: {}", e),
+        }
+    }
+
     let db = db_clone.lock().unwrap();
 
     for file in &catalog.files {
@@ -311,16 +321,19 @@ pub async fn sync_with_peer(
                     kept_as: to,
                 });
             }
+            Ok(crate::db::MergeOutcome::AlreadyDestroyed) => {}
             Err(e) => println!("[Sync] Skipped {}: {}", file.path, e),
         }
     }
 
     // The peer is the sole authority on its own copies, so its rows replace
     // ours wholesale - that is how a copy it deleted stops being listed.
+    // Rows for destroyed items are dropped rather than becoming orphans.
     let peer_holders: Vec<crate::db::FileHolder> = catalog
         .holders
         .iter()
         .filter(|h| h.device_id == peer_id)
+        .filter(|h| !db.has_tombstone(&h.file_id).unwrap_or(false))
         .cloned()
         .collect();
     if let Err(e) = db.replace_holders_for_device(&peer_id, &peer_holders) {
@@ -332,6 +345,9 @@ pub async fn sync_with_peer(
     // what we know about ourselves.
     for holder in &catalog.holders {
         if holder.device_id == peer_id || holder.device_id == my_device_id {
+            continue;
+        }
+        if db.has_tombstone(&holder.file_id).unwrap_or(false) {
             continue;
         }
         let _ = db.set_holder(holder);

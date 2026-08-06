@@ -30,6 +30,16 @@ use tokio::net::TcpListener;
 use notify::RecommendedWatcher;
 use mdns_sd::ServiceDaemon;
 
+/// How long a trashed item stays restorable before its bytes are released.
+///
+/// Only ever reached by the last copy of an item: deleting a copy while others
+/// remain frees the space at once, because nothing can be lost.
+pub const TRASH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// How often expired trash is looked for. The retention is measured in days, so
+/// checking hourly is ample and costs nothing when there is nothing to do.
+const TRASH_SWEEP_INTERVAL_SECS: u64 = 60 * 60;
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("{description}")]
@@ -54,6 +64,8 @@ pub enum EngineEvent {
     CollisionResolved { path: String },
     CopyDeleted { file_id: String, device_id: String },
     FileTrashed { file_id: String },
+    FileRestored { file_id: String },
+    FilePurged { file_id: String },
     FileIndexed { path: String },
     FileSent { path: String },
     FileDownloaded { path: String },
@@ -72,6 +84,7 @@ pub struct Engine {
     watcher: StdMutex<Option<RecommendedWatcher>>,
     mdns_daemon: StdMutex<Option<ServiceDaemon>>,
     server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    trash_sweep_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     known_peers: PeerMap,
     trust: TrustStore,
     pairing: PairingState,
@@ -123,6 +136,7 @@ impl Engine {
             watcher: StdMutex::new(None),
             mdns_daemon: StdMutex::new(None),
             server_task: StdMutex::new(None),
+            trash_sweep_task: StdMutex::new(None),
             known_peers,
             trust,
             pairing: PairingState::new(),
@@ -397,6 +411,7 @@ impl Engine {
             files: db.get_all_files().unwrap_or_default(),
             holders: db.get_all_holders().unwrap_or_default(),
             delete_requests: db.get_delete_requests().unwrap_or_default(),
+            tombstones: db.get_all_tombstones().unwrap_or_default(),
         }
     }
 
@@ -605,9 +620,65 @@ impl Engine {
     }
 
     /// Brings a trashed item back under its original name.
+    ///
+    /// Possible for as long as some device still holds its bytes, which is why
+    /// deleting a last copy keeps them rather than freeing the space.
     pub fn restore_file(&self, file_id: String) -> Result<(), EngineError> {
+        {
+            let db = self.db.lock().unwrap();
+            db.restore_file(&file_id).map_err(EngineError::from)?;
+        }
+        let _ = self.event_tx.send(EngineEvent::FileRestored {
+            file_id: file_id.clone(),
+        });
+        Ok(())
+    }
+
+    /// Destroys a trashed item now instead of waiting out its retention.
+    ///
+    /// Frees the space immediately and cannot be undone. Peers purge it too
+    /// once they see the tombstone.
+    pub fn delete_permanently(&self, file_id: String) -> Result<(), EngineError> {
+        {
+            let db = self.db.lock().unwrap();
+            let file = db
+                .get_file_by_id(&file_id)
+                .map_err(EngineError::from)?
+                .ok_or_else(|| EngineError::from("No such item in the catalog"))?;
+            if !file.is_trashed() {
+                return Err(EngineError::from(
+                    "Only a trashed item can be destroyed; delete the copies first",
+                ));
+            }
+        }
+
+        self.indexer().purge(&file_id).map_err(EngineError::from)?;
+        let _ = self.event_tx.send(EngineEvent::FilePurged { file_id });
+        Ok(())
+    }
+
+    /// How long an item has left in trash, in seconds, or None if it is live.
+    pub fn trash_seconds_remaining(&self, file_id: &str) -> Option<i64> {
         let db = self.db.lock().unwrap();
-        db.restore_file(&file_id).map_err(EngineError::from)
+        let file = db.get_file_by_id(file_id).ok().flatten()?;
+        if !file.is_trashed() {
+            return None;
+        }
+        Some((file.trashed_at + TRASH_RETENTION_SECS - watcher::now_secs()).max(0))
+    }
+
+    /// Runs the retention sweep once, rather than waiting for the next tick.
+    /// Returns the items destroyed.
+    pub fn sweep_trash_now(&self) -> Vec<String> {
+        let purged = self
+            .indexer()
+            .sweep_trash(watcher::now_secs(), TRASH_RETENTION_SECS);
+        for file_id in &purged {
+            let _ = self.event_tx.send(EngineEvent::FilePurged {
+                file_id: file_id.clone(),
+            });
+        }
+        purged
     }
 
     /// Which devices hold this item, and which content each one has.
@@ -823,6 +894,27 @@ impl Engine {
 
         *self.watcher.lock().unwrap() = Some(watcher);
 
+        // Retention is measured in days, so an hourly check is ample. It also
+        // runs once immediately, which is what releases trash that expired
+        // while this device was switched off.
+        let sweep_indexer = self.indexer();
+        let sweep_tx = self.event_tx.clone();
+        let sweep_task = self.runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                TRASH_SWEEP_INTERVAL_SECS,
+            ));
+            loop {
+                ticker.tick().await;
+                for file_id in
+                    sweep_indexer.sweep_trash(watcher::now_secs(), TRASH_RETENTION_SECS)
+                {
+                    println!("[Trash] Retention expired, destroyed {}", file_id);
+                    let _ = sweep_tx.send(EngineEvent::FilePurged { file_id });
+                }
+            }
+        });
+        *self.trash_sweep_task.lock().unwrap() = Some(sweep_task);
+
         let _ = self.event_tx.send(EngineEvent::EngineStarted);
         println!("[Engine] Started. Sync folder: {}", self.sync_dir);
         Ok(())
@@ -836,6 +928,9 @@ impl Engine {
             let _ = d.shutdown();
         }
         if let Some(t) = self.server_task.lock().unwrap().take() {
+            t.abort();
+        }
+        if let Some(t) = self.trash_sweep_task.lock().unwrap().take() {
             t.abort();
         }
         let _ = self.event_tx.send(EngineEvent::EngineStopped);

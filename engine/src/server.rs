@@ -321,6 +321,8 @@ async fn get_catalog(State(state): State<AppState>) -> Json<crate::db::Catalog> 
         holders: db.get_all_holders().unwrap_or_default(),
         // So a delete aimed at a device that was away still reaches it.
         delete_requests: db.get_delete_requests().unwrap_or_default(),
+        // So a device that was away cannot hand back a destroyed item.
+        tombstones: db.get_all_tombstones().unwrap_or_default(),
     })
 }
 

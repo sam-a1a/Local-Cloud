@@ -369,6 +369,72 @@ impl Indexer {
         })
     }
 
+    /// Destroys an item for good: its bytes, its catalog entry, and any
+    /// requests still outstanding for it.
+    ///
+    /// A tombstone is left behind so a device that was away cannot hand the
+    /// item back from a stale catalog.
+    pub fn purge(&self, file_id: &str) -> Result<()> {
+        let path = {
+            let db = self.db.lock().unwrap();
+            db.get_file_by_id(file_id)?
+                .ok_or_else(|| anyhow!("No such item in the catalog"))?
+                .path
+        };
+
+        self.remove_from_disk(&self.absolute(&path));
+
+        {
+            let db = self.db.lock().unwrap();
+            purge_exclusive_blocks(&db, &self.storage_dir, file_id)?;
+            db.purge_file(file_id, &self.device_id, now_secs())?;
+        }
+
+        self.collisions.forget_file(file_id);
+        Ok(())
+    }
+
+    /// Destroys trashed items whose retention has run out.
+    ///
+    /// `now` is passed in rather than read from the clock so the retention rule
+    /// can be tested without waiting a month.
+    pub fn sweep_trash(&self, now: i64, retention_secs: i64) -> Vec<String> {
+        let expired = {
+            let db = self.db.lock().unwrap();
+            db.expired_trash(now, retention_secs).unwrap_or_default()
+        };
+
+        let mut purged = Vec::new();
+        for file in expired {
+            match self.purge(&file.id) {
+                Ok(()) => purged.push(file.id),
+                Err(e) => println!("[Trash] Could not purge {}: {}", file.path, e),
+            }
+        }
+        purged
+    }
+
+    /// Applies a destruction a peer has already carried out.
+    pub fn apply_tombstone(&self, tombstone: &crate::db::Tombstone) -> Result<bool> {
+        let known = {
+            let db = self.db.lock().unwrap();
+            if db.has_tombstone(&tombstone.file_id)? {
+                return Ok(false);
+            }
+            db.get_file_by_id(&tombstone.file_id)?.is_some()
+        };
+
+        if known {
+            self.purge(&tombstone.file_id)?;
+        }
+
+        // Recorded either way: a device that never saw the item still has to
+        // refuse it if a third one offers it later.
+        let db = self.db.lock().unwrap();
+        db.insert_tombstone(tombstone)?;
+        Ok(true)
+    }
+
     /// Carries out any standing requests for this device to drop a copy.
     ///
     /// Only the holder can erase its own disk, so a delete aimed at this device

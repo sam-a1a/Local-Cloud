@@ -75,6 +75,8 @@ pub struct DeleteRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
     Applied,
+    /// The item has a tombstone here, so it is not reintroduced.
+    AlreadyDestroyed,
     /// A name conflict was settled by tie-break, moving one item aside.
     Renamed {
         file_id: String,
@@ -92,6 +94,8 @@ pub struct Catalog {
     pub holders: Vec<FileHolder>,
     #[serde(default)]
     pub delete_requests: Vec<DeleteRequest>,
+    #[serde(default)]
+    pub tombstones: Vec<Tombstone>,
 }
 
 /// A device this one has paired with. Its certificate is pinned, so it is the
@@ -106,12 +110,15 @@ pub struct PairedDevice {
     pub last_seen: i64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// A record that an item was destroyed for good.
+///
+/// Kept so a device that was away cannot reintroduce it from a stale catalog.
+/// Carries no version: there is nothing to order, only the fact of deletion.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Tombstone {
     pub file_id: String,
     pub deleted_at: i64,
     pub deleted_by: String,
-    pub version: i64,
 }
 
 fn holder_from_row(row: &rusqlite::Row) -> rusqlite::Result<FileHolder> {
@@ -188,7 +195,7 @@ impl Database {
             );
             CREATE TABLE IF NOT EXISTS tombstones (
                 file_id TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL,
-                deleted_by TEXT NOT NULL, version INTEGER NOT NULL
+                deleted_by TEXT NOT NULL
             );
             "
         )?;
@@ -214,6 +221,10 @@ impl Database {
         if !self.has_column("files", "trashed_at")? {
             self.rebuild_files_table()?;
         }
+
+        // Tombstones record that an item was destroyed, which has nothing to
+        // order and so needs no version.
+        self.drop_column_if_present("tombstones", "version")?;
 
         // Created here rather than alongside the table, because on an older
         // database the column it filters on does not exist until the rebuild
@@ -288,6 +299,14 @@ impl Database {
                 "ALTER TABLE {} ADD COLUMN {} {}",
                 table, column, definition
             ))?;
+        }
+        Ok(())
+    }
+
+    fn drop_column_if_present(&self, table: &str, column: &str) -> Result<()> {
+        if self.has_column(table, column)? {
+            self.conn
+                .execute_batch(&format!("ALTER TABLE {} DROP COLUMN {}", table, column))?;
         }
         Ok(())
     }
@@ -413,6 +432,12 @@ impl Database {
     /// Moves an item aside without destroying it: its blocks and holder rows
     /// stay put, and its name becomes available again.
     pub fn trash_file(&self, file_id: &str, trashed_by: &str, trashed_at: i64) -> Result<()> {
+        // 0 is what marks an item live, so accepting it here would silently
+        // leave the item exactly as it was.
+        if trashed_at <= 0 {
+            anyhow::bail!("A trash timestamp must be positive; 0 means live");
+        }
+
         let changed = self.conn.execute(
             "UPDATE files SET trashed_at = ?1, trashed_by = ?2 WHERE id = ?3 AND trashed_at = 0",
             rusqlite::params![trashed_at, trashed_by, file_id],
@@ -441,6 +466,12 @@ impl Database {
     /// trip. The loser is placed under a numbered name, and stays there on
     /// later syncs rather than being bumped again.
     pub fn merge_catalog_file(&self, incoming: &FileMetadata) -> Result<MergeOutcome> {
+        // A device that was away when an item was destroyed still has it in its
+        // catalog, and would otherwise hand it straight back.
+        if self.has_tombstone(&incoming.id)? {
+            return Ok(MergeOutcome::AlreadyDestroyed);
+        }
+
         // A trashed item does not own its name, so it never contends.
         if incoming.is_trashed() {
             self.upsert_file_from_catalog(incoming)?;
@@ -707,22 +738,26 @@ impl Database {
 
     pub fn insert_tombstone(&self, tombstone: &Tombstone) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO tombstones (file_id, deleted_at, deleted_by, version) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![tombstone.file_id, tombstone.deleted_at, tombstone.deleted_by, tombstone.version],
+            "INSERT OR REPLACE INTO tombstones (file_id, deleted_at, deleted_by)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                tombstone.file_id,
+                tombstone.deleted_at,
+                tombstone.deleted_by
+            ],
         )?;
         Ok(())
     }
 
     pub fn get_all_tombstones(&self) -> Result<Vec<Tombstone>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT file_id, deleted_at, deleted_by, version FROM tombstones"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_id, deleted_at, deleted_by FROM tombstones")?;
         let tombstones = stmt.query_map([], |row| {
             Ok(Tombstone {
                 file_id: row.get(0)?,
                 deleted_at: row.get(1)?,
                 deleted_by: row.get(2)?,
-                version: row.get(3)?,
             })
         })?;
 
@@ -733,6 +768,39 @@ impl Database {
         Ok(result)
     }
 
+    /// Destroys an item: its blocks mapping, holder rows, outstanding delete
+    /// requests and catalog entry all go, and a tombstone takes their place.
+    ///
+    /// Stored blocks are not touched here - whether one can be removed depends
+    /// on nothing else referencing it, which the caller establishes first.
+    pub fn purge_file(&self, file_id: &str, deleted_by: &str, deleted_at: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for statement in [
+            "DELETE FROM file_holders WHERE file_id = ?1",
+            "DELETE FROM file_blocks WHERE file_id = ?1",
+            "DELETE FROM delete_requests WHERE file_id = ?1",
+            "DELETE FROM files WHERE id = ?1",
+        ] {
+            tx.execute(statement, rusqlite::params![file_id])?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO tombstones (file_id, deleted_at, deleted_by)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![file_id, deleted_at, deleted_by],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Trashed items whose retention has run out.
+    pub fn expired_trash(&self, now: i64, retention_secs: i64) -> Result<Vec<FileMetadata>> {
+        Ok(self
+            .get_trashed_files()?
+            .into_iter()
+            .filter(|f| now.saturating_sub(f.trashed_at) >= retention_secs)
+            .collect())
+    }
+
     pub fn has_tombstone(&self, file_id: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tombstones WHERE file_id = ?1",
@@ -740,25 +808,6 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count > 0)
-    }
-
-    pub fn delete_file_with_tombstone(
-        &self,
-        file_id: &str,
-        deleted_by: &str,
-        version: i64,
-    ) -> Result<()> {
-        let tombstone = Tombstone {
-            file_id: file_id.to_string(),
-            deleted_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs() as i64,
-            deleted_by: deleted_by.to_string(),
-            version,
-        };
-        self.insert_tombstone(&tombstone)?;
-        self.delete_file(file_id)?;
-        Ok(())
     }
 
     // ---- Holder set ----
