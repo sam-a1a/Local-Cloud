@@ -1,1 +1,13 @@
 /target
+.DS_Store
+
+# Device identity: Ed25519 signing key + TLS private key. Never commit.
+identity.json
+
+# Local engine state, regenerated on first run
+*.db
+*.db-wal
+*.db-shm
+storage_*/
+trusted_peers/
+sync_folder/
