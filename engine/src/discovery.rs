@@ -209,15 +209,26 @@ pub async fn sync_with_peer(
     key_pem: String,
     event_tx: mpsc::Sender<EngineEvent>,
 ) {
+    // 1. Sync only with devices that have been through pairing.
+    //
+    // This used to fetch the peer's certificate over an unverified connection
+    // and pin it on the spot, which meant anything on the network could join by
+    // simply showing up. Trust now comes from pairing and nowhere else.
+    let paired = {
+        let db = db_clone.lock().unwrap();
+        db.is_paired(&peer_id).unwrap_or(false)
+    };
+
+    if !paired {
+        return;
+    }
+
     println!("[Sync] Starting metadata sync with {}", peer_id);
 
-    // 1. Fetch peer cert and build mTLS client
-    let untrusted_client = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
-    let peer_cert_pem = match untrusted_client.get(format!("{}/hello", peer_url)).send().await {
-        Ok(res) => match res.text().await { Ok(pem) => pem, Err(_) => return },
-        Err(_) => return,
-    };
-    let _ = crate::storage::save_peer_cert(&storage_dir_clone, &peer_id, &peer_cert_pem);
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let db = db_clone.lock().unwrap();
+        let _ = db.touch_device(&peer_id, now.as_secs() as i64);
+    }
 
     let trusted_certs = match crate::storage::load_all_trusted_certs(&storage_dir_clone) {
         Ok(c) => c,
@@ -340,17 +351,26 @@ pub async fn download_file_on_demand(
         return Ok(());
     }
 
-    // 2. Find a peer who has the blocks
-    let peers = known_peers.lock().unwrap().clone();
+    // 2. Find a paired device that has the blocks. Unpaired devices on the
+    // network are not candidates, and would refuse the request anyway.
+    let peers: Vec<DiscoveredDevice> = {
+        let visible = known_peers.lock().unwrap().clone();
+        let db = db_clone.lock().unwrap();
+        visible
+            .into_values()
+            .filter(|d| db.is_paired(&d.device_id).unwrap_or(false))
+            .collect()
+    };
+
     if peers.is_empty() {
-        return Err("No peers available".to_string());
+        return Err("No paired devices are available".to_string());
     }
 
     let trusted_certs = crate::storage::load_all_trusted_certs(&storage_dir_clone).map_err(|e| e.to_string())?;
     let client = build_mtls_client(&cert_pem, &key_pem, &trusted_certs).map_err(|e| e.to_string())?;
 
     // Try peers until one works
-    for (_peer_id, peer) in peers {
+    for peer in peers {
         let peer_url = peer.url;
         let success = fetch_blocks_from_peer(&client, &peer_url, &missing, &db_clone, &storage_dir_clone).await;
 
