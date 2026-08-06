@@ -34,6 +34,18 @@ pub struct FileBlock {
     pub is_present: i64,
 }
 
+/// A device this one has paired with. Its certificate is pinned, so it is the
+/// only kind of device allowed to touch the catalog or block storage.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PairedDevice {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub cert_pem: String,
+    pub paired_at: i64,
+    pub last_seen: i64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Tombstone {
     pub file_id: String,
@@ -89,7 +101,103 @@ impl Database {
             "
         )?;
 
-        Ok(Self { conn })
+        let db = Self { conn };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    /// Additive schema changes for databases created by earlier versions.
+    /// `CREATE TABLE IF NOT EXISTS` silently skips existing tables, so new
+    /// columns have to be applied separately.
+    fn migrate(&self) -> Result<()> {
+        self.add_column_if_missing("devices", "platform", "TEXT NOT NULL DEFAULT ''")?;
+        Ok(())
+    }
+
+    fn add_column_if_missing(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if !existing.iter().any(|c| c == column) {
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE {} ADD COLUMN {} {}",
+                table, column, definition
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Records a device as paired, or refreshes the details of one already
+    /// paired. The certificate is what actually grants access; the name and
+    /// platform are display only.
+    pub fn upsert_paired_device(&self, device: &PairedDevice) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO devices (id, name, platform, cert_pem, paired_at, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                platform = excluded.platform,
+                cert_pem = excluded.cert_pem,
+                last_seen = excluded.last_seen",
+            rusqlite::params![
+                device.id,
+                device.name,
+                device.platform,
+                device.cert_pem,
+                device.paired_at,
+                device.last_seen
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_paired_devices(&self) -> Result<Vec<PairedDevice>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, platform, cert_pem, paired_at, last_seen FROM devices ORDER BY name",
+        )?;
+        let devices = stmt.query_map([], |row| {
+            Ok(PairedDevice {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                platform: row.get(2)?,
+                cert_pem: row.get(3)?,
+                paired_at: row.get(4)?,
+                last_seen: row.get(5)?,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for device in devices {
+            result.push(device?);
+        }
+        Ok(result)
+    }
+
+    pub fn is_paired(&self, device_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM devices WHERE id = ?1",
+            rusqlite::params![device_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn remove_paired_device(&self, device_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM devices WHERE id = ?1",
+            rusqlite::params![device_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_device(&self, device_id: &str, seen_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE devices SET last_seen = ?1 WHERE id = ?2",
+            rusqlite::params![seen_at, device_id],
+        )?;
+        Ok(())
     }
 
     pub fn insert_file(&self, file: &FileMetadata) -> Result<()> {
