@@ -20,7 +20,7 @@ hyper = { version = "1.11.0", features = ["full"] }
 tower = "0.5.3"
 
 # Discovery (Local Mesh)
-mdns-sd = "0.19"
+mdns-sd = "0.20.3"
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
