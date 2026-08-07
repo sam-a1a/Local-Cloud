@@ -71,7 +71,7 @@ pub enum IndexOutcome {
     Skipped { reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DeleteOutcome {
     pub file_id: String,
     /// Copies left in the mesh once this one is gone.

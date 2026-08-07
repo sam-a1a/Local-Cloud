@@ -47,7 +47,7 @@ pub struct DeviceInfo {
 }
 
 /// An incoming pairing request awaiting a code from the user.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, uniffi::Record)]
 pub struct PairingOffer {
     pub device_id: String,
     pub name: String,

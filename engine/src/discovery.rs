@@ -17,7 +17,7 @@ const SERVICE_TYPE: &str = "_local-cloud._tcp.local.";
 /// A device seen on the local network. Being discovered says nothing about
 /// trust: unpaired devices appear here so they can be picked for pairing, and
 /// get no catalog or data access until that completes.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, uniffi::Record)]
 pub struct DiscoveredDevice {
     pub device_id: String,
     pub name: String,

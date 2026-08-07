@@ -11,3 +11,4 @@ identity.json
 storage_*/
 trusted_peers/
 sync_folder/
+bindings/

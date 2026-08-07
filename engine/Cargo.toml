@@ -53,6 +53,13 @@ whoami = "2.1.2"
 
 # Watching a folder is a desktop idea. iOS cannot watch a user directory, and
 # Android would need MANAGE_EXTERNAL_STORAGE, so neither links this at all.
+# Bindings for Swift and Kotlin. The proc-macro flavour rather than a UDL file,
+# so the interface is defined once, in the Rust that implements it. Needed on
+# every target - mobile most of all.
+uniffi = { version = "0.32", features = ["cli"] }
+
+# Watching a folder is a desktop idea. iOS cannot watch a user directory, and
+# Android would need MANAGE_EXTERNAL_STORAGE, so neither links this at all.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 notify = { version = "8.2", features = ["macos_fsevent"] }
 

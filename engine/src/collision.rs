@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, uniffi::Enum)]
 pub enum CollisionResolution {
     /// Give the name to the incoming item and move the previous one to trash.
     Override,
@@ -29,7 +29,7 @@ pub enum CollisionResolution {
 
 /// A name conflict that has been resolved the safe way and is awaiting a
 /// decision on whether it should have been an Override instead.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, uniffi::Record)]
 pub struct PendingCollision {
     pub id: String,
     /// The item that arrived and had to be renamed.

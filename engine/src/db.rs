@@ -13,7 +13,7 @@ pub struct Database {
 /// Carries no version number and no list of devices. Copies never merge, so
 /// there is nothing for a version to order; `content_hash` says what this item
 /// currently is, and `file_holders` says who has which content.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, uniffi::Record)]
 pub struct FileMetadata {
     pub id: String,
     pub path: String,
@@ -54,7 +54,7 @@ pub struct FileBlock {
 /// `content_hash` records *which* content that device has, not merely that it
 /// has something. Copies are snapshots and never update themselves, so a
 /// holder whose hash differs from the file's current hash is simply behind.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, uniffi::Record)]
 pub struct FileHolder {
     pub file_id: String,
     pub device_id: String,
@@ -63,7 +63,7 @@ pub struct FileHolder {
 }
 
 /// A standing instruction for one device to drop its copy of an item.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DeleteRequest {
     pub file_id: String,
     pub target_device: String,
@@ -105,7 +105,7 @@ pub struct CatalogPayload {
 
 /// A device this one has paired with. Its certificate is pinned, so it is the
 /// only kind of device allowed to touch the catalog or block storage.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, uniffi::Record)]
 pub struct PairedDevice {
     pub id: String,
     pub name: String,

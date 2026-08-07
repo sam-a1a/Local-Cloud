@@ -64,6 +64,12 @@ pub use pairing::PairingState;
 #[doc(hidden)]
 pub use tls::TrustStore;
 
+// Generates the C ABI the Swift and Kotlin bindings bind to. The interface is
+// declared by the `uniffi` attributes on the types and methods below, so there
+// is one definition of it rather than a Rust one and a separate UDL that can
+// drift from it.
+uniffi::setup_scaffolding!();
+
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
@@ -99,7 +105,7 @@ const CATALOG_SYNC_INTERVAL_SECS: u64 = 30;
 /// "that device is not paired" from "the disk is full" cannot react sensibly to
 /// either - nor can it survive the wording being improved. Match on the
 /// variant; show the message.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum EngineError {
     /// Nothing in the catalog has this id.
     #[error("No such item in the catalog")]
@@ -184,7 +190,7 @@ impl EngineError {
 /// arrives. Every failure names what it was about - the item, the device, or
 /// both - because an application has to put the message beside the row that
 /// caused it, and a bare string leaves it nowhere to go but a toast.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, uniffi::Enum)]
 pub enum EngineEvent {
     EngineStarted,
     EngineStopped,
@@ -238,7 +244,7 @@ pub enum EngineEvent {
 /// converge and mean nothing to an application - exposing them would invite one
 /// to reason about replication rather than about items. Delete requests that a
 /// person should see are `pending_delete_requests`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, uniffi::Record)]
 pub struct Catalog {
     pub items: Vec<FileMetadata>,
     pub holders: Vec<FileHolder>,
@@ -256,6 +262,7 @@ pub struct Catalog {
 /// the engine, and never two at once. An implementation must not assume it is
 /// on a UI thread, and must not call back into the engine and block waiting for
 /// an event.
+#[uniffi::export(with_foreign)]
 pub trait EventListener: Send + Sync {
     fn on_event(&self, event: EngineEvent);
 }
@@ -326,6 +333,7 @@ fn spawn_event_dispatch(
     });
 }
 
+#[derive(uniffi::Object)]
 pub struct Engine {
     db: Arc<StdMutex<Database>>,
     identity: DeviceIdentity,
@@ -1469,5 +1477,194 @@ impl Engine {
         *self.sync_nudge.lock().unwrap() = None;
         let _ = self.event_tx.send(EngineEvent::EngineStopped);
         println!("[Engine] Stopped.");
+    }
+}
+/// The surface the Swift and Kotlin bindings see.
+///
+/// Kept in its own block rather than annotating the methods where they are
+/// written, so that what crosses the boundary is visible in one place and
+/// adding a method to `Engine` is not accidentally an API commitment. Each of
+/// these is a thin forward; the behaviour lives above.
+///
+/// `new` returns `Arc<Self>` because a foreign caller holds the engine by
+/// reference and may share it across threads - which is sound because `Engine`
+/// is `Send + Sync`.
+#[uniffi::export]
+impl Engine {
+    #[uniffi::constructor(name = "new")]
+    pub fn ffi_new(base_dir: String, sync_dir_path: String) -> Result<Arc<Self>, EngineError> {
+        Ok(Arc::new(Self::new(base_dir, sync_dir_path)?))
+    }
+
+    #[uniffi::method(name = "set_event_listener")]
+    pub fn ffi_set_event_listener(&self, listener: Arc<dyn EventListener>) {
+        self.set_event_listener(listener);
+    }
+
+    #[uniffi::method(name = "start")]
+    pub fn ffi_start(&self) -> Result<(), EngineError> {
+        self.start()
+    }
+
+    #[uniffi::method(name = "stop")]
+    pub fn ffi_stop(&self) {
+        self.stop();
+    }
+
+    #[uniffi::method(name = "is_running")]
+    pub fn ffi_is_running(&self) -> bool {
+        self.is_running()
+    }
+
+    #[uniffi::method(name = "device_id")]
+    pub fn ffi_device_id(&self) -> String {
+        self.device_id()
+    }
+
+    #[uniffi::method(name = "device_name")]
+    pub fn ffi_device_name(&self) -> String {
+        self.device_name()
+    }
+
+    #[uniffi::method(name = "device_platform")]
+    pub fn ffi_device_platform(&self) -> String {
+        self.device_platform()
+    }
+
+    #[uniffi::method(name = "sync_dir")]
+    pub fn ffi_sync_dir(&self) -> String {
+        self.sync_dir()
+    }
+
+    // Pairing.
+
+    #[uniffi::method(name = "visible_devices")]
+    pub fn ffi_visible_devices(&self) -> Vec<DiscoveredDevice> {
+        self.visible_devices()
+    }
+
+    #[uniffi::method(name = "start_pairing")]
+    pub fn ffi_start_pairing(&self, target_device_ids: Vec<String>) -> Result<String, EngineError> {
+        self.start_pairing(target_device_ids)
+    }
+
+    #[uniffi::method(name = "pairing_offers")]
+    pub fn ffi_pairing_offers(&self) -> Vec<PairingOffer> {
+        self.pairing_offers()
+    }
+
+    #[uniffi::method(name = "confirm_pairing")]
+    pub fn ffi_confirm_pairing(&self, device_id: String, code: String) -> Result<(), EngineError> {
+        self.confirm_pairing(device_id, code)
+    }
+
+    #[uniffi::method(name = "cancel_pairing")]
+    pub fn ffi_cancel_pairing(&self) {
+        self.cancel_pairing();
+    }
+
+    #[uniffi::method(name = "paired_devices")]
+    pub fn ffi_paired_devices(&self) -> Vec<PairedDevice> {
+        self.paired_devices()
+    }
+
+    #[uniffi::method(name = "unpair")]
+    pub fn ffi_unpair(&self, device_id: String) -> Result<(), EngineError> {
+        self.unpair(device_id)
+    }
+
+    // Items.
+
+    #[uniffi::method(name = "catalog")]
+    pub fn ffi_catalog(&self) -> Catalog {
+        self.catalog()
+    }
+
+    #[uniffi::method(name = "local_files")]
+    pub fn ffi_local_files(&self) -> Vec<FileMetadata> {
+        self.local_files()
+    }
+
+    #[uniffi::method(name = "holders_of")]
+    pub fn ffi_holders_of(&self, file_id: String) -> Vec<FileHolder> {
+        self.holders_of(file_id)
+    }
+
+    /// Mobile's way in: there is no folder to watch, so the share sheet hands
+    /// over a file and a name.
+    #[uniffi::method(name = "import_file")]
+    pub fn ffi_import_file(
+        &self,
+        source_path: String,
+        name: String,
+    ) -> Result<FileMetadata, EngineError> {
+        self.import_file(source_path, name)
+    }
+
+    #[uniffi::method(name = "share_to")]
+    pub fn ffi_share_to(
+        &self,
+        file_id: String,
+        target_device_ids: Vec<String>,
+    ) -> Result<(), EngineError> {
+        self.share_to(file_id, target_device_ids)
+    }
+
+    #[uniffi::method(name = "pull_copy")]
+    pub fn ffi_pull_copy(&self, file_id: String) -> Result<(), EngineError> {
+        self.pull_copy(file_id)
+    }
+
+    // Deletion and trash.
+
+    #[uniffi::method(name = "delete_local_copy")]
+    pub fn ffi_delete_local_copy(&self, file_id: String) -> Result<DeleteOutcome, EngineError> {
+        self.delete_local_copy(file_id)
+    }
+
+    #[uniffi::method(name = "delete_copy")]
+    pub fn ffi_delete_copy(&self, file_id: String, device_id: String) -> Result<(), EngineError> {
+        self.delete_copy(file_id, device_id)
+    }
+
+    #[uniffi::method(name = "pending_delete_requests")]
+    pub fn ffi_pending_delete_requests(&self) -> Vec<DeleteRequest> {
+        self.pending_delete_requests()
+    }
+
+    #[uniffi::method(name = "trashed_files")]
+    pub fn ffi_trashed_files(&self) -> Vec<FileMetadata> {
+        self.trashed_files()
+    }
+
+    #[uniffi::method(name = "trash_seconds_remaining")]
+    pub fn ffi_trash_seconds_remaining(&self, file_id: String) -> Option<i64> {
+        self.trash_seconds_remaining(file_id)
+    }
+
+    #[uniffi::method(name = "restore_file")]
+    pub fn ffi_restore_file(&self, file_id: String) -> Result<(), EngineError> {
+        self.restore_file(file_id)
+    }
+
+    #[uniffi::method(name = "delete_permanently")]
+    pub fn ffi_delete_permanently(&self, file_id: String) -> Result<(), EngineError> {
+        self.delete_permanently(file_id)
+    }
+
+    // Contested names.
+
+    #[uniffi::method(name = "pending_collisions")]
+    pub fn ffi_pending_collisions(&self) -> Vec<PendingCollision> {
+        self.pending_collisions()
+    }
+
+    #[uniffi::method(name = "resolve_collision")]
+    pub fn ffi_resolve_collision(
+        &self,
+        collision_id: String,
+        resolution: CollisionResolution,
+    ) -> Result<(), EngineError> {
+        self.resolve_collision(collision_id, resolution)
     }
 }
