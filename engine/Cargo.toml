@@ -47,9 +47,18 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "tokio"] }
 reqwest = { version = "0.13.4", features = ["rustls-no-provider", "json"], default-features = false }
 rustls-pemfile = "2.2.0"
 
-notify = { version = "8.2", features = ["macos_fsevent"] }
+
 uuid = { version = "1.24.0", features = ["v4"] }
 whoami = "2.1.2"
+
+# Watching a folder is a desktop idea. iOS cannot watch a user directory, and
+# Android would need MANAGE_EXTERNAL_STORAGE, so neither links this at all.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+notify = { version = "8.2", features = ["macos_fsevent"] }
+
+[lints.rust]
+# `desktop` is ours: "a platform where watching a folder makes sense".
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(desktop)'] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

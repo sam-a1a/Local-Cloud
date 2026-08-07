@@ -68,6 +68,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, mpsc};
 use tokio::net::TcpListener;
+#[cfg(desktop)]
 use notify::RecommendedWatcher;
 use mdns_sd::ServiceDaemon;
 
@@ -130,6 +131,14 @@ pub enum EngineError {
     /// Paired, perhaps, but not on the network right now.
     #[error("That device is not visible on the network")]
     NotVisible { device_id: String },
+
+    /// A name that is not a name: empty, hidden, or a path in disguise.
+    #[error("That is not a usable name for an item")]
+    InvalidName { name: String },
+
+    /// There is no file to import at that path.
+    #[error("There is no file at that path")]
+    NoSuchFile { path: String },
 
     /// No devices were given for an operation that needs at least one.
     #[error("Select at least one device")]
@@ -318,6 +327,7 @@ pub struct Engine {
     event_tx: mpsc::Sender<EngineEvent>,
     listener: Arc<StdMutex<Option<Arc<dyn EventListener>>>>,
     runtime: tokio::runtime::Runtime,
+    #[cfg(desktop)]
     watcher: StdMutex<Option<RecommendedWatcher>>,
     mdns_daemon: StdMutex<Option<ServiceDaemon>>,
     server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
@@ -380,6 +390,7 @@ impl Engine {
             event_tx,
             listener,
             runtime,
+            #[cfg(desktop)]
             watcher: StdMutex::new(None),
             mdns_daemon: StdMutex::new(None),
             server_task: StdMutex::new(None),
@@ -599,6 +610,15 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether the engine is currently serving, discovering and syncing.
+    ///
+    /// An application that stops the engine when it is backgrounded needs to
+    /// know what state it left it in, and asking is more reliable than
+    /// remembering - a failed `start` leaves it stopped either way.
+    pub fn is_running(&self) -> bool {
+        self.server_task.lock().unwrap().is_some()
+    }
+
     pub fn sync_dir(&self) -> String {
         self.sync_dir.clone()
     }
@@ -622,6 +642,77 @@ impl Engine {
         let mut devices: Vec<DiscoveredDevice> = peers.values().cloned().collect();
         devices.sort_by(|a, b| a.name.cmp(&b.name));
         devices
+    }
+
+    /// Brings a file into the shared space from somewhere outside it.
+    ///
+    /// The way an item is created where there is no folder to watch. iOS cannot
+    /// watch a user directory or run a background daemon freely, and Android
+    /// would need `MANAGE_EXTERNAL_STORAGE`, so mobile hands the engine a file
+    /// the share sheet produced and a name to give it.
+    ///
+    /// It works on desktop too, and means the same thing there: the bytes are
+    /// copied into the sync folder, because the folder holds exactly what this
+    /// device holds. Importing does not move or delete the original.
+    ///
+    /// `name` is what the item should be called, not a path - a share sheet
+    /// supplies a filename, and anything that looks like a path is refused
+    /// rather than quietly writing outside the folder. If that name is already
+    /// taken, on disk or in the catalog, the item is numbered like any other
+    /// collision rather than overwriting what is there.
+    pub fn import_file(&self, source_path: String, name: String) -> Result<FileMetadata, EngineError> {
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.starts_with('.')
+        {
+            return Err(EngineError::InvalidName { name });
+        }
+
+        let source = std::path::Path::new(&source_path);
+        if !source.is_file() {
+            return Err(EngineError::NoSuchFile { path: source_path });
+        }
+
+        let indexer = self.indexer();
+        let relative = indexer.free_path(trimmed);
+        let destination = indexer.absolute(&relative);
+
+        // Marked before the copy, not after: on desktop the watcher is looking
+        // at this folder, and would otherwise index the file from underneath us
+        // and race the call.
+        ignore::mark_ignored(&self.ignore_set, &destination);
+        let copied = std::fs::copy(source, &destination).map_err(EngineError::internal);
+        ignore::schedule_unmark_ignored(self.ignore_set.clone(), destination.clone(), 3);
+        copied?;
+
+        let file_id = match indexer.index(&destination) {
+            watcher::IndexOutcome::Indexed { file_id, .. } => file_id,
+            watcher::IndexOutcome::KeptBoth { file_id, .. } => file_id,
+            watcher::IndexOutcome::Unchanged { file_id } => file_id,
+            watcher::IndexOutcome::Skipped { reason } => {
+                // Nothing was catalogued, so nothing should be left behind.
+                let _ = std::fs::remove_file(&destination);
+                return Err(EngineError::Internal { reason });
+            }
+        };
+
+        let file = {
+            let db = self.db.lock().unwrap();
+            db.get_file_by_id(&file_id)
+                .map_err(EngineError::internal)?
+                .ok_or_else(|| EngineError::NoSuchItem {
+                    file_id: file_id.clone(),
+                })?
+        };
+
+        let _ = self.event_tx.send(EngineEvent::FileIndexed {
+            file_id,
+            path: file.path.clone(),
+        });
+
+        Ok(file)
     }
 
     pub fn local_files(&self) -> Vec<FileMetadata> {
@@ -1276,14 +1367,22 @@ impl Engine {
             previous.abort();
         }
 
-        let watcher = watcher::start_watcher(
-            self.indexer(),
-            handle,
-            self.ignore_set.clone(),
-            self.event_tx.clone(),
-        ).map_err(EngineError::internal)?;
+        // Desktop keeps the folder and the catalog in step by watching the
+        // folder. Mobile has no folder to watch and uses `import_file`.
+        #[cfg(desktop)]
+        {
+            let watcher = watcher::start_watcher(
+                self.indexer(),
+                handle,
+                self.ignore_set.clone(),
+                self.event_tx.clone(),
+            )
+            .map_err(EngineError::internal)?;
 
-        *self.watcher.lock().unwrap() = Some(watcher);
+            *self.watcher.lock().unwrap() = Some(watcher);
+        }
+        #[cfg(not(desktop))]
+        let _ = handle;
 
         // Retention is measured in days, so an hourly check is ample. It also
         // runs once immediately, which is what releases trash that expired
@@ -1312,6 +1411,7 @@ impl Engine {
     }
 
     pub fn stop(&self) {
+        #[cfg(desktop)]
         if let Some(w) = self.watcher.lock().unwrap().take() {
             drop(w);
         }

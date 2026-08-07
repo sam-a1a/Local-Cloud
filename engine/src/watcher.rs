@@ -13,15 +13,28 @@ use crate::collision::{CollisionQueue, PendingCollision};
 use crate::db::{Database, FileHolder, FileMetadata};
 use crate::ignore::IgnoreSet;
 use crate::storage;
+#[cfg(desktop)]
 use crate::EngineEvent;
 use anyhow::{anyhow, Result};
+// The folder watcher is desktop-only, and so is the crate behind it. iOS
+// cannot watch a user directory or run a background daemon freely, and Android
+// would need MANAGE_EXTERNAL_STORAGE - which is why mobile has `import_file`
+// instead. Everything else in this module is platform-independent: `Indexer` is
+// what turns a file into an item, and it does not care what prompted the call.
+#[cfg(desktop)]
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(desktop)]
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
+#[cfg(desktop)]
+use std::sync::mpsc;
+#[cfg(desktop)]
 use std::time::{Duration, Instant};
+#[cfg(desktop)]
 use tokio::runtime::Handle;
 
+#[cfg(desktop)]
 type DebounceMap = Arc<Mutex<HashMap<String, Instant>>>;
 
 /// How long a path stays ignored after the engine itself writes to it, so the
@@ -116,7 +129,7 @@ impl Indexer {
 
     /// The first numbered variant of `path` free in both the catalog and the
     /// folder. A name free in one but taken in the other still collides.
-    fn free_path(&self, path: &str) -> String {
+    pub(crate) fn free_path(&self, path: &str) -> String {
         let db = self.db.lock().unwrap();
         crate::collision::next_available_path(path, |candidate| {
             db.is_path_taken(candidate).unwrap_or(true) || Path::new(&self.absolute(candidate)).exists()
@@ -521,6 +534,7 @@ pub(crate) fn purge_exclusive_blocks(
     Ok(())
 }
 
+#[cfg(desktop)]
 pub fn start_watcher(
     indexer: Indexer,
     handle: Handle,
@@ -550,10 +564,12 @@ pub fn start_watcher(
     Ok(watcher)
 }
 
+#[cfg(desktop)]
 fn is_engine_file(path: &str) -> bool {
     path.contains(".db") || path.contains(".pem") || path.contains("identity.json")
 }
 
+#[cfg(desktop)]
 async fn handle_fs_event(
     event: Event,
     indexer: Indexer,

@@ -129,3 +129,70 @@ fn messages_are_for_people_and_variants_are_for_code() {
         message
     );
 }
+
+/// Importing is how an item is created where there is no folder to watch, so
+/// what it refuses matters as much as what it accepts.
+#[test]
+fn importing_something_that_is_not_there_or_not_a_name() {
+    let dir = TempDir::new().expect("temp dir");
+    let engine = engine(&dir);
+
+    let real = dir.path().join("source.txt");
+    std::fs::write(&real, "contents").expect("write source");
+    let real = real.to_string_lossy().to_string();
+
+    assert!(matches!(
+        engine.import_file("/no/such/file".into(), "notes.txt".into()),
+        Err(EngineError::NoSuchFile { .. })
+    ));
+
+    // A name is a name, not a path. Anything else would write outside the
+    // shared folder, which is the one place items are allowed to live.
+    for bad in ["", "  ", "../escape.txt", "sub/dir.txt", ".hidden"] {
+        assert!(
+            matches!(
+                engine.import_file(real.clone(), bad.into()),
+                Err(EngineError::InvalidName { .. })
+            ),
+            "{:?} should not be accepted as a name",
+            bad
+        );
+    }
+}
+
+#[test]
+fn importing_a_file_puts_it_in_the_shared_folder_and_the_catalog() {
+    let dir = TempDir::new().expect("temp dir");
+    let engine = engine(&dir);
+
+    let source = dir.path().join("outside.txt");
+    std::fs::write(&source, "from the share sheet").expect("write source");
+    let source = source.to_string_lossy().to_string();
+
+    let item = engine
+        .import_file(source.clone(), "notes.txt".into())
+        .expect("import");
+
+    assert_eq!(item.path, "notes.txt");
+    assert!(
+        engine.local_files().iter().any(|f| f.id == item.id),
+        "an imported file must be in the catalog"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/notes.txt", engine.sync_dir())).expect("copy"),
+        "from the share sheet",
+        "and its bytes must be in the folder, which holds what this device holds"
+    );
+    assert!(
+        std::path::Path::new(&source).exists(),
+        "importing must not consume the original"
+    );
+
+    // A second import of the same name is numbered rather than overwriting the
+    // first - the same rule a name collision between devices follows.
+    let second = engine
+        .import_file(source, "notes.txt".into())
+        .expect("second import");
+    assert_eq!(second.path, "notes 1.txt");
+    assert_ne!(second.id, item.id);
+}
