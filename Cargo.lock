@@ -201,7 +201,6 @@ dependencies = [
  "anyhow",
  "engine",
  "rustls",
- "tokio",
 ]
 
 [[package]]
