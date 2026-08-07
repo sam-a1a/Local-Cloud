@@ -518,3 +518,65 @@ async fn syncing_records_the_peer_as_seen() {
         "last_seen must move forward when a peer answers"
     );
 }
+
+/// A transfer reports its progress, so a UI can draw a bar rather than a
+/// spinner for the minutes a large file takes.
+#[tokio::test]
+async fn a_transfer_reports_how_far_along_it_is() {
+    install_crypto_provider();
+    let alice = Device::start("alice").await;
+    let bob = Device::start("bob").await;
+    alice.pair_with(&bob);
+
+    // Several blocks, so progress is a sequence rather than a single step.
+    let contents = "x".repeat(localcloud::storage::BLOCK_SIZE * 3 + 17);
+    let file_id = bob.add("clip.bin", &contents);
+
+    let blocks = {
+        let db = bob.db.lock().unwrap();
+        db.get_blocks_for_file(&file_id).unwrap()
+    };
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let report = {
+        let seen = seen.clone();
+        move |done: u64, total: u64| seen.lock().unwrap().push((done, total))
+    };
+
+    let client = localcloud::discovery::build_mtls_client(
+        &bob.info.cert_pem,
+        &bob.key_pem,
+        &[alice.info.cert_pem.clone()],
+    )
+    .expect("client");
+
+    assert!(
+        localcloud::discovery::push_blocks_to_peer(
+            &client,
+            &alice.url,
+            &blocks,
+            &bob.storage_dir,
+            &report,
+        )
+        .await
+    );
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.first(), Some(&(0, 2)), "it starts at nothing, and says how much there is");
+    assert_eq!(seen.last(), Some(&(2, 2)), "and ends having moved all of it");
+
+    // The total counts what has to move, not the manifest length. This file is
+    // one repeated block and a tail, so four positions are two transfers - a
+    // bar drawn from the manifest would sit at half when it was done.
+    assert_eq!(blocks.len(), 4);
+    assert!(
+        seen.iter().all(|(_, total)| *total == 2),
+        "the total must not change part-way through: {:?}",
+        seen
+    );
+    assert_eq!(
+        seen.iter().map(|(done, _)| *done).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "and progress must only move forwards, one block at a time"
+    );
+}

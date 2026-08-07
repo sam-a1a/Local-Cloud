@@ -256,7 +256,20 @@ const TRANSFER_CONCURRENCY: usize = 8;
 /// until every block is present, so continuing after a failure only spends time
 /// and bandwidth on a copy that cannot complete. Whatever did arrive is kept -
 /// blocks are content-addressed, so a retry picks up where this left off.
-async fn transfer_all<F, Fut>(blocks: &[crate::db::FileBlock], start: F) -> bool
+/// Reports how many of a transfer's blocks have arrived, out of how many there
+/// are to move.
+///
+/// Called once per block, on the driving task. The total is the deduplicated
+/// count, so it is what will actually be transferred rather than the length of
+/// the manifest - a file that is mostly one repeated block would otherwise show
+/// a bar that jumps to the end immediately.
+pub type OnProgress<'a> = &'a (dyn Fn(u64, u64) + Send + Sync);
+
+async fn transfer_all<F, Fut>(
+    blocks: &[crate::db::FileBlock],
+    start: F,
+    progress: OnProgress<'_>,
+) -> bool
 where
     F: Fn(&crate::db::FileBlock) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
@@ -266,7 +279,16 @@ where
     // repeated. Moving it once is enough: storage is addressed by content, so
     // every position it occupies is satisfied by the same transfer.
     let mut seen = std::collections::HashSet::new();
-    let mut queued = blocks.iter().filter(|b| seen.insert(b.block_id.clone()));
+    let distinct: Vec<&crate::db::FileBlock> = blocks
+        .iter()
+        .filter(|b| seen.insert(b.block_id.clone()))
+        .collect();
+
+    let total = distinct.len() as u64;
+    let mut done: u64 = 0;
+    progress(done, total);
+
+    let mut queued = distinct.into_iter();
     let mut in_flight = tokio::task::JoinSet::new();
     let mut failed = false;
 
@@ -285,7 +307,11 @@ where
         };
 
         match finished {
-            Ok(Ok(())) => continue,
+            Ok(Ok(())) => {
+                done += 1;
+                progress(done, total);
+                continue;
+            }
             Ok(Err(e)) => println!("[Transfer] {}", e),
             Err(e) => println!("[Transfer] A block transfer did not finish: {}", e),
         }
@@ -305,6 +331,7 @@ async fn fetch_blocks_from_peer(
     blocks: &[crate::db::FileBlock],
     db_clone: &Arc<Mutex<Database>>,
     storage_dir_clone: &str,
+    progress: OnProgress<'_>,
 ) -> bool {
     transfer_all(blocks, |b| {
         let client = client.clone();
@@ -347,7 +374,7 @@ async fn fetch_blocks_from_peer(
             db.set_block_present(&block_id, true)
                 .map_err(|e| format!("Could not record a block as present: {}", e))
         }
-    })
+    }, progress)
     .await
 }
 
@@ -358,6 +385,7 @@ pub async fn push_blocks_to_peer(
     peer_url: &str,
     blocks: &[crate::db::FileBlock],
     storage_dir: &str,
+    progress: OnProgress<'_>,
 ) -> bool {
     transfer_all(blocks, |b| {
         let client = client.clone();
@@ -386,7 +414,7 @@ pub async fn push_blocks_to_peer(
             }
             Ok(())
         }
-    })
+    }, progress)
     .await
 }
 
@@ -632,9 +660,29 @@ pub async fn pull_copy(
         let client =
             build_mtls_client(&cert_pem, &key_pem, &trusted_certs).map_err(|e| e.to_string())?;
 
+        let report = {
+            let event_tx = event_tx.clone();
+            let file_id = file_id.clone();
+            move |done, total| {
+                let _ = event_tx.send(crate::EngineEvent::ReceiveProgress {
+                    file_id: file_id.clone(),
+                    blocks_done: done,
+                    blocks_total: total,
+                });
+            }
+        };
+
         let mut fetched = false;
         for source in sources {
-            if fetch_blocks_from_peer(&client, &source.url, &missing, &db_clone, &storage_dir).await
+            if fetch_blocks_from_peer(
+                &client,
+                &source.url,
+                &missing,
+                &db_clone,
+                &storage_dir,
+                &report,
+            )
+            .await
             {
                 fetched = true;
                 break;

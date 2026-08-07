@@ -203,12 +203,20 @@ pub enum EngineEvent {
     FilePurged { file_id: String },
     FileIndexed { file_id: String, path: String },
 
+    /// How far along sending a copy to `device_id` is. Emitted per block, and
+    /// once at zero before anything moves, so a UI can draw a bar rather than
+    /// an indeterminate spinner for the minutes a large file takes.
+    SendProgress { file_id: String, device_id: String, blocks_done: u64, blocks_total: u64 },
     /// A copy of `file_id` reached `device_id`.
     FileSent { file_id: String, path: String, device_id: String },
     /// Sending a copy to `device_id` did not finish. Other devices in the same
     /// `share_to` may still have succeeded; each reports separately.
     ShareFailed { file_id: String, path: String, device_id: String, reason: String },
 
+    /// How far along taking a copy is. Counts blocks that have to move, so a
+    /// file whose content this device largely holds already reports a small
+    /// total rather than a bar that finishes instantly.
+    ReceiveProgress { file_id: String, blocks_done: u64, blocks_total: u64 },
     /// This device now holds `file_id`, whether it was pushed here or pulled.
     FileDownloaded { file_id: String, path: String },
     /// Taking a copy did not finish, so this device still does not hold it.
@@ -1178,7 +1186,21 @@ impl Engine {
                     }
                 }
 
-                if !discovery::push_blocks_to_peer(&client, url, &blocks, &storage).await {
+                let report = {
+                    let tx = tx.clone();
+                    let file_id = file.id.clone();
+                    let device_id = device_id.clone();
+                    move |done, total| {
+                        let _ = tx.send(EngineEvent::SendProgress {
+                            file_id: file_id.clone(),
+                            device_id: device_id.clone(),
+                            blocks_done: done,
+                            blocks_total: total,
+                        });
+                    }
+                };
+
+                if !discovery::push_blocks_to_peer(&client, url, &blocks, &storage, &report).await {
                     failed("The transfer did not finish".to_string());
                     continue;
                 }
