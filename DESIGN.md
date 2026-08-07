@@ -314,6 +314,12 @@ what turns the larger block size into throughput.
    30-day retention and its sweep, permanent delete and restore.~~ **Done.**
 5. **Platform surfaces** — folder invariant on desktop, `import_file()` on mobile,
    the watcher compiled desktop-only, an iOS Files provider extension.
+
+   There is no UI at present. The Dioxus app was removed: it was one renderer's
+   idea of the model, and it was shaping the engine's API before the engine had
+   settled. `cli/` drives the engine directly and is the only consumer. A UI
+   comes back once the platform surfaces below exist to build it on, and the
+   engine's public API is what it should be answerable to.
 6. ~~**Block size and transfer**~~ — 1 MiB blocks, several in flight at once,
    and superseded blocks released when a file is re-chunked. **Done.**
 7. **Performance and cleanup** — sending only the blocks a recipient lacks,
@@ -345,8 +351,9 @@ from each platform's own idioms — and making large files fast.
 - Discovery has only been exercised with two instances on one machine. It has
   never run across two physical devices, or on Android or iOS, where multicast
   needs an entitlement (iOS) and a multicast lock (Android).
-- The desktop app never syncs the catalog on peer discovery; only the CLI does
-  (`cli/src/main.rs`).
+- Catalog sync on peer discovery is wired up by the caller, not the engine, so
+  every consumer has to remember to do it. `cli/src/main.rs` does; anything else
+  written against the engine would silently never sync.
 - File identity is path-based at creation, so renaming a file in the folder reads
   as delete-plus-create rather than a rename.
 - Blocks are stored unencrypted at rest.
