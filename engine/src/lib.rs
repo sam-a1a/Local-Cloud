@@ -96,11 +96,12 @@ pub struct Engine {
     server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     trash_sweep_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_sync_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Asks the catalog sync task to reach a peer now. Held here rather than
-    /// created in `start`, because pairing can ask for one and pairing is
-    /// driven from methods, not from the startup path.
-    sync_nudge: discovery::SyncNudge,
-    sync_nudges: StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    /// Asks the catalog sync task to reach a peer now.
+    ///
+    /// Renewed by every `start` and cleared by `stop`, so it always addresses
+    /// the task that is currently running - and is absent while the engine is
+    /// stopped, when there is nothing to ask.
+    sync_nudge: StdMutex<Option<discovery::SyncNudge>>,
     known_peers: PeerMap,
     trust: TrustStore,
     pairing: PairingState,
@@ -135,7 +136,6 @@ impl Engine {
         let db_state = Arc::new(StdMutex::new(database));
         let ignore_set = new_ignore_set();
         let (event_tx, event_rx) = mpsc::channel();
-        let (sync_nudge, sync_nudges) = tokio::sync::mpsc::unbounded_channel();
         let known_peers = Arc::new(StdMutex::new(HashMap::new()));
 
         let trust = TrustStore::new();
@@ -155,8 +155,7 @@ impl Engine {
             server_task: StdMutex::new(None),
             trash_sweep_task: StdMutex::new(None),
             catalog_sync_task: StdMutex::new(None),
-            sync_nudge,
-            sync_nudges: StdMutex::new(Some(sync_nudges)),
+            sync_nudge: StdMutex::new(None),
             known_peers,
             trust,
             pairing: PairingState::new(),
@@ -298,7 +297,9 @@ impl Engine {
         let trust = self.trust.clone();
         let pairing_state = self.pairing.clone();
         let tx = self.event_tx.clone();
-        let nudge = self.sync_nudge.clone();
+        // Absent when the engine is not running, in which case there is no
+        // sync task to ask and the pairing simply stands until the next start.
+        let nudge = self.sync_nudge.lock().unwrap().clone();
 
         self.runtime.spawn(async move {
             let client = match pairing::build_pairing_client() {
@@ -336,7 +337,9 @@ impl Engine {
 
             // Newly paired and already visible, so its catalog can be read now
             // rather than at the next scheduled pass.
-            let _ = nudge.send(peer.device_id.clone());
+            if let Some(nudge) = nudge {
+                let _ = nudge.send(peer.device_id.clone());
+            }
 
             let _ = tx.send(EngineEvent::DevicePaired {
                 device_id: peer.device_id,
@@ -950,7 +953,11 @@ impl Engine {
         let server_pairing = self.pairing.clone();
         let server_indexer = self.indexer();
         let server_device_name = self.identity.device_name.clone();
-        let server_nudge = self.sync_nudge.clone();
+        // Renewed here so a restarted engine addresses its new sync task
+        // rather than the one `stop` aborted.
+        let (nudge_tx, nudge_rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.sync_nudge.lock().unwrap() = Some(nudge_tx.clone());
+        let server_nudge = nudge_tx.clone();
 
         let server_task = handle.spawn(async move {
             if let Err(e) = server::start_server(
@@ -987,16 +994,16 @@ impl Engine {
             port,
             disc_tx,
             disc_peers,
-            self.sync_nudge.clone(),
+            nudge_tx,
         ).map_err(EngineError::from)?;
 
         *self.mdns_daemon.lock().unwrap() = Some(daemon);
 
-        // Only the first `start` gets the receiver; a second would otherwise
-        // leave two tasks racing to sync with the same peers.
-        if let Some(nudges) = self.sync_nudges.lock().unwrap().take() {
-            let sync_task = self.spawn_catalog_sync(nudges);
-            *self.catalog_sync_task.lock().unwrap() = Some(sync_task);
+        let sync_task = self.spawn_catalog_sync(nudge_rx);
+        if let Some(previous) = self.catalog_sync_task.lock().unwrap().replace(sync_task) {
+            // Belt and braces: `stop` aborts it, but starting twice without a
+            // stop in between must not leave two tasks syncing in parallel.
+            previous.abort();
         }
 
         let watcher = watcher::start_watcher(
@@ -1050,6 +1057,8 @@ impl Engine {
         if let Some(t) = self.catalog_sync_task.lock().unwrap().take() {
             t.abort();
         }
+        // Nothing left to ask, until the next start hands out a new one.
+        *self.sync_nudge.lock().unwrap() = None;
         let _ = self.event_tx.send(EngineEvent::EngineStopped);
         println!("[Engine] Stopped.");
     }

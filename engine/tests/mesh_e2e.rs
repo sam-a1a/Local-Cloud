@@ -194,3 +194,62 @@ fn converges_on_a_change_made_after_pairing() {
     alice.stop();
     bob.stop();
 }
+
+/// An engine that has been stopped and started again is still a working engine.
+///
+/// Mobile makes this the normal case rather than an edge one: an app is
+/// backgrounded and resumed, and is expected to stop and restart the engine
+/// around that. Anything `start` sets up has to survive being torn down once.
+#[test]
+fn an_engine_restarted_still_syncs() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let alice_dir = TempDir::new().expect("temp dir");
+    let bob_dir = TempDir::new().expect("temp dir");
+    let alice = start_engine(&alice_dir);
+    let bob = start_engine(&bob_dir);
+
+    std::fs::write(format!("{}/notes.txt", bob.get_sync_dir()), "bob's notes")
+        .expect("write into bob's folder");
+
+    // Backgrounded and resumed, before the two have ever paired.
+    alice.stop();
+    alice.start().expect("restart");
+
+    let alice_id = alice.device_id();
+    let bob_id = bob.device_id();
+
+    wait_for("alice to see bob again", || {
+        alice
+            .get_known_peers()
+            .into_iter()
+            .find(|d| d.device_id == bob_id)
+    });
+    wait_for("bob to see alice", || {
+        bob.get_known_peers()
+            .into_iter()
+            .find(|d| d.device_id == alice_id)
+    });
+
+    let code = alice
+        .start_pairing(vec![bob_id.clone()])
+        .expect("pairing starts");
+    wait_for("bob to be asked for the code", || {
+        bob.pairing_offers()
+            .into_iter()
+            .find(|o| o.device_id == alice_id)
+    });
+    bob.confirm_pairing(alice_id.clone(), code)
+        .expect("code accepted");
+
+    wait_for("alice's catalog to catch up after a restart", || {
+        alice
+            .get_catalog()
+            .files
+            .into_iter()
+            .find(|f| f.path == "notes.txt")
+    });
+
+    alice.stop();
+    bob.stop();
+}
