@@ -501,7 +501,10 @@ async fn finalize_file(
                     received_at,
                 });
 
-                let _ = state.event_tx.send(EngineEvent::FileDownloaded { path: file.path.clone() });
+                let _ = state.event_tx.send(EngineEvent::FileDownloaded {
+                    file_id: file_id.clone(),
+                    path: file.path.clone(),
+                });
 
                 crate::ignore::schedule_unmark_ignored(state.ignore_set.clone(), output_path, 3);
 

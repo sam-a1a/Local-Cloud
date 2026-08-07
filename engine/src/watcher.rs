@@ -589,21 +589,21 @@ async fn handle_fs_event(
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
                 match indexer.index(&path_str) {
-                    IndexOutcome::Indexed { path, .. } => {
+                    IndexOutcome::Indexed { file_id, path } => {
                         println!("[Watcher] Indexed {}", path);
-                        let _ = event_tx.send(EngineEvent::FileIndexed { path });
+                        let _ = event_tx.send(EngineEvent::FileIndexed { file_id, path });
                     }
                     IndexOutcome::KeptBoth {
+                        file_id,
                         requested_path,
                         path,
-                        ..
                     } => {
                         println!("[Watcher] \"{}\" was taken; kept as \"{}\"", requested_path, path);
                         let _ = event_tx.send(EngineEvent::NameCollision {
                             requested_path,
                             kept_as: path.clone(),
                         });
-                        let _ = event_tx.send(EngineEvent::FileIndexed { path });
+                        let _ = event_tx.send(EngineEvent::FileIndexed { file_id, path });
                     }
                     IndexOutcome::Unchanged { .. } => {}
                     IndexOutcome::Skipped { reason } => {

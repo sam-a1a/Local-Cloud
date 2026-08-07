@@ -658,6 +658,8 @@ pub async fn pull_copy(
         .map_err(|e| e.to_string())?;
     crate::ignore::schedule_unmark_ignored(ignore_set.clone(), output_path, 3);
 
+    let downloaded = file_id.clone();
+
     // Claiming the holder row is what makes the copy visible to everyone else.
     {
         let db = db_clone.lock().unwrap();
@@ -669,7 +671,10 @@ pub async fn pull_copy(
         });
     }
 
-    let _ = event_tx.send(EngineEvent::FileDownloaded { path: file.path });
+    let _ = event_tx.send(EngineEvent::FileDownloaded {
+        file_id: downloaded,
+        path: file.path,
+    });
     Ok(())
 }
 

@@ -126,24 +126,51 @@ impl EngineError {
     }
 }
 
+/// Something the engine did, or could not do, without being asked at that
+/// moment.
+///
+/// Operations that touch the network return as soon as their request is
+/// understood and finish in the background, so this is where their outcome
+/// arrives. Every failure names what it was about - the item, the device, or
+/// both - because an application has to put the message beside the row that
+/// caused it, and a bare string leaves it nowhere to go but a toast.
 #[derive(Clone, Debug, Serialize)]
 pub enum EngineEvent {
     EngineStarted,
     EngineStopped,
+
     PeerDiscovered { device: DiscoveredDevice },
     PairingRequested { device_id: String, name: String, platform: String },
     DevicePaired { device_id: String, name: String },
     PairingFailed { device_id: String, reason: String },
+
     NameCollision { requested_path: String, kept_as: String },
     CollisionResolved { path: String },
+
     CopyDeleted { file_id: String, device_id: String },
     FileTrashed { file_id: String },
     FileRestored { file_id: String },
     FilePurged { file_id: String },
-    FileIndexed { path: String },
-    FileSent { path: String },
-    FileDownloaded { path: String },
-    ErrorEvent { message: String },
+    FileIndexed { file_id: String, path: String },
+
+    /// A copy of `file_id` reached `device_id`.
+    FileSent { file_id: String, path: String, device_id: String },
+    /// Sending a copy to `device_id` did not finish. Other devices in the same
+    /// `share_to` may still have succeeded; each reports separately.
+    ShareFailed { file_id: String, path: String, device_id: String, reason: String },
+
+    /// This device now holds `file_id`, whether it was pushed here or pulled.
+    FileDownloaded { file_id: String, path: String },
+    /// Taking a copy did not finish, so this device still does not hold it.
+    PullFailed { file_id: String, reason: String },
+
+    /// A device was asked to drop its copy but could not be reached. The
+    /// request stands and travels through the catalog instead.
+    DeleteRequestDeferred { file_id: String, device_id: String, reason: String },
+
+    /// Something went wrong that concerns no particular item or device - the
+    /// server failing to bind, pairing failing before a peer was chosen.
+    EngineFailed { reason: String },
 }
 
 pub struct Engine {
@@ -288,8 +315,8 @@ impl Engine {
             let client = match pairing::build_pairing_client() {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(EngineEvent::ErrorEvent {
-                        message: format!("Could not start pairing: {}", e),
+                    let _ = tx.send(EngineEvent::EngineFailed {
+                        reason: format!("Could not start pairing: {}", e),
                     });
                     return;
                 }
@@ -512,13 +539,17 @@ impl Engine {
         let ignore = self.ignore_set.clone();
         let tx = self.event_tx.clone();
 
+        let pulled = file_id.clone();
         self.runtime.spawn(async move {
             if let Err(e) = discovery::pull_copy(
                 file_id, my_id, db, storage, sync, cert, key, peers, ignore, tx.clone(),
             )
             .await
             {
-                let _ = tx.send(EngineEvent::ErrorEvent { message: e });
+                let _ = tx.send(EngineEvent::PullFailed {
+                    file_id: pulled,
+                    reason: e,
+                });
             }
         });
         Ok(())
@@ -666,6 +697,7 @@ impl Engine {
             let key = self.identity.key_pem.clone();
             let requested_by = self.identity.device_id.clone();
             let tx = self.event_tx.clone();
+            let deferred_file_id = file_id.clone();
 
             self.runtime.spawn(async move {
                 let trusted = match storage::load_all_trusted_certs(&storage) {
@@ -687,8 +719,10 @@ impl Engine {
                     .await;
 
                 if let Err(e) = sent {
-                    let _ = tx.send(EngineEvent::ErrorEvent {
-                        message: format!("Delete queued; {} was not reachable: {}", device_id, e),
+                    let _ = tx.send(EngineEvent::DeleteRequestDeferred {
+                        file_id: deferred_file_id,
+                        device_id: device_id.clone(),
+                        reason: e.to_string(),
                     });
                 }
             });
@@ -886,24 +920,47 @@ impl Engine {
         let tx = self.event_tx.clone();
 
         self.runtime.spawn(async move {
+            // Nothing has been sent anywhere yet, so one report per target
+            // rather than a single anonymous one - each is a row in the UI that
+            // has to stop showing as in progress.
+            let fail_every_target = |reason: String| {
+                for (device_id, _) in &targets {
+                    let _ = tx.send(EngineEvent::ShareFailed {
+                        file_id: file.id.clone(),
+                        path: file.path.clone(),
+                        device_id: device_id.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+            };
+
             let trusted_certs = match storage::load_all_trusted_certs(&storage) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(EngineEvent::ErrorEvent { message: e.to_string() });
+                    fail_every_target(e.to_string());
                     return;
                 }
             };
             let client = match discovery::build_mtls_client(&cert, &key, &trusted_certs) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(EngineEvent::ErrorEvent { message: e.to_string() });
+                    fail_every_target(e.to_string());
                     return;
                 }
             };
 
             let announce = serde_json::json!({ "file": file, "blocks": blocks });
 
-            for (device_id, url) in targets {
+            for (device_id, url) in &targets {
+                let failed = |reason: String| {
+                    let _ = tx.send(EngineEvent::ShareFailed {
+                        file_id: file.id.clone(),
+                        path: file.path.clone(),
+                        device_id: device_id.clone(),
+                        reason,
+                    });
+                };
+
                 let announced = client
                     .post(format!("{}/push_metadata", url))
                     .json(&announce)
@@ -913,23 +970,17 @@ impl Engine {
                 match announced {
                     Ok(r) if r.status().is_success() => {}
                     Ok(r) => {
-                        let _ = tx.send(EngineEvent::ErrorEvent {
-                            message: format!("{} refused {}: {}", device_id, file.path, r.status()),
-                        });
+                        failed(format!("It refused the item: {}", r.status()));
                         continue;
                     }
                     Err(e) => {
-                        let _ = tx.send(EngineEvent::ErrorEvent {
-                            message: format!("Could not reach {}: {}", device_id, e),
-                        });
+                        failed(format!("Could not reach it: {}", e));
                         continue;
                     }
                 }
 
-                if !discovery::push_blocks_to_peer(&client, &url, &blocks, &storage).await {
-                    let _ = tx.send(EngineEvent::ErrorEvent {
-                        message: format!("Could not send all of {} to {}", file.path, device_id),
-                    });
+                if !discovery::push_blocks_to_peer(&client, url, &blocks, &storage).await {
+                    failed("The transfer did not finish".to_string());
                     continue;
                 }
 
@@ -940,7 +991,11 @@ impl Engine {
                     .send()
                     .await;
 
-                let _ = tx.send(EngineEvent::FileSent { path: file.path.clone() });
+                let _ = tx.send(EngineEvent::FileSent {
+                    file_id: file.id.clone(),
+                    path: file.path.clone(),
+                    device_id: device_id.clone(),
+                });
             }
         });
 
@@ -1083,8 +1138,8 @@ impl Engine {
                 server_tx,
                 server_nudge,
             ).await {
-                let _ = server_tx_err.send(EngineEvent::ErrorEvent {
-                    message: format!("Server error: {}", e),
+                let _ = server_tx_err.send(EngineEvent::EngineFailed {
+                    reason: format!("Server error: {}", e),
                 });
             }
         });
