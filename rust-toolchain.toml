@@ -1,0 +1,7 @@
+# Pinned so every device, and every future build, compiles this the same way.
+# The engine is going to be cross-compiled for iOS and Android, where "whatever
+# rustc happens to be installed" is how a build succeeds on one machine and
+# fails on another.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
