@@ -415,11 +415,15 @@ struct PushMetadataRequest {
 async fn push_metadata(
     State(state): State<AppState>,
     Json(req): Json<PushMetadataRequest>,
-) -> impl IntoResponse {
+) -> Response {
     let db = state.db.lock().unwrap();
 
     if let Err(e) = db.merge_catalog_file(&req.file) {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save metadata: {}", e));
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save metadata: {}", e),
+        )
+            .into_response();
     }
 
     let _ = db.clear_blocks_for_file(&req.file.id);
@@ -427,12 +431,32 @@ async fn push_metadata(
         let block_meta = crate::db::BlockMetadata {
             id: b.block_id.clone(),
             size: b.size,
-            is_present: 0, // Default to not present locally
+            is_present: 0, // Only a default; an existing row keeps its own.
         };
         let _ = db.insert_block(&block_meta);
         let _ = db.map_block_to_file(&req.file.id, &b.block_id, b.block_index);
     }
-    (axum::http::StatusCode::OK, String::new())
+
+    // The reply says which of those blocks are actually wanted.
+    //
+    // Storage is content-addressed, so a block this device already holds - from
+    // another item, or an earlier revision of this one - needs no transfer at
+    // all. Saying so here rather than accepting everything is what makes
+    // re-sending a large file that barely changed cost the change rather than
+    // the file. `insert_block` leaves an existing row alone, so a block already
+    // present says so.
+    let mut needed: Vec<String> = Vec::new();
+    let mut asked = std::collections::HashSet::new();
+    for b in &req.blocks {
+        if !asked.insert(b.block_id.clone()) {
+            continue;
+        }
+        if !db.block_is_present(&b.block_id).unwrap_or(false) {
+            needed.push(b.block_id.clone());
+        }
+    }
+
+    (axum::http::StatusCode::OK, Json(needed)).into_response()
 }
 
 /// Receives one block of an item a peer is sending.

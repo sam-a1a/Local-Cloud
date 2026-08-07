@@ -297,7 +297,7 @@ pinned at pairing time.
 | `POST /pair_request` | Begin pairing, carries the 6-digit code |
 | `POST /pair_confirm` | Complete the certificate exchange |
 | `GET /catalog` | Full catalog including holder sets |
-| `POST /push_metadata` | Announce an item being sent |
+| `POST /push_metadata` | Announce an item being sent; replies with the blocks it needs |
 | `POST /push_block/{id}` | Transfer one block |
 | `POST /finalize_file/{id}` | Assemble and claim a holder row |
 | `GET /get_block/{id}` | Serve a block to a puller |
@@ -359,8 +359,9 @@ appeared before the next scheduled pass.
    **Done.**
 4. ~~**Pull, delete, trash** — `/request_delete` with offline queueing, the
    30-day retention and its sweep, permanent delete and restore.~~ **Done.**
-5. **Platform surfaces** — folder invariant on desktop, `import_file()` on mobile,
-   the watcher compiled desktop-only, an iOS Files provider extension.
+5. **Platform surfaces** — ~~`import_file()` on mobile, the watcher compiled
+   desktop-only~~ **done**; an iOS Files provider extension and the FFI bindings
+   remain.
 
    There is no UI at present. The Dioxus app was removed: it was one renderer's
    idea of the model, and it was shaping the engine's API before the engine had
@@ -369,7 +370,8 @@ appeared before the next scheduled pass.
    engine's public API is what it should be answerable to.
 6. ~~**Block size and transfer**~~ — 1 MiB blocks, several in flight at once,
    and superseded blocks released when a file is re-chunked. **Done.**
-7. **Performance and cleanup** — sending only the blocks a recipient lacks.
+7. ~~**Sending only the blocks a recipient lacks**~~ — `/push_metadata` replies
+   with what is missing. **Done.**
 
 Steps 1 and 2 were load-bearing: everything after assumes trusted peers and a
 truthful holder set.
@@ -387,10 +389,6 @@ from each platform's own idioms — and making large files fast.
   milliseconds. The expiry and attempt cap bound *online* guessing only.
   Closing it properly needs a PAKE such as SPAKE2, where the code is never
   committed to. Acceptable on a home network; not on a hostile one.
-- Sharing sends every block of an item, including ones the recipient already
-  has. Blocks are content-addressed, so the recipient could be asked which of a
-  manifest it is missing and only those sent; re-sending a large file that has
-  barely changed currently costs as much as sending it the first time.
 - Transfer throughput has only been measured over loopback. The block size and
   overlapping requests are both aimed at network round-trips, which loopback
   does not have, so the real-network figures are unproven.

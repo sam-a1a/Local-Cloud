@@ -810,6 +810,20 @@ impl Database {
         Ok(result)
     }
 
+    /// Whether this device holds the block's contents, as opposed to merely
+    /// knowing an item refers to it.
+    pub fn block_is_present(&self, block_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT is_present FROM blocks WHERE id = ?1",
+                rusqlite::params![block_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|present| present != 0))
+    }
+
     pub fn set_block_present(&self, block_id: &str, is_present: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE blocks SET is_present = ?1 WHERE id = ?2",

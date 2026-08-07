@@ -1174,8 +1174,24 @@ impl Engine {
                     .send()
                     .await;
 
-                match announced {
-                    Ok(r) if r.status().is_success() => {}
+                // The reply names the blocks this peer does not already hold.
+                // Anything else is content it can reconstruct from what it has,
+                // so re-sending a large file that barely changed costs the
+                // change rather than the file. A peer that answers with
+                // something unreadable is simply sent everything.
+                let wanted: Vec<crate::db::FileBlock> = match announced {
+                    Ok(r) if r.status().is_success() => match r.json::<Vec<String>>().await {
+                        Ok(needed) => {
+                            let needed: std::collections::HashSet<String> =
+                                needed.into_iter().collect();
+                            blocks
+                                .iter()
+                                .filter(|b| needed.contains(&b.block_id))
+                                .cloned()
+                                .collect()
+                        }
+                        Err(_) => blocks.clone(),
+                    },
                     Ok(r) => {
                         failed(format!("It refused the item: {}", r.status()));
                         continue;
@@ -1184,7 +1200,7 @@ impl Engine {
                         failed(format!("Could not reach it: {}", e));
                         continue;
                     }
-                }
+                };
 
                 let report = {
                     let tx = tx.clone();
@@ -1200,7 +1216,7 @@ impl Engine {
                     }
                 };
 
-                if !discovery::push_blocks_to_peer(&client, url, &blocks, &storage, &report).await {
+                if !discovery::push_blocks_to_peer(&client, url, &wanted, &storage, &report).await {
                     failed("The transfer did not finish".to_string());
                     continue;
                 }

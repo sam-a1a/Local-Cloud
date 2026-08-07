@@ -386,7 +386,8 @@ async fn a_file_whose_blocks_repeat_arrives_whole() {
             &client,
             &receiver.url,
             &blocks,
-            &sender.storage_dir
+            &sender.storage_dir,
+            &|_, _| {},
         )
         .await,
         "every block must transfer"
@@ -434,5 +435,93 @@ async fn pairing_asks_for_a_catalog_sync_straight_away() {
         initiator.sync_nudges.lock().await.try_recv().ok(),
         Some(target.info.device_id.clone()),
         "the initiator must ask to read the new peer's catalog at once"
+    );
+}
+
+/// A peer is only sent the blocks it does not already hold.
+///
+/// Storage is content-addressed, so content the recipient has - from another
+/// item, or an earlier revision of this one - needs no transfer. Without this,
+/// re-sending a large file that barely changed costs as much as the first send.
+#[tokio::test]
+async fn a_peer_is_sent_only_what_it_is_missing() {
+    install_crypto_provider();
+    let receiver = TestDevice::start().await;
+    let sender = TestDevice::start().await;
+    let client = pair(&receiver, &sender).await;
+
+    // Two items sharing a leading region: fixed-size chunking makes that region
+    // literally the same blocks.
+    let shared = vec![7u8; storage::BLOCK_SIZE * 2];
+    let mut first = shared.clone();
+    first.extend_from_slice(b"first ending");
+    let mut second = shared.clone();
+    second.extend_from_slice(b"a different ending");
+
+    let announce = |id: &str, name: &str, bytes: &[u8]| {
+        let path = format!("{}/{}", sender.sync_dir, name);
+        std::fs::write(&path, bytes).expect("write");
+        let file = localcloud::FileMetadata {
+            id: id.to_string(),
+            path: name.to_string(),
+            size: bytes.len() as i64,
+            content_hash: String::new(),
+            modified_time: 1,
+            created_by: sender.info.device_id.clone(),
+            trashed_at: 0,
+            trashed_by: String::new(),
+        };
+        let db = sender.db.lock().unwrap();
+        db.insert_file(&file).expect("record");
+        storage::chunk_and_store_file(&sender.storage_dir, &db, id, &path).expect("chunk");
+        (file, db.get_blocks_for_file(id).expect("blocks"))
+    };
+
+    let (file_a, blocks_a) = announce("a", "first.bin", &first);
+    let (file_b, blocks_b) = announce("b", "second.bin", &second);
+
+    let needed = |file: &localcloud::FileMetadata, blocks: &Vec<localcloud::FileBlock>| {
+        let client = client.clone();
+        let url = receiver.url.clone();
+        let body = serde_json::json!({ "file": file, "blocks": blocks });
+        async move {
+            client
+                .post(format!("{}/push_metadata", url))
+                .json(&body)
+                .send()
+                .await
+                .expect("announced")
+                .json::<Vec<String>>()
+                .await
+                .expect("a list of what is wanted")
+        }
+    };
+
+    // Nothing is held yet, so everything distinct is wanted.
+    let first_ask = needed(&file_a, &blocks_a).await;
+    assert_eq!(first_ask.len(), 2, "one shared block and one tail");
+
+    assert!(
+        localcloud::discovery::push_blocks_to_peer(
+            &client,
+            &receiver.url,
+            &blocks_a,
+            &sender.storage_dir,
+            &|_, _| {},
+        )
+        .await
+    );
+
+    // Now the shared region is already there, so only the differing tail is.
+    let second_ask = needed(&file_b, &blocks_b).await;
+    assert_eq!(
+        second_ask.len(),
+        1,
+        "the shared region must not be asked for twice: {:?}",
+        second_ask
+    );
+    assert_eq!(
+        second_ask[0], blocks_b.last().expect("tail").block_id,
+        "and what is asked for must be the part that differs"
     );
 }
