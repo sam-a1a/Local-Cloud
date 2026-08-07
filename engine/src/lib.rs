@@ -173,6 +173,88 @@ pub enum EngineEvent {
     EngineFailed { reason: String },
 }
 
+/// Receives events as the engine produces them.
+///
+/// Implemented by the application. A callback interface rather than a queue to
+/// poll, because that is what an application actually wants and what bindings
+/// generate idiomatically on both platforms - and because a queue has exactly
+/// one consumer, so anything else that wanted to observe events had to be given
+/// them by hand.
+///
+/// Calls arrive on a background thread, never on the thread that called into
+/// the engine, and never two at once. An implementation must not assume it is
+/// on a UI thread, and must not call back into the engine and block waiting for
+/// an event.
+pub trait EventListener: Send + Sync {
+    fn on_event(&self, event: EngineEvent);
+}
+
+/// How many events are held for a listener that has not been set yet.
+///
+/// An application is expected to set one before `start`, so in practice this
+/// holds nothing. It exists so that one which forgets leaks a bounded amount
+/// rather than growing for as long as it runs.
+const EVENT_BACKLOG: usize = 256;
+
+/// Carries events from the engine's internals to whatever the application
+/// registered, on one thread, in order.
+///
+/// Draining continuously rather than only once a listener exists is what bounds
+/// the memory: a channel nobody reads grows for as long as the engine runs,
+/// whereas a backlog can be capped and, when it overflows, say so.
+fn spawn_event_dispatch(
+    events: mpsc::Receiver<EngineEvent>,
+    listener: Arc<StdMutex<Option<Arc<dyn EventListener>>>>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    std::thread::spawn(move || {
+        let mut backlog: Vec<EngineEvent> = Vec::new();
+        let mut dropped: usize = 0;
+
+        loop {
+            // Everything is queued first and delivered second, so one thread
+            // decides the order and a listener registered late is not a special
+            // case. The timeout exists for exactly that: a listener set when no
+            // further events are coming would otherwise never see the backlog,
+            // because nothing would wake this loop to notice it.
+            match events.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(event) => {
+                    if backlog.len() == EVENT_BACKLOG {
+                        backlog.remove(0);
+                        dropped += 1;
+                    }
+                    backlog.push(event);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                // Every sender is gone, so the engine has been dropped.
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+
+            if backlog.is_empty() {
+                continue;
+            }
+
+            // Cloned out, and the lock released, before anything is delivered:
+            // a listener is free to call back into the engine, and must not
+            // find this held.
+            let Some(current) = listener.lock().unwrap().clone() else {
+                continue;
+            };
+
+            if dropped > 0 {
+                current.on_event(EngineEvent::EngineFailed {
+                    reason: format!("{} events were discarded before a listener was set", dropped),
+                });
+                dropped = 0;
+            }
+            for event in backlog.drain(..) {
+                current.on_event(event);
+            }
+        }
+    });
+}
+
 pub struct Engine {
     db: Arc<StdMutex<Database>>,
     identity: DeviceIdentity,
@@ -180,7 +262,7 @@ pub struct Engine {
     sync_dir: String,
     ignore_set: IgnoreSet,
     event_tx: mpsc::Sender<EngineEvent>,
-    event_rx: StdMutex<mpsc::Receiver<EngineEvent>>,
+    listener: Arc<StdMutex<Option<Arc<dyn EventListener>>>>,
     runtime: tokio::runtime::Runtime,
     watcher: StdMutex<Option<RecommendedWatcher>>,
     mdns_daemon: StdMutex<Option<ServiceDaemon>>,
@@ -227,6 +309,9 @@ impl Engine {
         let db_state = Arc::new(StdMutex::new(database));
         let ignore_set = new_ignore_set();
         let (event_tx, event_rx) = mpsc::channel();
+        let listener: Arc<StdMutex<Option<Arc<dyn EventListener>>>> =
+            Arc::new(StdMutex::new(None));
+        spawn_event_dispatch(event_rx, listener.clone());
         let known_peers = Arc::new(StdMutex::new(HashMap::new()));
 
         let trust = TrustStore::new();
@@ -239,7 +324,7 @@ impl Engine {
             sync_dir,
             ignore_set,
             event_tx,
-            event_rx: StdMutex::new(event_rx),
+            listener,
             runtime,
             watcher: StdMutex::new(None),
             mdns_daemon: StdMutex::new(None),
@@ -464,10 +549,17 @@ impl Engine {
         self.sync_dir.clone()
     }
 
-    pub fn poll_event(&self, timeout_ms: u64) -> Option<EngineEvent> {
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        let rx = self.event_rx.lock().unwrap();
-        rx.recv_timeout(timeout).ok()
+    /// Registers what receives events from here on.
+    ///
+    /// Set this before `start`. Anything the engine produced before a listener
+    /// existed is delivered as soon as one does, up to `EVENT_BACKLOG`, so
+    /// setting it a moment late costs nothing - but leaving it unset means an
+    /// application eventually misses events, which is the honest trade for not
+    /// growing without bound.
+    ///
+    /// Replacing a listener is allowed; the next event goes to the new one.
+    pub fn set_event_listener(&self, listener: Arc<dyn EventListener>) {
+        *self.listener.lock().unwrap() = Some(listener);
     }
 
     /// Every device currently visible on the network, paired or not.

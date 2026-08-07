@@ -1,5 +1,5 @@
 // cli/src/main.rs
-use localcloud::{Engine, EngineEvent};
+use localcloud::{Engine, EngineEvent, EventListener};
 use anyhow::Result;
 use std::sync::Arc;
 use std::fs;
@@ -16,28 +16,19 @@ async fn main() -> Result<()> {
     let short_id = engine.device_short_id();
     let sync_dir = engine.get_sync_dir();
 
-    // Listen for events by polling in a background blocking thread
-    let engine_events = engine.clone();
-    tokio::spawn(async move {
-        loop {
-            let eng = engine_events.clone();
-            let event = tokio::task::spawn_blocking(move || {
-                eng.poll_event(500)
-            }).await.unwrap();
-
-            if let Some(event) = event {
-                println!("[Event] {:?}", event);
-
-                // Syncing on discovery used to be done here. The engine does it
-                // itself now, and keeps at it on an interval, so a consumer that
-                // does nothing but watch events still ends up with a true
-                // catalog.
-                if let EngineEvent::EngineStopped = event {
-                    break;
-                }
-            }
+    // Everything this consumer does with events. Registered before `start`, so
+    // nothing is missed - including EngineStarted.
+    //
+    // Syncing on discovery used to be done here. The engine does that itself
+    // now, and keeps at it on an interval, so a consumer that only watches
+    // still ends up with a true catalog.
+    struct Printer;
+    impl EventListener for Printer {
+        fn on_event(&self, event: EngineEvent) {
+            println!("[Event] {:?}", event);
         }
-    });
+    }
+    engine.set_event_listener(Arc::new(Printer));
 
     engine.start().map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
