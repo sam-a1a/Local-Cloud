@@ -40,6 +40,16 @@ pub const TRASH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 /// checking hourly is ample and costs nothing when there is nothing to do.
 const TRASH_SWEEP_INTERVAL_SECS: u64 = 60 * 60;
 
+/// How often a device re-reads the catalogs of the peers it can see.
+///
+/// Syncing only on discovery is not enough to keep a catalog true. A peer is
+/// announced when it is new or has moved, so two devices sitting on a network
+/// would exchange catalogs once and never again - a file added on one would
+/// stay invisible to the other for as long as both kept running. Every paired
+/// device is supposed to hold a complete copy of the catalog, and that is a
+/// property that has to be maintained, not established once.
+const CATALOG_SYNC_INTERVAL_SECS: u64 = 30;
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("{description}")]
@@ -85,6 +95,12 @@ pub struct Engine {
     mdns_daemon: StdMutex<Option<ServiceDaemon>>,
     server_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     trash_sweep_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    catalog_sync_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Asks the catalog sync task to reach a peer now. Held here rather than
+    /// created in `start`, because pairing can ask for one and pairing is
+    /// driven from methods, not from the startup path.
+    sync_nudge: discovery::SyncNudge,
+    sync_nudges: StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     known_peers: PeerMap,
     trust: TrustStore,
     pairing: PairingState,
@@ -119,6 +135,7 @@ impl Engine {
         let db_state = Arc::new(StdMutex::new(database));
         let ignore_set = new_ignore_set();
         let (event_tx, event_rx) = mpsc::channel();
+        let (sync_nudge, sync_nudges) = tokio::sync::mpsc::unbounded_channel();
         let known_peers = Arc::new(StdMutex::new(HashMap::new()));
 
         let trust = TrustStore::new();
@@ -137,6 +154,9 @@ impl Engine {
             mdns_daemon: StdMutex::new(None),
             server_task: StdMutex::new(None),
             trash_sweep_task: StdMutex::new(None),
+            catalog_sync_task: StdMutex::new(None),
+            sync_nudge,
+            sync_nudges: StdMutex::new(Some(sync_nudges)),
             known_peers,
             trust,
             pairing: PairingState::new(),
@@ -278,6 +298,7 @@ impl Engine {
         let trust = self.trust.clone();
         let pairing_state = self.pairing.clone();
         let tx = self.event_tx.clone();
+        let nudge = self.sync_nudge.clone();
 
         self.runtime.spawn(async move {
             let client = match pairing::build_pairing_client() {
@@ -312,6 +333,11 @@ impl Engine {
             }
 
             pairing_state.clear_offer(&initiator_device_id);
+
+            // Newly paired and already visible, so its catalog can be read now
+            // rather than at the next scheduled pass.
+            let _ = nudge.send(peer.device_id.clone());
+
             let _ = tx.send(EngineEvent::DevicePaired {
                 device_id: peer.device_id,
                 name: peer.name,
@@ -811,8 +837,100 @@ impl Engine {
         Ok(())
     }
 
+    /// Keeps this device's catalog in step with the peers it can see.
+    ///
+    /// Convergence is the engine's own responsibility. It used to be left to
+    /// whoever embedded the engine to notice `PeerDiscovered` and call
+    /// `sync_with_peer` themselves, which meant a consumer that did not happen
+    /// to do so simply never synced, with nothing to indicate anything was
+    /// wrong - the catalog just stayed empty.
+    ///
+    /// A newly seen peer is synced with at once so a device that has just
+    /// appeared is not left waiting for the next tick; the interval then keeps
+    /// everything already visible up to date. `sync_with_peer` ignores anything
+    /// unpaired, and decides that locally, so an unpaired device on the network
+    /// costs nothing here.
+    fn spawn_catalog_sync(
+        &self,
+        mut nudges: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let db = self.db.clone();
+        let storage = self.storage_dir.clone();
+        let sync = self.sync_dir.clone();
+        let cert = self.identity.cert_pem.clone();
+        let key = self.identity.key_pem.clone();
+        let my_id = self.identity.device_id.clone();
+        let ignore = self.ignore_set.clone();
+        let collisions = self.collisions.clone();
+        let indexer = self.indexer();
+        let tx = self.event_tx.clone();
+        let peers = self.known_peers.clone();
+
+        self.runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                CATALOG_SYNC_INTERVAL_SECS,
+            ));
+            let mut discovering = true;
+
+            loop {
+                let due: Vec<DiscoveredDevice> = tokio::select! {
+                    nudged = nudges.recv(), if discovering => match nudged {
+                        // Resolved here rather than carried in the message, so
+                        // a peer that has moved since is still reached, and one
+                        // that is no longer visible is simply skipped.
+                        Some(device_id) => peers
+                            .lock()
+                            .unwrap()
+                            .get(&device_id)
+                            .cloned()
+                            .into_iter()
+                            .collect(),
+                        // Discovery has shut down. The interval carries on with
+                        // whatever is already known rather than ending here.
+                        None => {
+                            discovering = false;
+                            Vec::new()
+                        }
+                    },
+                    _ = ticker.tick() => {
+                        // Collected rather than iterated, so the lock is not
+                        // held across a sync.
+                        let known = peers.lock().unwrap();
+                        known.values().cloned().collect()
+                    }
+                };
+
+                for device in due {
+                    discovery::sync_with_peer(
+                        device.url,
+                        device.device_id,
+                        my_id.clone(),
+                        db.clone(),
+                        storage.clone(),
+                        sync.clone(),
+                        cert.clone(),
+                        key.clone(),
+                        ignore.clone(),
+                        collisions.clone(),
+                        indexer.clone(),
+                        tx.clone(),
+                    )
+                    .await;
+                }
+            }
+        })
+    }
+
     pub fn start(&self) -> Result<(), EngineError> {
         let handle = self.runtime.handle().clone();
+
+        // Registering the listener needs a reactor, and the engine has one of
+        // its own - but nothing had put it in scope, so it used to find the
+        // *caller's* instead. That works from inside `#[tokio::main]` and
+        // panics anywhere else, which is precisely where this is headed: a
+        // binding called from Swift or Kotlin is not running in a runtime, and
+        // would have met "there is no reactor running" on the first call.
+        let _entered = handle.enter();
 
         let std_listener = std::net::TcpListener::bind("0.0.0.0:0").map_err(EngineError::from)?;
         let port = std_listener.local_addr().map_err(EngineError::from)?.port();
@@ -832,6 +950,7 @@ impl Engine {
         let server_pairing = self.pairing.clone();
         let server_indexer = self.indexer();
         let server_device_name = self.identity.device_name.clone();
+        let server_nudge = self.sync_nudge.clone();
 
         let server_task = handle.spawn(async move {
             if let Err(e) = server::start_server(
@@ -848,6 +967,7 @@ impl Engine {
                 server_pairing,
                 server_indexer,
                 server_tx,
+                server_nudge,
             ).await {
                 let _ = server_tx_err.send(EngineEvent::ErrorEvent {
                     message: format!("Server error: {}", e),
@@ -867,9 +987,17 @@ impl Engine {
             port,
             disc_tx,
             disc_peers,
+            self.sync_nudge.clone(),
         ).map_err(EngineError::from)?;
 
         *self.mdns_daemon.lock().unwrap() = Some(daemon);
+
+        // Only the first `start` gets the receiver; a second would otherwise
+        // leave two tasks racing to sync with the same peers.
+        if let Some(nudges) = self.sync_nudges.lock().unwrap().take() {
+            let sync_task = self.spawn_catalog_sync(nudges);
+            *self.catalog_sync_task.lock().unwrap() = Some(sync_task);
+        }
 
         let watcher = watcher::start_watcher(
             self.indexer(),
@@ -917,6 +1045,9 @@ impl Engine {
             t.abort();
         }
         if let Some(t) = self.trash_sweep_task.lock().unwrap().take() {
+            t.abort();
+        }
+        if let Some(t) = self.catalog_sync_task.lock().unwrap().take() {
             t.abort();
         }
         let _ = self.event_tx.send(EngineEvent::EngineStopped);

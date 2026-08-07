@@ -28,6 +28,14 @@ pub struct DiscoveredDevice {
 /// device_id -> most recently resolved advertisement for that device.
 pub type PeerMap = Arc<Mutex<HashMap<String, DiscoveredDevice>>>;
 
+/// Asks the engine to sync with a device now, by id.
+///
+/// A peer becomes worth syncing with for two reasons - it was just discovered
+/// while already paired, or it was just paired while already visible - and both
+/// have to prompt it, or which one happened last would decide whether anything
+/// appears before the next scheduled pass.
+pub type SyncNudge = tokio::sync::mpsc::UnboundedSender<String>;
+
 /// Picks the address to reach a peer on, and formats it as a base URL.
 ///
 /// A device advertises every address it has, and they arrive as an unordered
@@ -135,6 +143,12 @@ pub fn start_discovery(
     port: u16,
     event_tx: mpsc::Sender<EngineEvent>,
     known_peers: PeerMap,
+    // Separate from `event_tx`, which belongs to whoever embedded the engine:
+    // an event channel has one consumer, so the engine cannot both hand
+    // discoveries to the caller and act on them itself through the same one.
+    // Carries the device id rather than the whole advertisement, so a sync
+    // always uses the address the peer is reachable at *now*.
+    peer_found: SyncNudge,
 ) -> Result<ServiceDaemon> {
     let daemon = ServiceDaemon::new()?;
 
@@ -215,6 +229,7 @@ pub fn start_discovery(
                 };
 
                 if changed {
+                    let _ = peer_found.send(device.device_id.clone());
                     let _ = event_tx.send(EngineEvent::PeerDiscovered { device });
                 }
             }

@@ -279,6 +279,12 @@ spends most of its life waiting rather than moving bytes, so sending the next
 only once the last has returned leaves the link idle; overlapping a handful is
 what turns the larger block size into throughput.
 
+Keeping the catalog true is the engine's own job, not the caller's. It reads a
+peer's catalog when that peer is discovered, when pairing with it completes, and
+then every `CATALOG_SYNC_INTERVAL_SECS`. Both immediate triggers matter: which
+of discovery and pairing happened last would otherwise decide whether anything
+appeared before the next scheduled pass.
+
 ---
 
 ## 12. Worked example
@@ -322,8 +328,7 @@ what turns the larger block size into throughput.
    engine's public API is what it should be answerable to.
 6. ~~**Block size and transfer**~~ — 1 MiB blocks, several in flight at once,
    and superseded blocks released when a file is re-chunked. **Done.**
-7. **Performance and cleanup** — sending only the blocks a recipient lacks,
-   catalog sync on peer discovery.
+7. **Performance and cleanup** — sending only the blocks a recipient lacks.
 
 Steps 1 and 2 were load-bearing: everything after assumes trusted peers and a
 truthful holder set.
@@ -351,9 +356,14 @@ from each platform's own idioms — and making large files fast.
 - Discovery has only been exercised with two instances on one machine. It has
   never run across two physical devices, or on Android or iOS, where multicast
   needs an entitlement (iOS) and a multicast lock (Android).
-- Catalog sync on peer discovery is wired up by the caller, not the engine, so
-  every consumer has to remember to do it. `cli/src/main.rs` does; anything else
-  written against the engine would silently never sync.
+- A change takes up to `CATALOG_SYNC_INTERVAL_SECS` (30s) to reach another
+  device. Catalog replication is pull-only, so nothing tells a peer that
+  something has changed and the periodic pass is the only thing that carries it.
+  Discovery and pairing both prompt an immediate read, so the delay only applies
+  in steady state — but that is the common case. Closing it means either polling
+  harder, which fetches the whole catalog each time, or a notification carrying
+  no content that says "there is something new to read". The latter is the real
+  fix and is a protocol addition, not a tuning change.
 - File identity is path-based at creation, so renaming a file in the folder reads
   as delete-plus-create rather than a rename.
 - Blocks are stored unencrypted at rest.

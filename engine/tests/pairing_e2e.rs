@@ -10,6 +10,7 @@ use localcloud::pairing::{self, DeviceInfo, PairingState};
 use localcloud::tls::TrustStore;
 use localcloud::{server, storage, DeviceIdentity};
 use std::sync::{mpsc, Arc, Mutex};
+use tokio::sync::Mutex as AsyncMutex;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -27,6 +28,7 @@ struct TestDevice {
     db: Arc<Mutex<Database>>,
     storage_dir: String,
     sync_dir: String,
+    sync_nudges: AsyncMutex<tokio::sync::mpsc::UnboundedReceiver<String>>,
     _dir: TempDir,
 }
 
@@ -58,6 +60,7 @@ impl TestDevice {
         let port = listener.local_addr().expect("addr").port();
 
         let (event_tx, _event_rx) = mpsc::channel();
+        let (sync_nudge, sync_nudges) = tokio::sync::mpsc::unbounded_channel();
         // The receiver is dropped, so sends fail silently; the engine already
         // ignores send errors everywhere.
 
@@ -89,6 +92,7 @@ impl TestDevice {
                 localcloud::CollisionQueue::new(),
             ),
             event_tx,
+            sync_nudge,
         ));
 
         // Give the listener a moment to start accepting.
@@ -103,6 +107,7 @@ impl TestDevice {
             db,
             storage_dir,
             sync_dir,
+            sync_nudges: AsyncMutex::new(sync_nudges),
             _dir: dir,
         }
     }
@@ -402,5 +407,32 @@ async fn a_file_whose_blocks_repeat_arrives_whole() {
         std::fs::read(format!("{}/padded.bin", receiver.sync_dir)).expect("received file"),
         payload,
         "the copy must be the whole file, byte for byte"
+    );
+}
+
+/// Pairing is what makes a peer's catalog readable, so it has to be what
+/// prompts the first read.
+///
+/// The initiator learns it is paired here, in the `pair_confirm` handler -
+/// there is no other moment it finds out. Without a nudge from this point, a
+/// device would sit with an empty catalog until the next scheduled pass, which
+/// is exactly when a person is watching for something to appear.
+#[tokio::test]
+async fn pairing_asks_for_a_catalog_sync_straight_away() {
+    install_crypto_provider();
+    let initiator = TestDevice::start().await;
+    let target = TestDevice::start().await;
+
+    assert!(
+        initiator.sync_nudges.lock().await.try_recv().is_err(),
+        "nothing to sync with before pairing"
+    );
+
+    let _ = pair(&initiator, &target).await;
+
+    assert_eq!(
+        initiator.sync_nudges.lock().await.try_recv().ok(),
+        Some(target.info.device_id.clone()),
+        "the initiator must ask to read the new peer's catalog at once"
     );
 }

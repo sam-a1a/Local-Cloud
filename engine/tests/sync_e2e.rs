@@ -38,6 +38,9 @@ struct Device {
     trust: TrustStore,
     event_tx: mpsc::Sender<EngineEvent>,
     events: mpsc::Receiver<EngineEvent>,
+    // Kept alive so the server's end of the channel stays open. Nothing here
+    // pairs through the server, so nothing is ever sent on it.
+    _sync_nudges: tokio::sync::mpsc::UnboundedReceiver<String>,
     _dir: TempDir,
 }
 
@@ -74,6 +77,7 @@ impl Device {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let (event_tx, events) = mpsc::channel();
+        let (sync_nudge, _sync_nudges) = tokio::sync::mpsc::unbounded_channel();
 
         let info = DeviceInfo {
             device_id: identity.device_id.clone(),
@@ -96,6 +100,7 @@ impl Device {
             PairingState::new(),
             indexer.clone(),
             event_tx.clone(),
+            sync_nudge,
         ));
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -113,6 +118,7 @@ impl Device {
             trust,
             event_tx,
             events,
+            _sync_nudges,
             _dir: dir,
         }
     }

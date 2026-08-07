@@ -32,6 +32,10 @@ pub struct AppState {
     pub pairing: PairingState,
     pub indexer: crate::watcher::Indexer,
     pub event_tx: mpsc::Sender<EngineEvent>,
+    /// Pairing completes here for the initiator - the peer typed the code and
+    /// this is where we learn of it - so this is the only place that side can
+    /// ask for a first sync without waiting for the next scheduled pass.
+    pub sync_nudge: crate::discovery::SyncNudge,
 }
 
 impl AppState {
@@ -156,6 +160,7 @@ pub async fn start_server(
     pairing: PairingState,
     indexer: crate::watcher::Indexer,
     event_tx: mpsc::Sender<EngineEvent>,
+    sync_nudge: crate::discovery::SyncNudge,
 ) -> Result<()> {
     let (certs, key) = crate::tls::load_certs_and_key(&cert_pem, &key_pem)?;
 
@@ -181,6 +186,7 @@ pub async fn start_server(
         pairing,
         indexer,
         event_tx,
+        sync_nudge,
     };
 
     // Reachable by any device on the network; used to bootstrap pairing.
@@ -314,6 +320,9 @@ async fn pair_confirm(
         device_id: req.device.device_id.clone(),
         name: req.device.name.clone(),
     });
+
+    // Newly paired and already visible, so there is a catalog to read right now.
+    let _ = state.sync_nudge.send(req.device.device_id.clone());
 
     // Returned so the target can pin us from the same exchange.
     Json(state.own_info()).into_response()

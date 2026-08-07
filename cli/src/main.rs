@@ -28,18 +28,10 @@ async fn main() -> Result<()> {
             if let Some(event) = event {
                 println!("[Event] {:?}", event);
 
-                // Automatically synchronize metadata when a peer is discovered
-                // Use a reference (&event) to avoid moving the values out
-                if let EngineEvent::PeerDiscovered { device } = &event {
-                    let engine_sync = engine_events.clone();
-                    let peer_id = device.device_id.clone();
-                    let addr = device.url.clone();
-                    tokio::spawn(async move {
-                        let _ = engine_sync.sync_with_peer(peer_id, addr);
-                    });
-                }
-
-                // Now we can still use `event` here because we didn't move it above
+                // Syncing on discovery used to be done here. The engine does it
+                // itself now, and keeps at it on an interval, so a consumer that
+                // does nothing but watch events still ends up with a true
+                // catalog.
                 if let EngineEvent::EngineStopped = event {
                     break;
                 }
