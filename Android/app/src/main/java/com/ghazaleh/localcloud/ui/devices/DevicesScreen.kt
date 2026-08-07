@@ -226,7 +226,7 @@ private fun DeviceCard(
             containerColor = if (accent) {
                 MaterialTheme.colorScheme.tertiaryContainer
             } else {
-                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                MaterialTheme.colorScheme.surfaceContainer
             },
             contentColor = if (accent) {
                 MaterialTheme.colorScheme.onTertiaryContainer

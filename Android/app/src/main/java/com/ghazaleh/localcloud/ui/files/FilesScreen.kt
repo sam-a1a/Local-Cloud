@@ -150,7 +150,7 @@ private fun ItemRow(
             .animateContentSize(),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
         ),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {

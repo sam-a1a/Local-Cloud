@@ -39,6 +39,22 @@ val OnSurfaceLight = Color(0xFF171D1E)
 val SurfaceVariantLight = Color(0xFFDBE4E6)
 val OnSurfaceVariantLight = Color(0xFF3F484A)
 val OutlineLight = Color(0xFF6F797A)
+val OutlineVariantLight = Color(0xFFBFC8CA)
+
+// The container ramp. Material draws navigation bars, cards, sheets and menus
+// from these rather than from `surface`, so leaving them out does not mean
+// "use the surface colour" - it means every one of those falls back to the
+// baseline purple and the palette above applies only to what is left.
+val SurfaceDimLight = Color(0xFFD5DBDC)
+val SurfaceBrightLight = Color(0xFFF5FAFB)
+val SurfaceContainerLowestLight = Color(0xFFFFFFFF)
+val SurfaceContainerLowLight = Color(0xFFEFF5F6)
+val SurfaceContainerLight = Color(0xFFE9EFF0)
+val SurfaceContainerHighLight = Color(0xFFE3EAEB)
+val SurfaceContainerHighestLight = Color(0xFFDEE4E5)
+val InverseSurfaceLight = Color(0xFF2B3133)
+val InverseOnSurfaceLight = Color(0xFFECF2F3)
+val InversePrimaryLight = Color(0xFF82D3DC)
 
 // Dark.
 val TealPrimaryDark = Color(0xFF82D3DC)
@@ -61,3 +77,15 @@ val OnSurfaceDark = Color(0xFFDDE4E5)
 val SurfaceVariantDark = Color(0xFF3F484A)
 val OnSurfaceVariantDark = Color(0xFFBFC8CA)
 val OutlineDark = Color(0xFF899294)
+val OutlineVariantDark = Color(0xFF3F484A)
+
+val SurfaceDimDark = Color(0xFF0E1415)
+val SurfaceBrightDark = Color(0xFF343A3B)
+val SurfaceContainerLowestDark = Color(0xFF090F10)
+val SurfaceContainerLowDark = Color(0xFF171D1E)
+val SurfaceContainerDark = Color(0xFF1B2122)
+val SurfaceContainerHighDark = Color(0xFF252B2C)
+val SurfaceContainerHighestDark = Color(0xFF303637)
+val InverseSurfaceDark = Color(0xFFDDE4E5)
+val InverseOnSurfaceDark = Color(0xFF2B3133)
+val InversePrimaryDark = Color(0xFF1E6C74)

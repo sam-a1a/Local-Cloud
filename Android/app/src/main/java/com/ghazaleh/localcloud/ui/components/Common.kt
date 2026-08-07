@@ -4,7 +4,6 @@ import android.text.format.Formatter
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -248,5 +247,3 @@ fun formatRemaining(seconds: Long?): String = when {
     seconds >= 120L -> "${seconds / 60L} minutes left"
     else -> "Less than a minute left"
 }
-
-val ScreenPadding = PaddingValues(bottom = 96.dp)
