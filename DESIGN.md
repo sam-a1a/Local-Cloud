@@ -275,6 +275,15 @@ change when the protocol does, and that must not be an API change.
 Identity is `file_id`, never a path — collisions rename items, so an application
 keying on paths attaches events to the wrong row exactly when it matters.
 
+The surface is demarcated: `cargo doc` shows `Engine`, `Catalog`, the vocabulary
+above, and nothing else. `collision`, `crypto`, `ignore` and `tls` are private;
+`db`, `discovery`, `pairing`, `server`, `storage` and `watcher` stay reachable
+but are `#[doc(hidden)]` and carry no compatibility promise, because the
+integration tests are separate crates that drive them directly. That is
+documentation rather than enforcement — closing it properly means moving those
+tests inside the crate, which would cost them their one real virtue of proving
+the crate works from outside.
+
 ---
 
 ## 11. Protocol

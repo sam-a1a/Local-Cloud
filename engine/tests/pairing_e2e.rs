@@ -7,7 +7,7 @@
 
 use localcloud::db::Database;
 use localcloud::pairing::{self, DeviceInfo, PairingState};
-use localcloud::tls::TrustStore;
+use localcloud::TrustStore;
 use localcloud::{server, storage, DeviceIdentity};
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;

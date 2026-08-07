@@ -1,29 +1,68 @@
-// engine/src/lib.rs
-pub mod collision;
-pub mod crypto;
+//! LocalCloud's engine: a mesh of your own devices that behaves like shared
+//! storage, with no server and nothing copied without a person asking.
+//!
+//! # The supported API
+//!
+//! [`Engine`] and the types it takes and returns:
+//!
+//! - [`EngineError`] — why an operation could not be carried out
+//! - [`EngineEvent`] and [`EventListener`] — what happened, and how to hear it
+//! - [`Catalog`], [`FileMetadata`], [`FileHolder`] — the shared namespace
+//! - [`PairedDevice`], [`DiscoveredDevice`], [`PairingOffer`] — devices
+//! - [`PendingCollision`], [`CollisionResolution`] — contested names
+//! - [`DeleteRequest`], [`DeleteOutcome`] — deletion
+//!
+//! That is the whole of it. Everything else this crate exposes is machinery:
+//! the database, the block store, the TLS server, the watcher, the discovery
+//! and pairing protocols. Those are `#[doc(hidden)]` and carry no compatibility
+//! promise — they are reachable only because the integration tests are separate
+//! crates that drive them directly. Building against them means being broken by
+//! an internal change, without warning.
+//!
+//! See §10a of DESIGN.md for the rules the API is held to.
+
+// Nothing outside this crate names these.
+mod collision;
+mod crypto;
+mod ignore;
+mod tls;
+
+// Reachable, but not API. See the note above.
+#[doc(hidden)]
 pub mod db;
+#[doc(hidden)]
 pub mod discovery;
-pub mod ignore;
+#[doc(hidden)]
 pub mod pairing;
+#[doc(hidden)]
 pub mod server;
+#[doc(hidden)]
 pub mod storage;
-pub mod tls;
+#[doc(hidden)]
 pub mod watcher;
 
-pub use db::Database;
-pub use db::FileMetadata;
-pub use db::BlockMetadata;
-pub use db::FileBlock;
-pub use db::PairedDevice;
-pub use db::{DeleteRequest, FileHolder};
-pub use db::Tombstone;
-pub use pairing::{PairingOffer, PairingState};
-pub use collision::{CollisionQueue, CollisionResolution, PendingCollision};
-pub use crypto::DeviceIdentity;
-pub use discovery::{DiscoveredDevice, PeerMap};
-pub use ignore::{new_ignore_set, IgnoreSet};
-pub use tls::TrustStore;
+// The API's vocabulary.
+pub use collision::{CollisionResolution, PendingCollision};
+pub use db::{DeleteRequest, FileHolder, FileMetadata, PairedDevice};
+pub use discovery::DiscoveredDevice;
+pub use pairing::PairingOffer;
 pub use watcher::DeleteOutcome;
+
+// Machinery the tests construct directly.
+#[doc(hidden)]
+pub use collision::CollisionQueue;
+#[doc(hidden)]
+pub use crypto::DeviceIdentity;
+#[doc(hidden)]
+pub use db::{BlockMetadata, Database, FileBlock, Tombstone};
+#[doc(hidden)]
+pub use discovery::PeerMap;
+#[doc(hidden)]
+pub use ignore::{new_ignore_set, IgnoreSet};
+#[doc(hidden)]
+pub use pairing::PairingState;
+#[doc(hidden)]
+pub use tls::TrustStore;
 
 use serde::Serialize;
 use std::collections::HashMap;

@@ -4,7 +4,7 @@
 //! These drive `Indexer` directly rather than writing files and waiting for
 //! filesystem events, so nothing here depends on timing.
 
-use localcloud::collision::CollisionQueue;
+use localcloud::CollisionQueue;
 use localcloud::db::{Database, DeleteRequest, FileHolder, MergeOutcome, Tombstone};
 use localcloud::watcher::{IndexOutcome, Indexer};
 use localcloud::{new_ignore_set, storage};

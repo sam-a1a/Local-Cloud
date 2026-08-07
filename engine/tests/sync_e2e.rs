@@ -12,7 +12,7 @@
 
 use localcloud::db::{Database, DeleteRequest, FileHolder};
 use localcloud::pairing::{DeviceInfo, PairingState};
-use localcloud::tls::TrustStore;
+use localcloud::TrustStore;
 use localcloud::watcher::{IndexOutcome, Indexer};
 use localcloud::{
     new_ignore_set, server, storage, CollisionQueue, DeviceIdentity, EngineEvent, IgnoreSet,

@@ -88,6 +88,12 @@ pub fn load_certs_and_key(
     Ok((certs, key))
 }
 
+/// Fills in the rustls verifier methods that are the same for both directions.
+///
+/// `#[macro_export]` is the only way to use a macro across modules, and it puts
+/// it at the crate root whether that is wanted or not - so this is hidden, like
+/// the modules that use it. It is internal plumbing, not something to call.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! impl_tls_verifier_methods {
     () => {
