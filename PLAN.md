@@ -1,8 +1,10 @@
 # Where we are
 
-The engine is done. Nothing in DESIGN.md §13 is outstanding, it builds for iOS,
-and it emits Swift and Kotlin bindings. The next thing to do is run it on two
-physical machines; the thing after that is an app.
+The engine is done, and it now has a consumer. An Android app drives it through
+the Kotlin bindings, builds the engine and those bindings as part of an ordinary
+Gradle build, and runs — the engine starts on a phone, mints an identity, and
+reports itself discoverable. What is left is the network: two physical devices
+on one Wi-Fi, finding each other.
 
 `DESIGN.md` is the design and the reasoning. This is the status.
 
@@ -14,6 +16,7 @@ physical machines; the thing after that is an app.
 |---|---|
 | `Engine/` | 6,760 lines. The whole model, the server, discovery, storage, FFI. |
 | `Cli/` | 372 lines. A prompt for driving one device — the test harness. |
+| `Android/` | The app. Compose, three screens, every one of them the engine's own idea. |
 | tests | 115 across 6 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. |
 | dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
 
@@ -51,6 +54,8 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
   aarch64-apple-ios` clean.
 - **Swift and Kotlin bindings** via uniffi, generated from the compiled library.
 - **A CLI that can pair**, which is what makes the device test possible at all.
+- **An Android app**, in `Android/`, which is the first thing to consume those
+  bindings — and the first proof the engine runs anywhere but a desktop.
 
 Bugs found and fixed along the way, each by a test written for something else:
 
@@ -92,25 +97,46 @@ instances on one machine, so what is being tested is the network, not the logic.
 3. **Whether a 30s catalog delay is tolerable** in practice, or wants the
    notification described in §14.
 
-Mobile discovery is a separate question and cannot be answered here: iOS
-multicast needs an entitlement and Android a multicast lock, and both live in an
-app project.
+One of the two can now be the phone. The Android multicast lock is written and
+held while the app is in the foreground, so the Android half of "mobile
+discovery is a separate question" has been answered as far as it can be without
+a second machine. iOS still needs its entitlement, and still has no app.
 
 ---
 
-## Then: the app
+## The app
 
-The engine's API is settled and deliberately small — 32 methods, and `cargo doc`
-shows only them. Errors are typed and carry their ids, events are pushed to a
-listener, and no internal type crosses the boundary. §10a of DESIGN.md records
-the rules it is held to.
+`Android/` exists and runs. Three screens — the catalog and who holds what,
+the mesh and how devices join it, the thirty days before a deleted item is
+gone — and no fourth screen for anything the engine does not have an opinion
+about.
 
-Two things are still app-side rather than engine-side: an iOS Files provider
-extension, and the multicast entitlement and lock.
+`./gradlew assembleDebug` cross-compiles the engine for arm64-v8a and x86_64,
+generates the Kotlin from the library it just built, and packages both. Neither
+is checked in. Verified on an emulator: the app launches, the engine constructs,
+mints an identity, opens its database and reports itself running.
 
-I would build one platform end to end before starting a second. The bindings are
-generated but nothing has consumed them yet, and the first consumer always finds
-something.
+What the first consumer found, which is what a first consumer is for:
+
+- **The engine had never been built for Android.** It compiles clean, first
+  try. §8 was a real boundary rather than a stated one.
+- **Typed errors keep their variants across the FFI but lose their sentences.**
+  uniffi generates `message` from a variant's fields, so `NotVisible` arrives in
+  Kotlin as `deviceId=7f3a…` rather than as "That device is not visible on the
+  network". The variants were the point and they survive; the app supplies the
+  English. Worth knowing before writing the iOS one.
+- **An Android device is called "Unknown".** `whoami::devicename()` does not
+  fail there, it succeeds with that literal string, so the "Unnamed Android"
+  fallback never fires. `DeviceIdentity::set_device_name` exists and is not
+  exposed, and exposing it is not a one-liner: `identity` is a plain field on
+  `Engine`, read by `start`, pairing and discovery, so making it settable means
+  putting it behind a lock. The alternative is for the engine to read
+  `ro.product.model` itself. **Undecided, and it blocks nothing but reads badly
+  on the one screen where devices are named.**
+
+Still app-side rather than engine-side: an iOS Files provider extension, the iOS
+multicast entitlement, and a foreground service if Android is ever to sync while
+the app is closed. The app runs the engine only in the foreground today.
 
 ---
 
