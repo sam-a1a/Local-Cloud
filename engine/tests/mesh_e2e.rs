@@ -102,7 +102,7 @@ fn two_engines_discover_pair_and_converge_on_their_own() {
     let seen = wait_for("alice's catalog to catch up", || {
         alice
             .get_catalog()
-            .files
+            .items
             .into_iter()
             .find(|f| f.path == "notes.txt")
     });
@@ -186,7 +186,7 @@ fn converges_on_a_change_made_after_pairing() {
     wait_for("alice's catalog to catch up on its own", || {
         alice
             .get_catalog()
-            .files
+            .items
             .into_iter()
             .find(|f| f.path == "later.txt")
     });
@@ -245,7 +245,7 @@ fn an_engine_restarted_still_syncs() {
     wait_for("alice's catalog to catch up after a restart", || {
         alice
             .get_catalog()
-            .files
+            .items
             .into_iter()
             .find(|f| f.path == "notes.txt")
     });

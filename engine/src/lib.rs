@@ -15,6 +15,7 @@ pub use db::FileMetadata;
 pub use db::BlockMetadata;
 pub use db::FileBlock;
 pub use db::PairedDevice;
+pub use db::{DeleteRequest, FileHolder};
 pub use db::Tombstone;
 pub use pairing::{PairingOffer, PairingState};
 pub use collision::{CollisionQueue, CollisionResolution, PendingCollision};
@@ -22,6 +23,7 @@ pub use crypto::DeviceIdentity;
 pub use discovery::{DiscoveredDevice, PeerMap};
 pub use ignore::{new_ignore_set, IgnoreSet};
 pub use tls::TrustStore;
+pub use watcher::DeleteOutcome;
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -171,6 +173,19 @@ pub enum EngineEvent {
     /// Something went wrong that concerns no particular item or device - the
     /// server failing to bind, pairing failing before a peer was chosen.
     EngineFailed { reason: String },
+}
+
+/// The shared namespace: every item, and which devices hold which content.
+///
+/// Deliberately not what travels between devices. `db::CatalogPayload` also
+/// carries tombstones and outstanding delete requests, which exist so peers can
+/// converge and mean nothing to an application - exposing them would invite one
+/// to reason about replication rather than about items. Delete requests that a
+/// person should see are `pending_delete_requests`.
+#[derive(Clone, Debug, Serialize)]
+pub struct Catalog {
+    pub items: Vec<FileMetadata>,
+    pub holders: Vec<FileHolder>,
 }
 
 /// Receives events as the engine produces them.
@@ -648,13 +663,11 @@ impl Engine {
     }
 
     /// The shared namespace as this device currently knows it.
-    pub fn get_catalog(&self) -> db::Catalog {
+    pub fn get_catalog(&self) -> Catalog {
         let db = self.db.lock().unwrap();
-        db::Catalog {
-            files: db.get_all_files().unwrap_or_default(),
+        Catalog {
+            items: db.get_all_files().unwrap_or_default(),
             holders: db.get_all_holders().unwrap_or_default(),
-            delete_requests: db.get_delete_requests().unwrap_or_default(),
-            tombstones: db.get_all_tombstones().unwrap_or_default(),
         }
     }
 
@@ -831,7 +844,7 @@ impl Engine {
     pub fn delete_local_copy(
         &self,
         file_id: String,
-    ) -> Result<watcher::DeleteOutcome, EngineError> {
+    ) -> Result<DeleteOutcome, EngineError> {
         // Checked here as well as in the indexer, so the caller is told *which*
         // thing was wrong. The indexer reports in prose, and flattening that
         // into `Internal` would lose the distinction the caller needs.
@@ -873,7 +886,7 @@ impl Engine {
     }
 
     /// Deletes still waiting on a device that has not been reachable.
-    pub fn pending_delete_requests(&self) -> Vec<db::DeleteRequest> {
+    pub fn pending_delete_requests(&self) -> Vec<DeleteRequest> {
         let db = self.db.lock().unwrap();
         db.get_delete_requests().unwrap_or_default()
     }
@@ -953,7 +966,7 @@ impl Engine {
     }
 
     /// Which devices hold this item, and which content each one has.
-    pub fn get_file_holders(&self, file_id: &str) -> Vec<db::FileHolder> {
+    pub fn get_file_holders(&self, file_id: &str) -> Vec<FileHolder> {
         let db = self.db.lock().unwrap();
         db.get_holders(file_id).unwrap_or_default()
     }

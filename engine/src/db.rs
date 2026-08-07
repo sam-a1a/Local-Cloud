@@ -87,9 +87,14 @@ pub enum MergeOutcome {
     },
 }
 
-/// The whole shared namespace as one device knows it.
+/// The whole shared namespace as one device knows it, as it travels between
+/// devices.
+///
+/// This is the protocol's shape, not the API's: it carries tombstones and
+/// outstanding delete requests because a peer needs them to converge. An
+/// application does not, and `localcloud::Catalog` is what it sees instead.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct Catalog {
+pub struct CatalogPayload {
     pub files: Vec<FileMetadata>,
     pub holders: Vec<FileHolder>,
     #[serde(default)]

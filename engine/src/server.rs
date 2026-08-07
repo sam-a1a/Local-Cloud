@@ -329,9 +329,9 @@ async fn pair_confirm(
 }
 
 /// The full shared namespace: every item, and who holds which content of it.
-async fn get_catalog(State(state): State<AppState>) -> Json<crate::db::Catalog> {
+async fn get_catalog(State(state): State<AppState>) -> Json<crate::db::CatalogPayload> {
     let db = state.db.lock().unwrap();
-    Json(crate::db::Catalog {
+    Json(crate::db::CatalogPayload {
         // Trashed items travel too, or a peer that missed the deletion would
         // keep listing the item as live.
         files: db.get_catalog_files().unwrap_or_default(),

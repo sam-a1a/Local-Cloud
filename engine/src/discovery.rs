@@ -439,7 +439,7 @@ pub async fn sync_with_peer(
     // Catalog replication is pull-only in both directions: each device asks its
     // peers what they know rather than broadcasting. Nothing here moves file
     // data - bytes only ever move because a person shared or pulled something.
-    let catalog: crate::db::Catalog = match mtls_client
+    let catalog: crate::db::CatalogPayload = match mtls_client
         .get(format!("{}/catalog", peer_url))
         .send()
         .await
