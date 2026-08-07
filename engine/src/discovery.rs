@@ -224,6 +224,66 @@ pub fn start_discovery(
     Ok(daemon)
 }
 
+/// How many blocks are in the air between two devices at once.
+///
+/// A block is one HTTP request, and a request on a LAN spends most of its life
+/// waiting rather than moving bytes. Sending the next only once the last has
+/// come back leaves the link almost entirely idle, so a larger block size alone
+/// would not have bought much; overlapping a handful is the other half of it.
+/// Past this the link rather than the round-trips is the limit, and each one in
+/// flight costs a block held in memory at both ends.
+const TRANSFER_CONCURRENCY: usize = 8;
+
+/// Runs `start` over every block with a bounded number in flight, giving up as
+/// soon as one fails.
+///
+/// A partial transfer is worth nothing: the receiver will not assemble a file
+/// until every block is present, so continuing after a failure only spends time
+/// and bandwidth on a copy that cannot complete. Whatever did arrive is kept -
+/// blocks are content-addressed, so a retry picks up where this left off.
+async fn transfer_all<F, Fut>(blocks: &[crate::db::FileBlock], start: F) -> bool
+where
+    F: Fn(&crate::db::FileBlock) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    // A manifest names positions, so a block that fills several of them appears
+    // several times - a file with a long run of zeros is mostly one block
+    // repeated. Moving it once is enough: storage is addressed by content, so
+    // every position it occupies is satisfied by the same transfer.
+    let mut seen = std::collections::HashSet::new();
+    let mut queued = blocks.iter().filter(|b| seen.insert(b.block_id.clone()));
+    let mut in_flight = tokio::task::JoinSet::new();
+    let mut failed = false;
+
+    loop {
+        while in_flight.len() < TRANSFER_CONCURRENCY {
+            match queued.next() {
+                Some(block) => {
+                    in_flight.spawn(start(block));
+                }
+                None => break,
+            }
+        }
+
+        let Some(finished) = in_flight.join_next().await else {
+            break;
+        };
+
+        match finished {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => println!("[Transfer] {}", e),
+            Err(e) => println!("[Transfer] A block transfer did not finish: {}", e),
+        }
+
+        failed = true;
+        in_flight.abort_all();
+        while in_flight.join_next().await.is_some() {}
+        break;
+    }
+
+    !failed
+}
+
 async fn fetch_blocks_from_peer(
     client: &reqwest::Client,
     peer_url: &str,
@@ -231,40 +291,88 @@ async fn fetch_blocks_from_peer(
     db_clone: &Arc<Mutex<Database>>,
     storage_dir_clone: &str,
 ) -> bool {
-    for b in blocks {
-        let resp = match client.get(format!("{}/get_block/{}", peer_url, b.block_id)).send().await {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
+    transfer_all(blocks, |b| {
+        let client = client.clone();
+        let peer_url = peer_url.to_string();
+        let storage_dir = storage_dir_clone.to_string();
+        let db = db_clone.clone();
+        let block_id = b.block_id.clone();
 
-        if resp.status() != 200 {
-            return false;
+        async move {
+            let resp = client
+                .get(format!("{}/get_block/{}", peer_url, block_id))
+                .send()
+                .await
+                .map_err(|e| format!("Could not ask {} for a block: {}", peer_url, e))?;
+
+            if resp.status() != 200 {
+                return Err(format!("{} would not serve a block: {}", peer_url, resp.status()));
+            }
+
+            let data = resp
+                .bytes()
+                .await
+                .map_err(|e| format!("A block from {} did not arrive: {}", peer_url, e))?;
+
+            // Storing checks that the bytes hash to the id they were asked for,
+            // so a peer serving anything else is refused rather than having it
+            // assembled into the file unnoticed. Hashing and writing a megabyte
+            // are both blocking work and do not belong on a runtime thread.
+            let stored = {
+                let block_id = block_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::storage::write_block(&storage_dir, &block_id, &data)
+                })
+                .await
+                .map_err(|e| format!("Storing a block failed: {}", e))?
+            };
+            stored.map_err(|e| format!("Refusing a block from {}: {}", peer_url, e))?;
+
+            let db = db.lock().unwrap();
+            db.set_block_present(&block_id, true)
+                .map_err(|e| format!("Could not record a block as present: {}", e))
         }
+    })
+    .await
+}
 
-        let Ok(data) = resp.bytes().await else {
-            return false;
-        };
+/// Sends the blocks of an item to a peer that has already accepted its
+/// metadata.
+pub async fn push_blocks_to_peer(
+    client: &reqwest::Client,
+    peer_url: &str,
+    blocks: &[crate::db::FileBlock],
+    storage_dir: &str,
+) -> bool {
+    transfer_all(blocks, |b| {
+        let client = client.clone();
+        let peer_url = peer_url.to_string();
+        let storage_dir = storage_dir.to_string();
+        let block_id = b.block_id.clone();
 
-        // Block ids are the SHA-256 of their contents, so what arrived can be
-        // checked against what was asked for. Without this a peer could serve
-        // anything and it would be assembled into the file unnoticed.
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&data);
-        let actual = hex::encode(hasher.finalize());
-        if actual != b.block_id {
-            println!(
-                "[Sync] Refusing block from {}: content does not match its id",
-                peer_url
-            );
-            return false;
+        async move {
+            let data = {
+                let wanted = block_id.clone();
+                tokio::task::spawn_blocking(move || crate::storage::read_block(&storage_dir, &wanted))
+                    .await
+                    .map_err(|e| format!("Reading a block failed: {}", e))?
+                    .map_err(|e| format!("Missing block {}: {}", block_id, e))?
+            };
+
+            let sent = client
+                .post(format!("{}/push_block/{}", peer_url, block_id))
+                .body(data)
+                .send()
+                .await
+                .map_err(|e| format!("Could not send a block to {}: {}", peer_url, e))?;
+
+            if !sent.status().is_success() {
+                return Err(format!("{} refused a block: {}", peer_url, sent.status()));
+            }
+            Ok(())
         }
-
-        let _ = crate::storage::write_block(storage_dir_clone, &b.block_id, &data);
-        let db = db_clone.lock().unwrap();
-        let _ = db.set_block_present(&b.block_id, true);
-    }
-    true
+    })
+    .await
 }
 
 pub async fn sync_with_peer(

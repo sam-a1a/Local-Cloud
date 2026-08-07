@@ -753,3 +753,121 @@ async fn deleting_a_copy_this_device_does_not_hold_is_refused() {
     assert!(db.is_holder("android-item", "android").unwrap());
     assert_eq!(device.device_id, "linux");
 }
+
+/// Content that spans `blocks` whole blocks plus a remainder, varying enough
+/// that no two blocks hash alike.
+fn spanning(blocks: usize, remainder: usize) -> String {
+    let len = storage::BLOCK_SIZE * blocks + remainder;
+    (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect()
+}
+
+#[tokio::test]
+async fn a_file_spanning_several_blocks_round_trips_through_storage() {
+    let device = Device::new("laptop");
+    let contents = spanning(2, 4_096);
+    let path = device.write("clip.bin", &contents);
+
+    let IndexOutcome::Indexed { file_id, .. } = device.indexer.index(&path) else {
+        panic!("expected Indexed");
+    };
+
+    let blocks = {
+        let db = device.db.lock().unwrap();
+        db.get_blocks_for_file(&file_id).unwrap()
+    };
+    assert_eq!(blocks.len(), 3, "two full blocks and a remainder");
+    assert!(blocks.iter().all(|b| b.is_present == 1));
+
+    // What a receiving device would end up with, from the blocks alone.
+    let rebuilt = format!("{}/rebuilt.bin", device.sync_dir);
+    storage::assemble_file_from_blocks(&device.storage_dir, &rebuilt, &blocks).unwrap();
+    assert_eq!(std::fs::read_to_string(&rebuilt).unwrap(), contents);
+}
+
+#[tokio::test]
+async fn re_chunking_releases_what_only_the_previous_revision_used() {
+    // Otherwise every edit leaves its old contents in storage for good, and the
+    // one-off re-chunk onto larger blocks would leave a second copy of the
+    // whole folder behind.
+    let device = Device::new("laptop");
+    let path = device.write("clip.bin", &spanning(2, 512));
+    let IndexOutcome::Indexed { file_id, .. } = device.indexer.index(&path) else {
+        panic!("expected Indexed");
+    };
+
+    let before: Vec<String> = {
+        let db = device.db.lock().unwrap();
+        db.get_blocks_for_file(&file_id)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.block_id)
+            .collect()
+    };
+
+    // Rewritten from the first byte, so nothing of the old manifest survives.
+    std::fs::write(&path, spanning(2, 512).chars().rev().collect::<String>()).unwrap();
+    device.indexer.index(&path);
+
+    let after: Vec<String> = {
+        let db = device.db.lock().unwrap();
+        db.get_blocks_for_file(&file_id)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.block_id)
+            .collect()
+    };
+    assert!(after.iter().all(|id| !before.contains(id)), "the test needs a full rewrite");
+
+    for block_id in &before {
+        assert!(
+            !std::path::Path::new(&device.block_path(block_id)).exists(),
+            "superseded block {} should have been released",
+            block_id
+        );
+    }
+    for block_id in &after {
+        assert!(
+            std::path::Path::new(&device.block_path(block_id)).exists(),
+            "the current revision's blocks must survive"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_file_that_repeats_a_block_keeps_every_occurrence() {
+    // A manifest is an ordered list of positions, not a set of blocks. Any file
+    // with a run of zeros or repeated padding holds one block several times
+    // over, and dropping the repeats made it reassemble short on every device
+    // it was sent to - while the sender's own copy on disk still looked perfect.
+    let device = Device::new("laptop");
+    let repeated = "\0".repeat(storage::BLOCK_SIZE * 3);
+    let path = device.write("padded.bin", &format!("{}tail", repeated));
+
+    let IndexOutcome::Indexed { file_id, .. } = device.indexer.index(&path) else {
+        panic!("expected Indexed");
+    };
+
+    let blocks = {
+        let db = device.db.lock().unwrap();
+        db.get_blocks_for_file(&file_id).unwrap()
+    };
+    assert_eq!(blocks.len(), 4, "three identical blocks and a tail");
+    assert_eq!(
+        blocks.iter().map(|b| b.block_index).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "the manifest must be contiguous"
+    );
+    assert_eq!(
+        blocks[0].block_id, blocks[2].block_id,
+        "the repeats really are the same block"
+    );
+
+    // What the receiving device ends up with.
+    let rebuilt = format!("{}/rebuilt.bin", device.sync_dir);
+    storage::assemble_file_from_blocks(&device.storage_dir, &rebuilt, &blocks).unwrap();
+    assert_eq!(
+        std::fs::read(&rebuilt).unwrap(),
+        std::fs::read(&path).unwrap(),
+        "a copy must be the whole file"
+    );
+}

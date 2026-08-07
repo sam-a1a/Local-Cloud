@@ -202,7 +202,15 @@ pub async fn start_server(
         .route("/catalog", get(get_catalog))
         .route("/get_block/{block_id}", get(get_block))
         .route("/push_metadata", post(push_metadata))
-        .route("/push_block/{block_id}", post(push_block))
+        // Axum caps request bodies at 2 MB by default, which a block is now
+        // within but would silently start failing on any increase. Stated
+        // explicitly so the limit tracks the block size instead.
+        .route(
+            "/push_block/{block_id}",
+            post(push_block).layer(axum::extract::DefaultBodyLimit::max(
+                crate::storage::BLOCK_SIZE + 4096,
+            )),
+        )
         .route("/finalize_file/{file_id}", post(finalize_file))
         .route("/request_delete", post(request_delete))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -418,13 +426,24 @@ async fn push_metadata(
     (axum::http::StatusCode::OK, String::new())
 }
 
+/// Receives one block of an item a peer is sending.
+///
+/// The contents are checked against the id they arrived under, exactly as they
+/// are when this device pulls a block itself. A push had been taken on trust,
+/// so a paired device could put whatever bytes it liked into storage under any
+/// name and have them assembled into the file later.
 async fn push_block(
     State(state): State<AppState>,
     Path(block_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
     if let Err(e) = crate::storage::write_block(&state.storage_dir, &block_id, &body) {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write block: {}", e));
+        let status = match e {
+            crate::storage::BlockError::Storage(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            // Nothing the sender can retry its way out of.
+            _ => axum::http::StatusCode::BAD_REQUEST,
+        };
+        return (status, format!("Refusing block: {}", e));
     }
     let db = state.db.lock().unwrap();
     if let Err(e) = db.set_block_present(&block_id, true) {

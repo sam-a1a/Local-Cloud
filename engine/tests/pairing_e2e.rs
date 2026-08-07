@@ -26,6 +26,7 @@ struct TestDevice {
     pairing: PairingState,
     db: Arc<Mutex<Database>>,
     storage_dir: String,
+    sync_dir: String,
     _dir: TempDir,
 }
 
@@ -82,7 +83,7 @@ impl TestDevice {
             localcloud::watcher::Indexer::new(
                 db.clone(),
                 storage_dir.clone(),
-                sync_dir,
+                sync_dir.clone(),
                 identity.device_id.clone(),
                 ignore_set,
                 localcloud::CollisionQueue::new(),
@@ -101,6 +102,7 @@ impl TestDevice {
             pairing: pairing_state,
             db,
             storage_dir,
+            sync_dir,
             _dir: dir,
         }
     }
@@ -240,4 +242,165 @@ async fn device_not_selected_cannot_pair_itself() {
 
     assert!(result.is_err(), "an unselected device must be refused");
     assert!(initiator.trust.is_empty(), "nothing should have been pinned");
+}
+
+/// Runs the full 6-digit exchange and returns a client authenticated as
+/// `target` for calls to `initiator`.
+async fn pair(initiator: &TestDevice, target: &TestDevice) -> reqwest::Client {
+    let anon = pairing::build_pairing_client().expect("client");
+    let code = initiator
+        .pairing
+        .begin(vec![target.info.device_id.clone()]);
+
+    pairing::send_pair_request(&anon, &target.url, &initiator.info)
+        .await
+        .expect("pair request delivered");
+
+    let proof = pairing::pairing_proof(&code, &initiator.info.cert_pem, &target.info.cert_pem);
+    let peer = pairing::send_pair_confirm(&anon, &initiator.url, &target.info, &proof)
+        .await
+        .expect("pairing accepted");
+
+    server::pin_paired_device(&target.db, &target.storage_dir, &target.trust, &peer)
+        .expect("target pins initiator");
+
+    target.mtls_client_for(initiator)
+}
+
+/// Pairing grants access to block storage, not to the filesystem around it.
+#[tokio::test]
+async fn a_paired_device_cannot_push_outside_block_storage() {
+    install_crypto_provider();
+    let initiator = TestDevice::start().await;
+    let target = TestDevice::start().await;
+    let client = pair(&initiator, &target).await;
+
+    // Percent-encoded separators are decoded before the handler sees them, so
+    // without a check on the shape of an id this arrives as a relative path and
+    // is written wherever it points.
+    let escaped = client
+        .post(format!("{}/push_block/..%2Fpwned", initiator.url))
+        .body("payload")
+        .send()
+        .await
+        .expect("request completes");
+
+    assert_eq!(escaped.status(), 400, "a block id that is a path must be refused");
+    assert!(
+        !std::path::Path::new(&format!("{}/../pwned", initiator.storage_dir)).exists(),
+        "nothing may be written outside block storage"
+    );
+
+    // The device's private key sits one level above block storage, so this is
+    // the read the same trick buys if ids are taken at face value.
+    let key_path = format!("{}/../identity.json", initiator.storage_dir);
+    assert!(
+        std::path::Path::new(&key_path).exists(),
+        "the test is pointless unless it names a file that is really there"
+    );
+
+    let read_back = client
+        .get(format!("{}/get_block/..%2Fidentity.json", initiator.url))
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(read_back.status(), 404, "and nothing outside it may be read");
+}
+
+/// The same check the pull path makes, on the pushing side.
+#[tokio::test]
+async fn a_paired_device_cannot_push_contents_that_belie_their_id() {
+    install_crypto_provider();
+    let initiator = TestDevice::start().await;
+    let target = TestDevice::start().await;
+    let client = pair(&initiator, &target).await;
+
+    let asked_for = storage::block_id_for(b"the block this id names");
+    let lied = client
+        .post(format!("{}/push_block/{}", initiator.url, asked_for))
+        .body("something else entirely")
+        .send()
+        .await
+        .expect("request completes");
+
+    assert_eq!(lied.status(), 400);
+    assert!(
+        !storage::get_block_path(&initiator.storage_dir, &asked_for).exists(),
+        "storage is content-addressed; the id must not be claimable by other bytes"
+    );
+}
+
+/// The whole transfer path, on a file whose blocks repeat.
+///
+/// This is the shape that used to arrive corrupt: a manifest was keyed by block
+/// rather than by position, so a file made largely of one repeated block lost
+/// every repeat. The sender's own copy on disk was untouched, so the damage only
+/// ever appeared on the device that received it.
+#[tokio::test]
+async fn a_file_whose_blocks_repeat_arrives_whole() {
+    install_crypto_provider();
+    let receiver = TestDevice::start().await;
+    let sender = TestDevice::start().await;
+    let client = pair(&receiver, &sender).await;
+
+    // Three identical blocks and a tail, as any file with a run of padding has.
+    let mut payload = vec![0u8; storage::BLOCK_SIZE * 3];
+    payload.extend_from_slice(b"tail");
+    let source = format!("{}/padded.bin", sender.sync_dir);
+    std::fs::write(&source, &payload).expect("write source");
+
+    let file = localcloud::FileMetadata {
+        id: "f1".into(),
+        path: "padded.bin".into(),
+        size: payload.len() as i64,
+        content_hash: String::new(),
+        modified_time: 1,
+        created_by: sender.info.device_id.clone(),
+        trashed_at: 0,
+        trashed_by: String::new(),
+    };
+
+    let blocks = {
+        let db = sender.db.lock().unwrap();
+        db.insert_file(&file).expect("record item");
+        storage::chunk_and_store_file(&sender.storage_dir, &db, "f1", &source).expect("chunk");
+        db.get_blocks_for_file("f1").expect("blocks")
+    };
+    assert_eq!(blocks.len(), 4, "the manifest must keep every position");
+
+    let announced = client
+        .post(format!("{}/push_metadata", receiver.url))
+        .json(&serde_json::json!({ "file": file, "blocks": blocks }))
+        .send()
+        .await
+        .expect("request completes");
+    assert!(announced.status().is_success());
+
+    assert!(
+        localcloud::discovery::push_blocks_to_peer(
+            &client,
+            &receiver.url,
+            &blocks,
+            &sender.storage_dir
+        )
+        .await,
+        "every block must transfer"
+    );
+
+    let finalized = client
+        .post(format!("{}/finalize_file/f1", receiver.url))
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(
+        finalized.status(),
+        200,
+        "the receiver must consider the item complete"
+    );
+
+    assert_eq!(
+        std::fs::read(format!("{}/padded.bin", receiver.sync_dir)).expect("received file"),
+        payload,
+        "the copy must be the whole file, byte for byte"
+    );
 }

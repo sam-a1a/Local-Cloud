@@ -268,11 +268,26 @@ impl Indexer {
                 return skip(&format!("could not record metadata: {}", e));
             }
 
+            // Noted before the manifest is replaced, so what the previous
+            // revision alone was using can be released once the new one is in.
+            let superseded = db.blocks_exclusive_to_file(&file_id).unwrap_or_default();
+
             let _ = db.clear_blocks_for_file(&file_id);
             if let Err(e) =
                 storage::chunk_and_store_file(&self.storage_dir, &db, &file_id, &absolute_path)
             {
                 return skip(&format!("could not chunk: {}", e));
+            }
+
+            // Re-chunking keeps whatever the new manifest maps to again, so an
+            // unchanged file loses nothing here. Without this every edit would
+            // leave its previous contents in storage for good - and the move to
+            // megabyte blocks re-chunks every existing file once, which would
+            // otherwise mean carrying a second copy of everything forever.
+            for block_id in superseded {
+                if db.forget_block_if_unreferenced(&block_id).unwrap_or(false) {
+                    let _ = storage::remove_block(&self.storage_dir, &block_id);
+                }
             }
 
             let blocks = db.get_blocks_for_file(&file_id).unwrap_or_default();

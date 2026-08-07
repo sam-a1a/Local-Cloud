@@ -214,7 +214,7 @@ Each of these is a decision, not an omission.
 devices(id, name, platform, cert_pem, paired_at, last_seen)
 files(id, path, size, created_by, created_at, trashed_at, trashed_by)
 blocks(id, size, is_present)
-file_blocks(file_id, block_id, block_index)
+file_blocks(file_id, block_id, block_index)   -- keyed on (file_id, block_index)
 file_holders(file_id, device_id, content_hash, received_at)
 delete_requests(file_id, target_device, requested_by, requested_at)
 tombstones(file_id, deleted_at, deleted_by)
@@ -223,6 +223,19 @@ tombstones(file_id, deleted_at, deleted_by)
 `content_hash` is the hash of the ordered block-id list — a manifest hash. Blocks
 are already content-addressed by SHA-256, so this is nearly free to compute and
 makes staleness a comparison rather than a guess.
+
+A manifest is an ordered list of *positions*, which is why `file_blocks` is keyed
+on `(file_id, block_index)` rather than on the block. The same block legitimately
+appears many times in one file — any run of zeros or repeated padding produces
+one — and keying on content collapsed those repeats, so the file reassembled short
+on every device it was sent to while the sender's own copy looked untouched.
+
+Blocks are 1 MiB (`storage::BLOCK_SIZE`). The size is a transfer decision more
+than a storage one: each block costs its own request, so the original 4 KiB made
+a 1 GB file 262,144 round-trips. Chunking is fixed-size, so blocks only ever
+dedup against byte-identical, identically-aligned content; the smaller block
+bought finer sharing only for a file edited without any bytes shifting, and cost
+two database rows and a request for every 4 KiB of every file.
 
 `file_holders` replaces the `files.pinned_devices` JSON array. A device may only
 write rows where `device_id` is itself.
@@ -254,8 +267,17 @@ and tombstones. The last two are what make deletion survive a device being away 
 a request reaches a target that was offline, and a tombstone stops a device that
 missed a destruction from handing the item back.
 
-Blocks are verified on arrival: a block id *is* the SHA-256 of its contents, so
-one that does not hash to its own id is refused rather than assembled into a file.
+Blocks are verified on arrival, pulled or pushed: a block id *is* the SHA-256 of
+its contents, so one that does not hash to its own id is refused rather than
+assembled into a file. An id that is not a hash at all is refused too — ids
+arrive in a URL path and are joined onto the storage directory, so without that
+check a paired device could name a block `../../identity.json` and read or
+overwrite anything the process can reach.
+
+Blocks move several at a time (`discovery::TRANSFER_CONCURRENCY`). A request
+spends most of its life waiting rather than moving bytes, so sending the next
+only once the last has returned leaves the link idle; overlapping a handful is
+what turns the larger block size into throughput.
 
 ---
 
@@ -292,8 +314,10 @@ one that does not hash to its own id is refused rather than assembled into a fil
    30-day retention and its sweep, permanent delete and restore.~~ **Done.**
 5. **Platform surfaces** — folder invariant on desktop, `import_file()` on mobile,
    the watcher compiled desktop-only, an iOS Files provider extension.
-6. **Performance and cleanup** — block size, batched transfer, catalog sync on
-   peer discovery.
+6. ~~**Block size and transfer**~~ — 1 MiB blocks, several in flight at once,
+   and superseded blocks released when a file is re-chunked. **Done.**
+7. **Performance and cleanup** — sending only the blocks a recipient lacks,
+   catalog sync on peer discovery.
 
 Steps 1 and 2 were load-bearing: everything after assumes trusted peers and a
 truthful holder set.
@@ -311,8 +335,13 @@ from each platform's own idioms — and making large files fast.
   milliseconds. The expiry and attempt cap bound *online* guessing only.
   Closing it properly needs a PAKE such as SPAKE2, where the code is never
   committed to. Acceptable on a home network; not on a hostile one.
-- Block size is 4 KB (`storage.rs`) and each block moves in its own HTTP
-  round-trip. A 1 GB file is 262,144 requests. This is the largest thing left.
+- Sharing sends every block of an item, including ones the recipient already
+  has. Blocks are content-addressed, so the recipient could be asked which of a
+  manifest it is missing and only those sent; re-sending a large file that has
+  barely changed currently costs as much as sending it the first time.
+- Transfer throughput has only been measured over loopback. The block size and
+  overlapping requests are both aimed at network round-trips, which loopback
+  does not have, so the real-network figures are unproven.
 - Discovery has only been exercised with two instances on one machine. It has
   never run across two physical devices, or on Android or iOS, where multicast
   needs an entitlement (iOS) and a multicast lock (Android).

@@ -168,12 +168,19 @@ impl Database {
             CREATE TABLE IF NOT EXISTS blocks (
                 id TEXT PRIMARY KEY, size INTEGER NOT NULL, is_present INTEGER NOT NULL DEFAULT 0
             );
+            -- Keyed by position, not by content. A manifest is an ordered list
+            -- and the same block can legitimately appear at several places in
+            -- it: any file with a run of zeros or repeated padding contains one
+            -- block many times over. Keying on (file_id, block_id) made those
+            -- repeats collapse into a single row, so the file reassembled short
+            -- and corrupt on every device it was sent to.
             CREATE TABLE IF NOT EXISTS file_blocks (
                 file_id TEXT NOT NULL, block_id TEXT NOT NULL, block_index INTEGER NOT NULL,
-                PRIMARY KEY (file_id, block_id),
+                PRIMARY KEY (file_id, block_index),
                 FOREIGN KEY (file_id) REFERENCES files(id),
                 FOREIGN KEY (block_id) REFERENCES blocks(id)
             );
+            CREATE INDEX IF NOT EXISTS idx_file_blocks_block ON file_blocks(block_id);
             CREATE TABLE IF NOT EXISTS file_holders (
                 file_id TEXT NOT NULL,
                 device_id TEXT NOT NULL,
@@ -220,6 +227,16 @@ impl Database {
         // *should* go, which file_holders replaces with where it actually is.
         if !self.has_column("files", "trashed_at")? {
             self.rebuild_files_table()?;
+        }
+
+        // Older databases key file_blocks on the block rather than its position,
+        // so every repeat of a block within one file was silently dropped and
+        // the file reassembled short wherever it was sent. The mappings that
+        // were lost cannot be recovered here, but re-indexing rebuilds them,
+        // and the move to larger blocks re-chunks every file on the next scan
+        // regardless.
+        if self.file_blocks_keyed_by_content()? {
+            self.rebuild_file_blocks_table()?;
         }
 
         // Tombstones record that an item was destroyed, which has nothing to
@@ -277,6 +294,52 @@ impl Database {
 
         // Restore enforcement even if the rebuild failed, so a partial
         // migration cannot leave the connection silently unprotected.
+        self.conn.execute_batch("PRAGMA foreign_keys=ON")?;
+        result
+    }
+
+    /// Whether file_blocks still treats a file's manifest as a *set* of blocks
+    /// rather than an ordered list of positions.
+    fn file_blocks_keyed_by_content(&self) -> Result<bool> {
+        let declaration: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'file_blocks'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        Ok(declaration
+            .map(|sql| sql.split_whitespace().collect::<String>())
+            .is_some_and(|sql| sql.contains("PRIMARYKEY(file_id,block_id)")))
+    }
+
+    fn rebuild_file_blocks_table(&self) -> Result<()> {
+        // As with the files rebuild: dropping a table other rows reference
+        // needs enforcement off, and the pragma is a no-op inside a
+        // transaction.
+        self.conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+
+        let result = (|| -> Result<()> {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE file_blocks_rebuilt (
+                    file_id TEXT NOT NULL, block_id TEXT NOT NULL, block_index INTEGER NOT NULL,
+                    PRIMARY KEY (file_id, block_index),
+                    FOREIGN KEY (file_id) REFERENCES files(id),
+                    FOREIGN KEY (block_id) REFERENCES blocks(id)
+                 );
+                 INSERT OR IGNORE INTO file_blocks_rebuilt (file_id, block_id, block_index)
+                    SELECT file_id, block_id, block_index FROM file_blocks;
+                 DROP TABLE file_blocks;
+                 ALTER TABLE file_blocks_rebuilt RENAME TO file_blocks;
+                 CREATE INDEX IF NOT EXISTS idx_file_blocks_block ON file_blocks(block_id);",
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+
         self.conn.execute_batch("PRAGMA foreign_keys=ON")?;
         result
     }
@@ -668,8 +731,10 @@ impl Database {
     /// Deleting a file's blocks outright would take those away from whatever
     /// else still needs them, so only the exclusive ones may be removed.
     pub fn blocks_exclusive_to_file(&self, file_id: &str) -> Result<Vec<String>> {
+        // DISTINCT because a block may fill several positions in the same file,
+        // and callers release the bytes once per name they are given.
         let mut stmt = self.conn.prepare(
-            "SELECT fb.block_id FROM file_blocks fb
+            "SELECT DISTINCT fb.block_id FROM file_blocks fb
              WHERE fb.file_id = ?1
                AND NOT EXISTS (
                    SELECT 1 FROM file_blocks other
@@ -691,6 +756,30 @@ impl Database {
             rusqlite::params![file_id],
         )?;
         Ok(())
+    }
+
+    /// Forgets a block that no file maps to any more, reporting whether it went.
+    ///
+    /// Blocks outlive the revision that introduced them: another item, or a
+    /// later version of the same one, may map to the very same contents. Only
+    /// once the last mapping is gone does the block belong to nobody, and the
+    /// caller can release its bytes.
+    pub fn forget_block_if_unreferenced(&self, block_id: &str) -> Result<bool> {
+        let referenced: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_blocks WHERE block_id = ?1)",
+            rusqlite::params![block_id],
+            |row| row.get(0),
+        )?;
+
+        if referenced {
+            return Ok(false);
+        }
+
+        self.conn.execute(
+            "DELETE FROM blocks WHERE id = ?1",
+            rusqlite::params![block_id],
+        )?;
+        Ok(true)
     }
 
     pub fn get_blocks_for_file(&self, file_id: &str) -> Result<Vec<FileBlock>> {
@@ -1507,5 +1596,66 @@ mod tests {
 
         db.remove_paired_device("abc").unwrap();
         assert!(!db.is_paired("abc").unwrap());
+    }
+
+    #[test]
+    fn a_database_keyed_on_block_content_is_rebuilt_to_key_on_position() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("old.db");
+        let path = path.to_string_lossy().to_string();
+
+        // The schema as it was when a manifest was a set of blocks. Note the
+        // file that repeats a block: under the old key the second occurrence
+        // overwrote the first, so the file lost a third of itself.
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    id TEXT PRIMARY KEY, path TEXT NOT NULL, size INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    modified_time INTEGER NOT NULL, created_by TEXT NOT NULL,
+                    trashed_at INTEGER NOT NULL DEFAULT 0,
+                    trashed_by TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE blocks (
+                    id TEXT PRIMARY KEY, size INTEGER NOT NULL,
+                    is_present INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE file_blocks (
+                    file_id TEXT NOT NULL, block_id TEXT NOT NULL,
+                    block_index INTEGER NOT NULL,
+                    PRIMARY KEY (file_id, block_id)
+                 );
+                 INSERT INTO files (id, path, size, modified_time, created_by)
+                    VALUES ('f1', 'padded.bin', 30, 1, 'laptop');
+                 INSERT INTO blocks VALUES ('aaa', 10, 1), ('bbb', 10, 1);
+                 INSERT INTO file_blocks VALUES ('f1', 'aaa', 0), ('f1', 'bbb', 1);",
+            )
+            .expect("seed old schema");
+        }
+
+        let db = Database::init(&path).expect("migrate");
+
+        // The mappings that survived are carried over untouched.
+        let blocks = db.get_blocks_for_file("f1").expect("query");
+        assert_eq!(
+            blocks.iter().map(|b| b.block_id.as_str()).collect::<Vec<_>>(),
+            vec!["aaa", "bbb"]
+        );
+
+        // And the same block may now appear twice in one file, which is the
+        // whole point of the rebuild.
+        db.map_block_to_file("f1", "aaa", 2).expect("repeat a block");
+        let blocks = db.get_blocks_for_file("f1").expect("query");
+        assert_eq!(
+            blocks.iter().map(|b| b.block_id.as_str()).collect::<Vec<_>>(),
+            vec!["aaa", "bbb", "aaa"],
+            "a repeated block must occupy its own position"
+        );
+
+        assert!(
+            !db.file_blocks_keyed_by_content().expect("inspect schema"),
+            "the old key must be gone, not merely worked around"
+        );
     }
 }

@@ -790,31 +790,10 @@ impl Engine {
                     }
                 }
 
-                let mut sent_all = true;
-                for b in &blocks {
-                    let data = match storage::read_block(&storage, &b.block_id) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            let _ = tx.send(EngineEvent::ErrorEvent {
-                                message: format!("Missing block for {}: {}", file.path, e),
-                            });
-                            sent_all = false;
-                            break;
-                        }
-                    };
-                    if client
-                        .post(format!("{}/push_block/{}", url, b.block_id))
-                        .body(data)
-                        .send()
-                        .await
-                        .is_err()
-                    {
-                        sent_all = false;
-                        break;
-                    }
-                }
-
-                if !sent_all {
+                if !discovery::push_blocks_to_peer(&client, &url, &blocks, &storage).await {
+                    let _ = tx.send(EngineEvent::ErrorEvent {
+                        message: format!("Could not send all of {} to {}", file.path, device_id),
+                    });
                     continue;
                 }
 
