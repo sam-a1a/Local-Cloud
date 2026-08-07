@@ -1,7 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!--
+        The engine talks to other devices on this network and to nothing else.
+
+        CHANGE_WIFI_MULTICAST_STATE is the one that is easy to miss and fatal to
+        omit: Android drops multicast packets that are not addressed to the
+        device unless something holds a MulticastLock, so mDNS discovery finds
+        nothing at all without it. ACCESS_WIFI_STATE is what makes WifiManager,
+        and therefore that lock, reachable.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <application
+        android:name=".LocalCloudApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"

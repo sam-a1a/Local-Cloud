@@ -6,29 +6,25 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
-// Set of Material typography styles to start with
-val Typography = Typography(
-    bodyLarge = TextStyle(
-        fontFamily = FontFamily.Default,
-        fontWeight = FontWeight.Normal,
-        fontSize = 16.sp,
-        lineHeight = 24.sp,
-        letterSpacing = 0.5.sp
-    )
-    /* Other default text styles to override
-    titleLarge = TextStyle(
-        fontFamily = FontFamily.Default,
-        fontWeight = FontWeight.Normal,
-        fontSize = 22.sp,
-        lineHeight = 28.sp,
-        letterSpacing = 0.sp
-    ),
-    labelSmall = TextStyle(
-        fontFamily = FontFamily.Default,
-        fontWeight = FontWeight.Medium,
-        fontSize = 11.sp,
-        lineHeight = 16.sp,
-        letterSpacing = 0.5.sp
-    )
-    */
+val Typography = Typography()
+
+/**
+ * The six digits, set to be read aloud across a room.
+ *
+ * Monospaced and widely tracked because this is the one piece of text in the
+ * app that someone copies by eye onto another device, and the failure it has to
+ * design against is a misread digit, not an ugly one.
+ */
+val PairingCodeStyle = TextStyle(
+    fontFamily = FontFamily.Monospace,
+    fontWeight = FontWeight.Medium,
+    fontSize = 44.sp,
+    letterSpacing = 12.sp,
+)
+
+/** Device ids and content hashes: never read as words, only compared. */
+val IdentifierStyle = TextStyle(
+    fontFamily = FontFamily.Monospace,
+    fontSize = 12.sp,
+    letterSpacing = 0.5.sp,
 )
