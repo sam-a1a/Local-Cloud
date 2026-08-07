@@ -50,15 +50,79 @@ const TRASH_SWEEP_INTERVAL_SECS: u64 = 60 * 60;
 /// property that has to be maintained, not established once.
 const CATALOG_SYNC_INTERVAL_SECS: u64 = 30;
 
+/// Why an operation could not be carried out.
+///
+/// Deliberately specific. These cross into Swift and Kotlin as typed
+/// exceptions, and an application forced to match on English prose to tell
+/// "that device is not paired" from "the disk is full" cannot react sensibly to
+/// either - nor can it survive the wording being improved. Match on the
+/// variant; show the message.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error("{description}")]
-    Generic { description: String },
+    /// Nothing in the catalog has this id.
+    #[error("No such item in the catalog")]
+    NoSuchItem { file_id: String },
+
+    /// The item exists, but this device does not have its data, so it has
+    /// nothing to send or delete.
+    #[error("This device does not hold that item")]
+    NotHeldHere { file_id: String },
+
+    /// The item exists, but the named device is not one of its holders.
+    #[error("That device does not hold that item")]
+    NotAHolder { file_id: String, device_id: String },
+
+    /// Only a trashed item can be destroyed; a live one has to be deleted from
+    /// its holders first.
+    #[error("Only a trashed item can be destroyed; delete the copies first")]
+    NotTrashed { file_id: String },
+
+    /// The item is in the trash, and trashed items do not take part in
+    /// anything until they are restored.
+    #[error("That item is in the trash; restore it first")]
+    InTrash { file_id: String },
+
+    /// The device has not been through pairing, so it may not be asked anything.
+    #[error("That device is not paired with this one")]
+    NotPaired { device_id: String },
+
+    /// Paired, perhaps, but not on the network right now.
+    #[error("That device is not visible on the network")]
+    NotVisible { device_id: String },
+
+    /// No devices were given for an operation that needs at least one.
+    #[error("Select at least one device")]
+    NothingSelected,
+
+    /// Devices were given, but none of them can be used - not visible, not
+    /// paired, or not holding what was asked for.
+    #[error("{reason}")]
+    NoUsableDevices { reason: String },
+
+    /// No collision is awaiting this decision. Most often it was already
+    /// settled, possibly on another device.
+    #[error("No such collision, or it was already resolved")]
+    NoSuchCollision { collision_id: String },
+
+    /// Pairing could not proceed: no request from that device, a code that has
+    /// expired, or one entered too many times.
+    #[error("{reason}")]
+    Pairing { reason: String },
+
+    /// The database, the filesystem or the network stack failed. Nothing the
+    /// caller did wrong, and nothing it can correct.
+    #[error("{reason}")]
+    Internal { reason: String },
 }
 
 impl EngineError {
-    fn from<E: std::fmt::Display>(e: E) -> Self {
-        EngineError::Generic { description: e.to_string() }
+    /// For failures that are genuinely this device's problem rather than a
+    /// misuse of the API - a database error, a full disk, a socket that will
+    /// not bind.
+    fn internal<E: std::fmt::Display>(e: E) -> Self {
+        EngineError::Internal {
+            reason: e.to_string(),
+        }
     }
 }
 
@@ -110,26 +174,26 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(base_dir: String, sync_dir_path: String) -> Result<Self, EngineError> {
-        std::fs::create_dir_all(&base_dir).map_err(EngineError::from)?;
+        std::fs::create_dir_all(&base_dir).map_err(EngineError::internal)?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(EngineError::from)?;
+            .map_err(EngineError::internal)?;
 
-        let identity = DeviceIdentity::load_or_generate(&base_dir).map_err(EngineError::from)?;
+        let identity = DeviceIdentity::load_or_generate(&base_dir).map_err(EngineError::internal)?;
         let short_id = &identity.device_id[..8];
 
         let db_path = format!("{}/local-cloud-{}.db", base_dir, short_id);
         let storage_dir = format!("{}/storage_{}", base_dir, short_id);
 
-        let database = Database::init(&db_path).map_err(EngineError::from)?;
-        storage::ensure_storage_dir(&storage_dir).map_err(EngineError::from)?;
-        storage::ensure_trusted_peers_dir(&storage_dir).map_err(EngineError::from)?;
+        let database = Database::init(&db_path).map_err(EngineError::internal)?;
+        storage::ensure_storage_dir(&storage_dir).map_err(EngineError::internal)?;
+        storage::ensure_trusted_peers_dir(&storage_dir).map_err(EngineError::internal)?;
 
-        std::fs::create_dir_all(&sync_dir_path).map_err(EngineError::from)?;
+        std::fs::create_dir_all(&sync_dir_path).map_err(EngineError::internal)?;
         let sync_dir = std::fs::canonicalize(&sync_dir_path)
-            .map_err(EngineError::from)?
+            .map_err(EngineError::internal)?
             .to_string_lossy()
             .to_string();
 
@@ -139,7 +203,7 @@ impl Engine {
         let known_peers = Arc::new(StdMutex::new(HashMap::new()));
 
         let trust = TrustStore::new();
-        trust.reload(&storage_dir).map_err(EngineError::from)?;
+        trust.reload(&storage_dir).map_err(EngineError::internal)?;
 
         Ok(Self {
             db: db_state,
@@ -196,7 +260,7 @@ impl Engine {
     /// to prompt for it; pairing completes as each one enters it correctly.
     pub fn start_pairing(&self, target_device_ids: Vec<String>) -> Result<String, EngineError> {
         if target_device_ids.is_empty() {
-            return Err(EngineError::from("Select at least one device to pair with"));
+            return Err(EngineError::NothingSelected);
         }
 
         let targets: Vec<(String, String)> = {
@@ -208,9 +272,9 @@ impl Engine {
         };
 
         if targets.is_empty() {
-            return Err(EngineError::from(
-                "None of those devices are visible on the network",
-            ));
+            return Err(EngineError::NoUsableDevices {
+                reason: "None of those devices are visible on the network".into(),
+            });
         }
 
         let code = self
@@ -276,7 +340,9 @@ impl Engine {
         let initiator = self
             .pairing
             .offer_details(&initiator_device_id)
-            .ok_or_else(|| EngineError::from("No pending pairing request from that device"))?;
+            .ok_or_else(|| EngineError::Pairing {
+                reason: "No pending pairing request from that device".into(),
+            })?;
 
         let url = {
             let peers = self.known_peers.lock().unwrap();
@@ -284,7 +350,7 @@ impl Engine {
                 .get(&initiator_device_id)
                 .map(|d| d.url.clone())
                 .ok_or_else(|| {
-                    EngineError::from("That device is no longer visible on the network")
+                    EngineError::NotVisible { device_id: initiator_device_id.clone() }
                 })?
         };
 
@@ -360,10 +426,10 @@ impl Engine {
     pub fn unpair(&self, device_id: String) -> Result<(), EngineError> {
         {
             let db = self.db.lock().unwrap();
-            db.remove_paired_device(&device_id).map_err(EngineError::from)?;
+            db.remove_paired_device(&device_id).map_err(EngineError::internal)?;
         }
-        storage::remove_peer_cert(&self.storage_dir, &device_id).map_err(EngineError::from)?;
-        self.trust.reload(&self.storage_dir).map_err(EngineError::from)?;
+        storage::remove_peer_cert(&self.storage_dir, &device_id).map_err(EngineError::internal)?;
+        self.trust.reload(&self.storage_dir).map_err(EngineError::internal)?;
         Ok(())
     }
 
@@ -418,6 +484,24 @@ impl Engine {
     /// something goes, a device helps itself to something it can see. Both are
     /// deliberate acts by a person - nothing copies itself.
     pub fn pull_copy(&self, file_id: String) -> Result<(), EngineError> {
+        // Whatever can be decided from local state is decided now and returned,
+        // so a caller learns straight away that it asked for something that
+        // makes no sense. Only what depends on the network - whether a holder
+        // answers, whether the blocks arrive - is left to the spawned task and
+        // reported as a failure event.
+        {
+            let db = self.db.lock().unwrap();
+            let file = db
+                .get_file_by_id(&file_id)
+                .map_err(EngineError::internal)?
+                .ok_or_else(|| EngineError::NoSuchItem {
+                    file_id: file_id.clone(),
+                })?;
+            if file.is_trashed() {
+                return Err(EngineError::InTrash { file_id });
+            }
+        }
+
         let db = self.db.clone();
         let storage = self.storage_dir.clone();
         let sync = self.sync_dir.clone();
@@ -482,7 +566,7 @@ impl Engine {
         let collision = self
             .collisions
             .take(&collision_id)
-            .ok_or_else(|| EngineError::from("No such collision, or it was already resolved"))?;
+            .ok_or_else(|| EngineError::NoSuchCollision { collision_id: collision_id.clone() })?;
 
         if resolution == CollisionResolution::KeepBoth {
             return Ok(());
@@ -505,7 +589,7 @@ impl Engine {
                 // Nothing changed, so put the question back rather than
                 // silently dropping the decision.
                 self.collisions.record(collision);
-                return Err(EngineError::from(e));
+                return Err(EngineError::internal(e));
             }
         }
 
@@ -548,14 +632,14 @@ impl Engine {
 
         {
             let db = self.db.lock().unwrap();
-            if !db.is_paired(&device_id).map_err(EngineError::from)? {
-                return Err(EngineError::from("That device is not paired"));
+            if !db.is_paired(&device_id).map_err(EngineError::internal)? {
+                return Err(EngineError::NotPaired { device_id: device_id.clone() });
             }
             if !db
                 .is_holder(&file_id, &device_id)
-                .map_err(EngineError::from)?
+                .map_err(EngineError::internal)?
             {
-                return Err(EngineError::from("That device does not hold that item"));
+                return Err(EngineError::NotAHolder { file_id: file_id.clone(), device_id: device_id.clone() });
             }
 
             // Recorded before any attempt to deliver it, so the instruction
@@ -566,7 +650,7 @@ impl Engine {
                 requested_by: self.identity.device_id.clone(),
                 requested_at: watcher::now_secs(),
             })
-            .map_err(EngineError::from)?;
+            .map_err(EngineError::internal)?;
         }
 
         let url = {
@@ -622,10 +706,30 @@ impl Engine {
         &self,
         file_id: String,
     ) -> Result<watcher::DeleteOutcome, EngineError> {
+        // Checked here as well as in the indexer, so the caller is told *which*
+        // thing was wrong. The indexer reports in prose, and flattening that
+        // into `Internal` would lose the distinction the caller needs.
+        {
+            let db = self.db.lock().unwrap();
+            if db
+                .get_file_by_id(&file_id)
+                .map_err(EngineError::internal)?
+                .is_none()
+            {
+                return Err(EngineError::NoSuchItem { file_id });
+            }
+            if !db
+                .is_holder(&file_id, &self.identity.device_id)
+                .map_err(EngineError::internal)?
+            {
+                return Err(EngineError::NotHeldHere { file_id });
+            }
+        }
+
         let outcome = self
             .indexer()
             .delete_local_copy(&file_id, true)
-            .map_err(EngineError::from)?;
+            .map_err(EngineError::internal)?;
 
         let event = if outcome.trashed {
             EngineEvent::FileTrashed {
@@ -662,7 +766,14 @@ impl Engine {
     pub fn restore_file(&self, file_id: String) -> Result<(), EngineError> {
         {
             let db = self.db.lock().unwrap();
-            db.restore_file(&file_id).map_err(EngineError::from)?;
+            if db
+                .get_file_by_id(&file_id)
+                .map_err(EngineError::internal)?
+                .is_none()
+            {
+                return Err(EngineError::NoSuchItem { file_id });
+            }
+            db.restore_file(&file_id).map_err(EngineError::internal)?;
         }
         let _ = self.event_tx.send(EngineEvent::FileRestored {
             file_id: file_id.clone(),
@@ -679,16 +790,14 @@ impl Engine {
             let db = self.db.lock().unwrap();
             let file = db
                 .get_file_by_id(&file_id)
-                .map_err(EngineError::from)?
-                .ok_or_else(|| EngineError::from("No such item in the catalog"))?;
+                .map_err(EngineError::internal)?
+                .ok_or_else(|| EngineError::NoSuchItem { file_id: file_id.clone() })?;
             if !file.is_trashed() {
-                return Err(EngineError::from(
-                    "Only a trashed item can be destroyed; delete the copies first",
-                ));
+                return Err(EngineError::NotTrashed { file_id: file_id.clone() });
             }
         }
 
-        self.indexer().purge(&file_id).map_err(EngineError::from)?;
+        self.indexer().purge(&file_id).map_err(EngineError::internal)?;
         let _ = self.event_tx.send(EngineEvent::FilePurged { file_id });
         Ok(())
     }
@@ -737,23 +846,21 @@ impl Engine {
         target_device_ids: Vec<String>,
     ) -> Result<(), EngineError> {
         if target_device_ids.is_empty() {
-            return Err(EngineError::from("Select at least one device to share with"));
+            return Err(EngineError::NothingSelected);
         }
 
         let (file, blocks) = {
             let db = self.db.lock().unwrap();
             let file = db
                 .get_file_by_id(&file_id)
-                .map_err(EngineError::from)?
-                .ok_or_else(|| EngineError::from("No such item in the catalog"))?;
+                .map_err(EngineError::internal)?
+                .ok_or_else(|| EngineError::NoSuchItem { file_id: file_id.clone() })?;
             let blocks = db.get_blocks_for_file(&file_id).unwrap_or_default();
             (file, blocks)
         };
 
         if blocks.is_empty() || !blocks.iter().all(|b| b.is_present == 1) {
-            return Err(EngineError::from(
-                "This device does not hold the data for that item",
-            ));
+            return Err(EngineError::NotHeldHere { file_id: file_id.clone() });
         }
 
         // Only paired, currently visible devices can receive anything.
@@ -768,9 +875,9 @@ impl Engine {
         };
 
         if targets.is_empty() {
-            return Err(EngineError::from(
-                "None of those devices are paired and reachable",
-            ));
+            return Err(EngineError::NoUsableDevices {
+                reason: "None of those devices are paired and reachable".into(),
+            });
         }
 
         let storage = self.storage_dir.clone();
@@ -935,10 +1042,10 @@ impl Engine {
         // would have met "there is no reactor running" on the first call.
         let _entered = handle.enter();
 
-        let std_listener = std::net::TcpListener::bind("0.0.0.0:0").map_err(EngineError::from)?;
-        let port = std_listener.local_addr().map_err(EngineError::from)?.port();
-        std_listener.set_nonblocking(true).map_err(EngineError::from)?;
-        let listener = TcpListener::from_std(std_listener).map_err(EngineError::from)?;
+        let std_listener = std::net::TcpListener::bind("0.0.0.0:0").map_err(EngineError::internal)?;
+        let port = std_listener.local_addr().map_err(EngineError::internal)?.port();
+        std_listener.set_nonblocking(true).map_err(EngineError::internal)?;
+        let listener = TcpListener::from_std(std_listener).map_err(EngineError::internal)?;
 
         let server_db = self.db.clone();
         let server_storage = self.storage_dir.clone();
@@ -995,7 +1102,7 @@ impl Engine {
             disc_tx,
             disc_peers,
             nudge_tx,
-        ).map_err(EngineError::from)?;
+        ).map_err(EngineError::internal)?;
 
         *self.mdns_daemon.lock().unwrap() = Some(daemon);
 
@@ -1011,7 +1118,7 @@ impl Engine {
             handle,
             self.ignore_set.clone(),
             self.event_tx.clone(),
-        ).map_err(EngineError::from)?;
+        ).map_err(EngineError::internal)?;
 
         *self.watcher.lock().unwrap() = Some(watcher);
 
