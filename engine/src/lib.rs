@@ -560,7 +560,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn get_sync_dir(&self) -> String {
+    pub fn sync_dir(&self) -> String {
         self.sync_dir.clone()
     }
 
@@ -578,38 +578,16 @@ impl Engine {
     }
 
     /// Every device currently visible on the network, paired or not.
-    pub fn get_known_peers(&self) -> Vec<DiscoveredDevice> {
+    pub fn visible_devices(&self) -> Vec<DiscoveredDevice> {
         let peers = self.known_peers.lock().unwrap();
         let mut devices: Vec<DiscoveredDevice> = peers.values().cloned().collect();
         devices.sort_by(|a, b| a.name.cmp(&b.name));
         devices
     }
 
-    pub fn get_local_files(&self) -> Vec<FileMetadata> {
+    pub fn local_files(&self) -> Vec<FileMetadata> {
         let db = self.db.lock().unwrap();
         db.get_all_files().unwrap_or_default()
-    }
-
-    pub fn sync_with_peer(&self, peer_id: String, peer_url: String) -> Result<(), EngineError> {
-        let db = self.db.clone();
-        let storage = self.storage_dir.clone();
-        let sync = self.sync_dir.clone();
-        let cert = self.identity.cert_pem.clone();
-        let key = self.identity.key_pem.clone();
-        let my_id = self.identity.device_id.clone();
-        let ignore = self.ignore_set.clone();
-        let collisions = self.collisions.clone();
-        let indexer = self.indexer();
-        let tx = self.event_tx.clone();
-
-        self.runtime.spawn(async move {
-            discovery::sync_with_peer(
-                peer_url, peer_id, my_id, db, storage, sync, cert, key, ignore, collisions,
-                indexer, tx,
-            )
-            .await;
-        });
-        Ok(())
     }
 
     /// Takes a copy of an item for this device.
@@ -663,7 +641,7 @@ impl Engine {
     }
 
     /// The shared namespace as this device currently knows it.
-    pub fn get_catalog(&self) -> Catalog {
+    pub fn catalog(&self) -> Catalog {
         let db = self.db.lock().unwrap();
         Catalog {
             items: db.get_all_files().unwrap_or_default(),
@@ -893,7 +871,7 @@ impl Engine {
 
     /// Items that have been moved aside. Their bytes are still on whichever
     /// devices held them, so restoring is possible until they are purged.
-    pub fn get_trashed_files(&self) -> Vec<FileMetadata> {
+    pub fn trashed_files(&self) -> Vec<FileMetadata> {
         let db = self.db.lock().unwrap();
         db.get_trashed_files().unwrap_or_default()
     }
@@ -942,33 +920,19 @@ impl Engine {
     }
 
     /// How long an item has left in trash, in seconds, or None if it is live.
-    pub fn trash_seconds_remaining(&self, file_id: &str) -> Option<i64> {
+    pub fn trash_seconds_remaining(&self, file_id: String) -> Option<i64> {
         let db = self.db.lock().unwrap();
-        let file = db.get_file_by_id(file_id).ok().flatten()?;
+        let file = db.get_file_by_id(&file_id).ok().flatten()?;
         if !file.is_trashed() {
             return None;
         }
         Some((file.trashed_at + TRASH_RETENTION_SECS - watcher::now_secs()).max(0))
     }
 
-    /// Runs the retention sweep once, rather than waiting for the next tick.
-    /// Returns the items destroyed.
-    pub fn sweep_trash_now(&self) -> Vec<String> {
-        let purged = self
-            .indexer()
-            .sweep_trash(watcher::now_secs(), TRASH_RETENTION_SECS);
-        for file_id in &purged {
-            let _ = self.event_tx.send(EngineEvent::FilePurged {
-                file_id: file_id.clone(),
-            });
-        }
-        purged
-    }
-
     /// Which devices hold this item, and which content each one has.
-    pub fn get_file_holders(&self, file_id: &str) -> Vec<FileHolder> {
+    pub fn holders_of(&self, file_id: String) -> Vec<FileHolder> {
         let db = self.db.lock().unwrap();
-        db.get_holders(file_id).unwrap_or_default()
+        db.get_holders(&file_id).unwrap_or_default()
     }
 
     /// Sends a copy of an item to specific devices.

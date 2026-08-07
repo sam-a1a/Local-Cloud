@@ -55,18 +55,18 @@ fn two_engines_discover_pair_and_converge_on_their_own() {
     // measured is the pairing itself prompting a read rather than the periodic
     // pass coming round. `converges_on_a_change_made_after_pairing` covers the
     // other trigger.
-    std::fs::write(format!("{}/notes.txt", bob.get_sync_dir()), "bob's notes")
+    std::fs::write(format!("{}/notes.txt", bob.sync_dir()), "bob's notes")
         .expect("write into bob's folder");
 
     // 1. They find each other over mDNS.
     wait_for("alice to see bob", || {
         alice
-            .get_known_peers()
+            .visible_devices()
             .into_iter()
             .find(|d| d.device_id == bob_id)
     });
     wait_for("bob to see alice", || {
-        bob.get_known_peers()
+        bob.visible_devices()
             .into_iter()
             .find(|d| d.device_id == alice_id)
     });
@@ -93,7 +93,7 @@ fn two_engines_discover_pair_and_converge_on_their_own() {
     // 3. Bob already had a file in his folder. The watcher indexed it; nothing
     //    else is called on either engine from here on.
     let file = wait_for("bob to index his own file", || {
-        bob.get_local_files()
+        bob.local_files()
             .into_iter()
             .find(|f| f.path == "notes.txt")
     });
@@ -101,7 +101,7 @@ fn two_engines_discover_pair_and_converge_on_their_own() {
     // 4. Alice learns of it without being told to sync.
     let seen = wait_for("alice's catalog to catch up", || {
         alice
-            .get_catalog()
+            .catalog()
             .items
             .into_iter()
             .find(|f| f.path == "notes.txt")
@@ -109,7 +109,7 @@ fn two_engines_discover_pair_and_converge_on_their_own() {
     assert_eq!(seen.id, file.id, "it must be the same item, not a new one");
 
     // And she knows who has it, and that she does not.
-    let holders = alice.get_file_holders(&file.id);
+    let holders = alice.holders_of(file.id);
     assert!(
         holders.iter().any(|h| h.device_id == bob_id),
         "bob must be listed as holding it"
@@ -119,7 +119,7 @@ fn two_engines_discover_pair_and_converge_on_their_own() {
         "seeing an item is not having it"
     );
     assert!(
-        !std::path::Path::new(&format!("{}/notes.txt", alice.get_sync_dir())).exists(),
+        !std::path::Path::new(&format!("{}/notes.txt", alice.sync_dir())).exists(),
         "and its bytes must not appear in her folder"
     );
 
@@ -152,12 +152,12 @@ fn converges_on_a_change_made_after_pairing() {
 
     wait_for("alice to see bob", || {
         alice
-            .get_known_peers()
+            .visible_devices()
             .into_iter()
             .find(|d| d.device_id == bob_id)
     });
     wait_for("bob to see alice", || {
-        bob.get_known_peers()
+        bob.visible_devices()
             .into_iter()
             .find(|d| d.device_id == alice_id)
     });
@@ -180,12 +180,12 @@ fn converges_on_a_change_made_after_pairing() {
 
     // Only now does bob add anything, so no pairing or discovery event is left
     // to prompt a read. The periodic pass is the only thing that can.
-    std::fs::write(format!("{}/later.txt", bob.get_sync_dir()), "added afterwards")
+    std::fs::write(format!("{}/later.txt", bob.sync_dir()), "added afterwards")
         .expect("write into bob's folder");
 
     wait_for("alice's catalog to catch up on its own", || {
         alice
-            .get_catalog()
+            .catalog()
             .items
             .into_iter()
             .find(|f| f.path == "later.txt")
@@ -209,7 +209,7 @@ fn an_engine_restarted_still_syncs() {
     let alice = start_engine(&alice_dir);
     let bob = start_engine(&bob_dir);
 
-    std::fs::write(format!("{}/notes.txt", bob.get_sync_dir()), "bob's notes")
+    std::fs::write(format!("{}/notes.txt", bob.sync_dir()), "bob's notes")
         .expect("write into bob's folder");
 
     // Backgrounded and resumed, before the two have ever paired.
@@ -221,12 +221,12 @@ fn an_engine_restarted_still_syncs() {
 
     wait_for("alice to see bob again", || {
         alice
-            .get_known_peers()
+            .visible_devices()
             .into_iter()
             .find(|d| d.device_id == bob_id)
     });
     wait_for("bob to see alice", || {
-        bob.get_known_peers()
+        bob.visible_devices()
             .into_iter()
             .find(|d| d.device_id == alice_id)
     });
@@ -244,7 +244,7 @@ fn an_engine_restarted_still_syncs() {
 
     wait_for("alice's catalog to catch up after a restart", || {
         alice
-            .get_catalog()
+            .catalog()
             .items
             .into_iter()
             .find(|f| f.path == "notes.txt")

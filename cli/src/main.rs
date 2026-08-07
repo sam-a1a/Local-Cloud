@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     let engine = Arc::new(Engine::new(".".to_string(), "./sync_folder".to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))?);
 
     let short_id = engine.device_short_id();
-    let sync_dir = engine.get_sync_dir();
+    let sync_dir = engine.sync_dir();
 
     // Everything this consumer does with events. Registered before `start`, so
     // nothing is missed - including EngineStarted.
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         let devices = engine_share.paired_devices();
-        let files = engine_share.get_local_files();
+        let files = engine_share.local_files();
 
         match (devices.first(), files.first()) {
             (Some(device), Some(file)) => {

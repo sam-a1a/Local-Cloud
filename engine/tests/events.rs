@@ -111,7 +111,7 @@ fn an_indexed_file_is_announced_with_its_identity() {
     engine.set_event_listener(recorder.clone());
     engine.start().expect("start");
 
-    std::fs::write(format!("{}/notes.txt", engine.get_sync_dir()), "contents")
+    std::fs::write(format!("{}/notes.txt", engine.sync_dir()), "contents")
         .expect("write into the folder");
 
     let event = recorder.wait_for("the file to be indexed", |e| {
@@ -123,7 +123,7 @@ fn an_indexed_file_is_announced_with_its_identity() {
             assert_eq!(path, "notes.txt");
             assert!(!file_id.is_empty(), "an event must carry the item's identity");
             assert!(
-                engine.get_local_files().iter().any(|f| f.id == file_id),
+                engine.local_files().iter().any(|f| f.id == file_id),
                 "and that identity must be the one in the catalog"
             );
         }
@@ -148,7 +148,7 @@ fn a_share_to_a_device_that_is_not_there_is_refused_up_front() {
     engine.set_event_listener(recorder.clone());
     engine.start().expect("start");
 
-    std::fs::write(format!("{}/notes.txt", engine.get_sync_dir()), "contents")
+    std::fs::write(format!("{}/notes.txt", engine.sync_dir()), "contents")
         .expect("write into the folder");
     let indexed = recorder.wait_for("the file to be indexed", |e| {
         matches!(e, EngineEvent::FileIndexed { path, .. } if path == "notes.txt")
