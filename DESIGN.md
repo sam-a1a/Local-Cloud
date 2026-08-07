@@ -381,7 +381,12 @@ from each platform's own idioms — and making large files fast.
   records truthfully what that device has, so nothing is lost and the divergence
   is visible — but the catalog's idea of "current" is last-writer-wins.
 
-Fixed along the way: the committed `identity.json`, the two fail-open TLS paths,
+The key that was committed in `identity.json` has been retired — the file is
+untracked and gitignored, and the device it belonged to has minted a fresh
+identity. The old key is still readable in the git history of a public
+repository, so it must be treated as known to anyone; nothing uses it now.
+
+Fixed along the way: the tracked `identity.json`, the two fail-open TLS paths,
 trust-on-first-use in `sync_with_peer`, the hardcoded `/tmp/local_cloud_sync/`
 download path, deleting blocks that another item still needed, pushes being
 refused by a stale catalog, and unverified block contents.
