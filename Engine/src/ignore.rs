@@ -1,4 +1,4 @@
-// engine/src/ignore.rs
+// Engine/src/ignore.rs
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 

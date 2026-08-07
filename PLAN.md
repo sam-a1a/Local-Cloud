@@ -12,8 +12,8 @@ physical machines; the thing after that is an app.
 
 | | |
 |---|---|
-| `engine/` | 6,760 lines. The whole model, the server, discovery, storage, FFI. |
-| `cli/` | 372 lines. A prompt for driving one device — the test harness. |
+| `Engine/` | 6,760 lines. The whole model, the server, discovery, storage, FFI. |
+| `Cli/` | 372 lines. A prompt for driving one device — the test harness. |
 | tests | 115 across 6 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. |
 | dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
 
@@ -44,7 +44,7 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
 - **Only missing blocks are sent.** `/push_metadata` replies with what the
   recipient lacks. Verified on two running instances: a re-share moved 0 blocks.
 - **The engine keeps its own catalog true** — on discovery, on pairing, and
-  every 30s. It used to be the caller's job, and only `cli/` remembered.
+  every 30s. It used to be the caller's job, and only `Cli/` remembered.
 - **Transfer progress**, per block, counting what actually has to move.
 - **Typed errors and pushed events.** Failures name the item and the device.
 - **Mobile.** `import_file`, the watcher gated to desktop, `cargo check --target

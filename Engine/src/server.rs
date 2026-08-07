@@ -1,4 +1,4 @@
-// engine/src/server.rs
+// Engine/src/server.rs
 use crate::db::Database;
 use crate::ignore::IgnoreSet;
 use crate::pairing::{DeviceInfo, PairingState};

@@ -1,4 +1,4 @@
-// engine/src/crypto.rs
+// Engine/src/crypto.rs
 use anyhow::Result;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
