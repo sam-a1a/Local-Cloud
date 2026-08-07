@@ -4,6 +4,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use rand::rngs::OsRng;
+use rand::TryRngCore;
 
 #[derive(Serialize, Deserialize)]
 struct IdentityFile {
@@ -91,8 +92,21 @@ impl DeviceIdentity {
 
     /// Generates a new random identity and self-signed TLS cert
     pub fn generate(base_dir: &str) -> Result<Self> {
-        let mut csprng = OsRng;
-        let signing_key = SigningKey::generate(&mut csprng);
+        // The key material is drawn here rather than handed to
+        // `SigningKey::generate`, which wants an RNG implementing *its* version
+        // of rand_core. ed25519-dalek and rand advance that trait on their own
+        // schedules, and coupling this to both at once means an upgrade to
+        // either is blocked until they agree. Thirty-two bytes from the
+        // operating system is what a signing key is; nothing is given up.
+        //
+        // Reading it is fallible, and says so: rand_core made OS randomness a
+        // `TryRngCore` precisely because it can fail, and a device identity is
+        // the last thing that should be built on a silent fallback.
+        let mut secret = [0u8; 32];
+        OsRng.try_fill_bytes(&mut secret).map_err(|e| {
+            anyhow::anyhow!("Could not read randomness from the operating system: {}", e)
+        })?;
+        let signing_key = SigningKey::from_bytes(&secret);
         let verifying_key: VerifyingKey = signing_key.verifying_key();
         let device_id = hex::encode(verifying_key.to_bytes());
 

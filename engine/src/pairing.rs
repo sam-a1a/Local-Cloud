@@ -104,7 +104,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 fn generate_code() -> String {
     use rand::Rng;
-    format!("{:06}", rand::thread_rng().gen_range(0..1_000_000u32))
+    format!("{:06}", rand::rng().random_range(0..1_000_000u32))
 }
 
 /// The initiator's side: one code, the devices it was shown for, and how many

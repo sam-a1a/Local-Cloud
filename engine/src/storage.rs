@@ -312,6 +312,27 @@ mod tests {
         }
     }
 
+    /// A block id is a persistent, cross-device identifier, so the hash behind
+    /// it must never move.
+    ///
+    /// Every block on disk is filed under this, every content hash is built
+    /// from it, and two devices agree they hold the same thing by comparing
+    /// them. A hashing library that changed its output - or a swap to a
+    /// different one - would silently make every existing block unfindable and
+    /// every peer's catalog disagree with ours. Pinned to the published SHA-256
+    /// vector rather than to whatever the current dependency happens to return.
+    #[test]
+    fn a_block_id_is_the_published_sha256_of_its_contents() {
+        assert_eq!(
+            block_id_for(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            block_id_for(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
     #[test]
     fn a_short_read_does_not_end_a_block_early() {
         // The whole of chunking rests on this: if a block ended wherever a read
