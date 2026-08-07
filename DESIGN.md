@@ -245,6 +245,38 @@ mobile treats the namespace as flat.
 
 ---
 
+## 10a. The engine's API
+
+`Engine` is what an application talks to, and bindings will freeze its shape, so
+it holds to four rules.
+
+**Failures are typed.** `EngineError` names what went wrong — `NotPaired`,
+`NoSuchItem`, `NotHeldHere`, `InTrash` and the rest — and carries the ids it
+concerns. Match on the variant; show the message. A single stringly-typed error
+would force every application into prose comparison and break on rewording.
+
+**A request that cannot make sense fails immediately; only the network reports
+late.** Anything decidable from local state comes back as an `Err` from the call.
+Operations that then touch the network return `Ok` and finish in the background,
+and their outcome arrives as an event naming the item and device it concerns —
+`ShareFailed` per device, `PullFailed`, `DeleteRequestDeferred`.
+
+**Events are pushed to an `EventListener`, not polled.** One consumer, one
+thread, in order. Events produced before a listener is registered are held (up
+to a cap) and delivered once one is, so an application cannot miss
+`EngineStarted` by registering a moment late.
+
+**The API has its own types.** `Catalog` is items and holders. What travels
+between devices is `db::CatalogPayload`, which also carries tombstones and
+delete requests so peers can converge; an application handed those would be
+reasoning about replication rather than about its items. The wire format has to
+change when the protocol does, and that must not be an API change.
+
+Identity is `file_id`, never a path — collisions rename items, so an application
+keying on paths attaches events to the wrong row exactly when it matters.
+
+---
+
 ## 11. Protocol
 
 All traffic is mutually-authenticated TLS between paired devices, with certificates
