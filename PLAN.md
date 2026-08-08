@@ -1,13 +1,18 @@
 # Where we are
 
-The engine is done and it has a consumer. An Android app drives it through the
-Kotlin bindings, builds the engine and those bindings as part of an ordinary
-Gradle build, pairs, transfers, and keeps syncing with the screen off. All of it
-has been run on a phone.
+The engine is done and it has a consumer.
 
-**None of it has been run on two phones.** Every figure and every claim about
-discovery still comes from processes talking to each other on one machine over
-loopback. That is the next thing, and it has been the next thing for a while.
+An Android app drives it through the Kotlin bindings. It pairs with a six-digit
+code, names itself what the phone is called, brings files in from the picker or
+the share sheet, opens them again or hands them to another app, shows which
+devices hold what, and keeps syncing with the screen off behind a foreground
+service. The engine and the bindings are built by an ordinary `./gradlew
+assembleDebug`, and every part of that has been run on a phone.
+
+**None of it has been run on two phones.** Every throughput figure and every
+claim about discovery in this file still comes from processes talking to each
+other on one machine over loopback. That is the next thing, it needs no code,
+and it has been the next thing for a while.
 
 `DESIGN.md` is the design and the reasoning. This is the status.
 
@@ -19,7 +24,7 @@ loopback. That is the next thing, and it has been the next thing for a while.
 |---|---|
 | `engine/` | 6,999 lines. The whole model, the server, discovery, storage, FFI. |
 | `cli/` | 372 lines. A prompt for driving one device — the test harness. |
-| `android/` | 3,541 lines of Kotlin. Compose, three screens, a foreground service. |
+| `android/` | 3,868 lines of Kotlin across 22 files. Compose, three screens, a foreground service. |
 | tests | 121 Rust across 7 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. 14 Kotlin: the background notification's line, and names arriving from other apps. |
 | dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
 
@@ -73,7 +78,7 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
   waiting for a restart. Renaming does not mint a new identity, which is what
   the test asserts.
 
-Bugs found and fixed along the way, each by a test written for something else:
+Bugs in the engine, every one found by a test written for something else:
 
 - A file whose blocks repeated **arrived corrupt** — `file_blocks` was keyed on
   the block rather than its position, so a 3 MB file with a run of zeros became
@@ -215,15 +220,25 @@ alternatives were naming the private data path literally or copying every file
 to the cache before handing it out. Backup exclusion is now a rule rather than a
 side effect of location, which is better because the reasoning is written down.
 
-Running it found two things a build never would. The catalog rows were as wide
-as their filenames, because a Card sizes to its content and every screenshot
-until then had been of an empty catalog. And no row had ever expanded, because
-`Modifier.clickable` on a Card is swallowed by the Surface's own pointer handler
-— silently, with no error, which is why it survived being written, reviewed and
-shipped.
-
 Still not possible: surviving a reboot with background syncing on. That is
 Android's rule, not an omission.
+
+### Bugs in the app, every one found by running it
+
+The engine's bugs were all found by tests. None of the app's were, and none of
+them could have been:
+
+- **Every catalog row was as wide as its filename.** A Card sizes to its
+  content. It had been wrong since the screen was written and never showed,
+  because every screenshot until then was of an empty catalog.
+- **No row had ever expanded.** `Modifier.clickable` on a Card is swallowed by
+  the Material Surface's own pointer handler, which sits inside the modifier
+  passed in and consumes the tap first. No error, no crash — the row simply did
+  nothing, which is how it survived being written and reviewed.
+
+The lesson is cheap to state and was expensive to learn twice: a compiling
+Compose screen is not a working one, and a screenshot of the state you already
+had proves nothing about the state you have not reached.
 
 ---
 
