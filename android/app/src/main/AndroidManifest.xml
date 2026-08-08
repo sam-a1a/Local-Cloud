@@ -15,6 +15,23 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
+    <!--
+        Syncing with the app closed.
+
+        `dataSync` is the type this actually is - moving a user's files between
+        their own devices - and Android requires the type to be declared both
+        here and again when the service goes foreground.
+
+        POST_NOTIFICATIONS is a runtime permission, and asking for it is not a
+        formality: the foreground service will run without it, but the ongoing
+        notification will not appear, which would leave the engine syncing with
+        the screen off and nothing on screen to say so. The switch asks before
+        it starts anything.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:name=".LocalCloudApplication"
         android:allowBackup="true"

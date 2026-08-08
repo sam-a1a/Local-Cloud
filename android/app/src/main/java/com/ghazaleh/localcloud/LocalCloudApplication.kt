@@ -6,6 +6,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.ghazaleh.localcloud.engine.EngineHost
 import com.ghazaleh.localcloud.engine.EngineRepository
+import com.ghazaleh.localcloud.service.SyncNotification
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -40,6 +41,11 @@ class LocalCloudApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // Registered once, for the life of the install. Creating a channel that
+        // already exists updates it rather than duplicating it, so this is also
+        // how its wording stays current.
+        SyncNotification.ensureChannel(this)
 
         repository = EngineRepository(EngineHost(this), engineScope)
         repository.begin()
