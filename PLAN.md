@@ -17,7 +17,7 @@ on one Wi-Fi, finding each other.
 | `engine/` | 6,760 lines. The whole model, the server, discovery, storage, FFI. |
 | `cli/` | 372 lines. A prompt for driving one device — the test harness. |
 | `android/` | The app. Compose, three screens, every one of them the engine's own idea. |
-| tests | 121 across 7 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. |
+| tests | 121 Rust across 7 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. 7 Kotlin, on the line the background notification shows. |
 | dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
 
 Test suites, and what each is for:
@@ -57,6 +57,9 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
 - **A CLI that can pair**, which is what makes the device test possible at all.
 - **An Android app**, in `android/`, which is the first thing to consume those
   bindings — and the first proof the engine runs anywhere but a desktop.
+- **Syncing with the app closed**, behind a switch that is off until asked for.
+  A foreground service holds the engine up with no screen on, and the engine
+  runs while anything needs it rather than while a screen is open.
 - **A device can be named.** `set_device_name` crosses the FFI, so a platform
   that knows better than Rust does can say so. The name is the one mutable part
   of an identity, so it is the one part behind a lock: the running server shares
@@ -104,10 +107,12 @@ instances on one machine, so what is being tested is the network, not the logic.
 3. **Whether a 30s catalog delay is tolerable** in practice, or wants the
    notification described in §14.
 
-One of the two can now be the phone. The Android multicast lock is written and
-held while the app is in the foreground, so the Android half of "mobile
-discovery is a separate question" has been answered as far as it can be without
-a second machine. iOS still needs its entitlement, and still has no app.
+One of the two can now be the phone, and it no longer has to be sitting there
+unlocked with the app open: the multicast lock is held whenever the engine runs,
+and a foreground service can keep it running with the screen off. The Android
+half of "mobile discovery is a separate question" has been answered as far as it
+can be without a second machine. iOS still needs its entitlement, and still has
+no app.
 
 ---
 
@@ -138,9 +143,35 @@ What the first consumer found, which is what a first consumer is for:
   as the absence they are, and `set_device_name` is exposed, so the app hands
   the engine the name Android actually knows. See below.
 
-Still app-side rather than engine-side: an iOS Files provider extension, the iOS
-multicast entitlement, and a foreground service if Android is ever to sync while
-the app is closed. The app runs the engine only in the foreground today.
+### Syncing with the app closed
+
+A `dataSync` foreground service, off by default and switched on from the This
+device card. While it runs, this phone stays on the mesh, keeps its multicast
+lock, and accepts files with no screen on — verified on an emulator by pressing
+Home and watching the engine stay up.
+
+The engine no longer starts and stops with the process lifecycle. It runs while
+*anything* needs it to — an open screen, the service, or both — because those
+overlap constantly, and a service starting a moment before the app is
+backgrounded must not lose the engine to the departing screen.
+
+Three limits worth knowing before relying on it:
+
+- **Android 15 caps a `dataSync` service at roughly six hours a day.** When the
+  six are up the system calls `onTimeout`, and a service that does not stop is
+  treated as misbehaving. This one stops, turns the switch off, and leaves a
+  notification saying why — the failure to avoid is a device that quietly
+  stopped syncing hours ago and never said.
+- **The notification is not optional**, and the switch will not turn on without
+  permission to post it. Android would run the service anyway and simply not
+  show it, which is the one outcome worth refusing: syncing with the screen off
+  and nothing anywhere admitting it.
+- **Nothing restarts it after a reboot.** Android 15 does not allow a `dataSync`
+  service to be started from `BOOT_COMPLETED`, so the switch stays on and the
+  service comes back the next time the app is opened. Deliberate, not missing.
+
+Still app-side and still undone: an iOS Files provider extension and the iOS
+multicast entitlement. iOS has no app at all yet.
 
 ---
 
