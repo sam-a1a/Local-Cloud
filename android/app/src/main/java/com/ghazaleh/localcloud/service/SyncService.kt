@@ -18,6 +18,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 
 /**
@@ -56,6 +57,26 @@ class SyncService : Service() {
 
         app().engineNeededBy(EngineRepository.RunReason.BackgroundService)
         keepTheNotificationTrue()
+        standDownIfTheEngineCannot()
+    }
+
+    /**
+     * A foreground service is a promise that something is happening.
+     *
+     * If the engine could not be built or could not start - a corrupt database,
+     * a port that will not bind - then nothing is, and the notification is
+     * claiming otherwise while costing battery to do it. Better to stop, turn
+     * the setting off and say what went wrong than to sit there indefinitely
+     * reporting "Starting…".
+     */
+    private fun standDownIfTheEngineCannot() {
+        app().repository.state
+            .map { it.fatal }
+            .distinctUntilChanged()
+            .onEach { fatal ->
+                if (fatal != null) standDown("LocalCloud could not start on this device. $fatal")
+            }
+            .launchIn(scope)
     }
 
     /**
