@@ -1,4 +1,4 @@
-// Engine/src/collision.rs
+// engine/src/collision.rs
 //
 // Two different files wanting the same name in a shared namespace.
 //

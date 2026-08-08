@@ -1,4 +1,4 @@
-// Engine/src/pairing.rs
+// engine/src/pairing.rs
 //
 // Pairing turns two devices that merely see each other on the network into two
 // devices that trust each other.

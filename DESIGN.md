@@ -365,7 +365,7 @@ appeared before the next scheduled pass.
 
    There is no UI at present. The Dioxus app was removed: it was one renderer's
    idea of the model, and it was shaping the engine's API before the engine had
-   settled. `Cli/` drives the engine directly and is the only consumer. A UI
+   settled. `cli/` drives the engine directly and is the only consumer. A UI
    comes back once the platform surfaces below exist to build it on, and the
    engine's public API is what it should be answerable to.
 6. ~~**Block size and transfer**~~ — 1 MiB blocks, several in flight at once,

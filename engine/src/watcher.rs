@@ -1,4 +1,4 @@
-// Engine/src/watcher.rs
+// engine/src/watcher.rs
 //
 // Turning files in the sync folder into catalog items, and removals into the
 // loss of this device's copy.

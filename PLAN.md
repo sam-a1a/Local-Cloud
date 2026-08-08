@@ -14,9 +14,9 @@ on one Wi-Fi, finding each other.
 
 | | |
 |---|---|
-| `Engine/` | 6,760 lines. The whole model, the server, discovery, storage, FFI. |
-| `Cli/` | 372 lines. A prompt for driving one device — the test harness. |
-| `Android/` | The app. Compose, three screens, every one of them the engine's own idea. |
+| `engine/` | 6,760 lines. The whole model, the server, discovery, storage, FFI. |
+| `cli/` | 372 lines. A prompt for driving one device — the test harness. |
+| `android/` | The app. Compose, three screens, every one of them the engine's own idea. |
 | tests | 115 across 6 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. |
 | dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
 
@@ -47,14 +47,14 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
 - **Only missing blocks are sent.** `/push_metadata` replies with what the
   recipient lacks. Verified on two running instances: a re-share moved 0 blocks.
 - **The engine keeps its own catalog true** — on discovery, on pairing, and
-  every 30s. It used to be the caller's job, and only `Cli/` remembered.
+  every 30s. It used to be the caller's job, and only `cli/` remembered.
 - **Transfer progress**, per block, counting what actually has to move.
 - **Typed errors and pushed events.** Failures name the item and the device.
 - **Mobile.** `import_file`, the watcher gated to desktop, `cargo check --target
   aarch64-apple-ios` clean.
 - **Swift and Kotlin bindings** via uniffi, generated from the compiled library.
 - **A CLI that can pair**, which is what makes the device test possible at all.
-- **An Android app**, in `Android/`, which is the first thing to consume those
+- **An Android app**, in `android/`, which is the first thing to consume those
   bindings — and the first proof the engine runs anywhere but a desktop.
 
 Bugs found and fixed along the way, each by a test written for something else:
@@ -106,7 +106,7 @@ a second machine. iOS still needs its entitlement, and still has no app.
 
 ## The app
 
-`Android/` exists and runs. Three screens — the catalog and who holds what,
+`android/` exists and runs. Three screens — the catalog and who holds what,
 the mesh and how devices join it, the thirty days before a deleted item is
 gone — and no fourth screen for anything the engine does not have an opinion
 about.

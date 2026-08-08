@@ -1,4 +1,4 @@
-// Engine/src/discovery.rs
+// engine/src/discovery.rs
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rustls::client::danger::ServerCertVerifier;

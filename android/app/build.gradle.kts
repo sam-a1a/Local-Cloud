@@ -17,7 +17,7 @@ plugins {
 // entirely.
 // ---------------------------------------------------------------------------
 
-/** `Android/` is the Gradle root, so the Rust workspace is one directory up. */
+/** `android/` is the Gradle root, so the Rust workspace is one directory up. */
 val workspaceRoot: File = rootProject.projectDir.parentFile
 
 /**
@@ -127,9 +127,9 @@ val cargoBuildEngine = tasks.register<Exec>("cargoBuildEngine") {
         }
     )
 
-    inputs.dir(File(workspaceRoot, "Engine/src")).withPathSensitivity(PathSensitivity.RELATIVE)
-    inputs.file(File(workspaceRoot, "Engine/Cargo.toml"))
-    inputs.file(File(workspaceRoot, "Engine/build.rs"))
+    inputs.dir(File(workspaceRoot, "engine/src")).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file(File(workspaceRoot, "engine/Cargo.toml"))
+    inputs.file(File(workspaceRoot, "engine/build.rs"))
     inputs.file(File(workspaceRoot, "Cargo.lock"))
     outputs.dir(jniLibsDir)
 }
