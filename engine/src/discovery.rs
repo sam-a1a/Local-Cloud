@@ -137,26 +137,25 @@ pub fn build_mtls_client(
     Ok(client)
 }
 
-pub fn start_discovery(
-    device_id: String,
-    device_name: String,
+/// Publishes this device's record: who it is, what it is called, and where to
+/// reach it.
+///
+/// Separate from starting discovery because it is also how a rename reaches the
+/// network. mDNS advertises a snapshot rather than a live view, so a name
+/// changed after `start` is only seen once this is called again - and mdns-sd
+/// documents a second `register` of the same service as an update, with no
+/// `unregister` first, so peers are not told the device left and came back.
+pub fn announce(
+    daemon: &ServiceDaemon,
+    device_id: &str,
+    device_name: &str,
     port: u16,
-    event_tx: mpsc::Sender<EngineEvent>,
-    known_peers: PeerMap,
-    // Separate from `event_tx`, which belongs to whoever embedded the engine:
-    // an event channel has one consumer, so the engine cannot both hand
-    // discoveries to the caller and act on them itself through the same one.
-    // Carries the device id rather than the whole advertisement, so a sync
-    // always uses the address the peer is reachable at *now*.
-    peer_found: SyncNudge,
-) -> Result<ServiceDaemon> {
-    let daemon = ServiceDaemon::new()?;
-
+) -> Result<()> {
     let short_id = &device_id[..8];
     let host_name = format!("{}.local.", short_id);
     let mut properties = HashMap::new();
-    properties.insert("device_id".to_string(), device_id.clone());
-    properties.insert("name".to_string(), device_name);
+    properties.insert("device_id".to_string(), device_id.to_string());
+    properties.insert("name".to_string(), device_name.to_string());
     properties.insert("platform".to_string(), crate::crypto::platform_name().to_string());
 
     // Addresses are left to the daemon rather than guessed.
@@ -172,9 +171,29 @@ pub fn start_discovery(
         .enable_addr_auto();
 
     daemon.register(service_info)?;
+    Ok(())
+}
+
+pub fn start_discovery(
+    device_id: String,
+    device_name: String,
+    port: u16,
+    event_tx: mpsc::Sender<EngineEvent>,
+    known_peers: PeerMap,
+    // Separate from `event_tx`, which belongs to whoever embedded the engine:
+    // an event channel has one consumer, so the engine cannot both hand
+    // discoveries to the caller and act on them itself through the same one.
+    // Carries the device id rather than the whole advertisement, so a sync
+    // always uses the address the peer is reachable at *now*.
+    peer_found: SyncNudge,
+) -> Result<ServiceDaemon> {
+    let daemon = ServiceDaemon::new()?;
+
+    let short_id = device_id[..8].to_string();
+    announce(&daemon, &device_id, &device_name, port)?;
 
     let receiver = daemon.browse(SERVICE_TYPE)?;
-    let my_short_id = short_id.to_string();
+    let my_short_id = short_id;
 
     std::thread::spawn(move || {
         while let Ok(event) = receiver.recv() {

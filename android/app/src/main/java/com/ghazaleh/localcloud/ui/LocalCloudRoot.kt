@@ -69,6 +69,7 @@ fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
     val sharing by viewModel.sharing.collectAsStateWithLifecycle()
     val collision by viewModel.collision.collectAsStateWithLifecycle()
     val importing by viewModel.importing.collectAsStateWithLifecycle()
+    val renaming by viewModel.renaming.collectAsStateWithLifecycle()
 
     var tab by rememberSaveable { mutableStateOf(Tab.Files) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -184,6 +185,7 @@ fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
                         onPair = viewModel::startPairing,
                         onOpenOffer = viewModel::openOffer,
                         onUnpair = viewModel::unpair,
+                        onRename = viewModel::beginRename,
                         contentPadding = ContentInset,
                     )
 
@@ -214,6 +216,16 @@ fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
             onlineIds = state.visible.map { it.deviceId }.toSet(),
             onSend = { deviceIds -> viewModel.share(item.id, deviceIds) },
             onDismiss = viewModel::stopSharing,
+        )
+    }
+
+    val draft = renaming
+    if (draft != null) {
+        RenameDialog(
+            draft = draft,
+            onType = viewModel::typeName,
+            onSubmit = viewModel::submitRename,
+            onDismiss = viewModel::dismissRename,
         )
     }
 

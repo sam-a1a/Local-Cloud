@@ -66,7 +66,7 @@ impl TestDevice {
 
         let info = DeviceInfo {
             device_id: identity.device_id.clone(),
-            name: identity.device_name.clone(),
+            name: identity.device_name(),
             platform: "test".to_string(),
             cert_pem: identity.cert_pem.clone(),
         };
@@ -74,7 +74,7 @@ impl TestDevice {
         tokio::spawn(server::start_server(
             listener,
             identity.device_id.clone(),
-            identity.device_name.clone(),
+            identity.device_name_handle(),
             identity.cert_pem.clone(),
             identity.key_pem.clone(),
             db.clone(),

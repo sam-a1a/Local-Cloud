@@ -98,6 +98,13 @@ const TRASH_SWEEP_INTERVAL_SECS: u64 = 60 * 60;
 /// property that has to be maintained, not established once.
 const CATALOG_SYNC_INTERVAL_SECS: u64 = 30;
 
+/// How long a device name may be.
+///
+/// An mDNS TXT entry holds at most 255 bytes for its key and value together,
+/// and this name travels in one. Well under the limit even for a name that is
+/// entirely multi-byte characters, and far more than anyone types.
+const MAX_DEVICE_NAME_CHARS: usize = 64;
+
 /// Why an operation could not be carried out.
 ///
 /// Deliberately specific. These cross into Swift and Kotlin as typed
@@ -355,6 +362,12 @@ pub struct Engine {
     /// the task that is currently running - and is absent while the engine is
     /// stopped, when there is nothing to ask.
     sync_nudge: StdMutex<Option<discovery::SyncNudge>>,
+    /// The port the mDNS record currently advertises.
+    ///
+    /// Kept because re-announcing needs it and the port is chosen by the
+    /// operating system at every `start`. Set and cleared alongside the daemon,
+    /// so the two can never describe different runs.
+    announced_port: StdMutex<Option<u16>>,
     known_peers: PeerMap,
     trust: TrustStore,
     pairing: PairingState,
@@ -413,6 +426,7 @@ impl Engine {
             trash_sweep_task: StdMutex::new(None),
             catalog_sync_task: StdMutex::new(None),
             sync_nudge: StdMutex::new(None),
+            announced_port: StdMutex::new(None),
             known_peers,
             trust,
             pairing: PairingState::new(),
@@ -429,7 +443,60 @@ impl Engine {
     }
 
     pub fn device_name(&self) -> String {
-        self.identity.device_name.clone()
+        self.identity.device_name()
+    }
+
+    /// Renames this device, as every other device sees it.
+    ///
+    /// Exists because the platform usually knows a far better name than the
+    /// engine can work out from inside Rust. Android is the plain case:
+    /// `whoami` there reports the literal string "Unknown", and only an
+    /// application can ask the system for the model or the user's own name for
+    /// the phone. What the engine guesses at first run is a starting point, not
+    /// an answer.
+    ///
+    /// It takes effect at three different ranges, and it is worth being exact
+    /// about which:
+    ///
+    /// - **Here**, at once.
+    /// - **A device that pairs from now on**, at once — the running server
+    ///   shares the name rather than a copy taken when it started.
+    /// - **Devices already on the network**, when they next resolve this one.
+    ///   The mDNS record is re-announced here if the engine is running, so that
+    ///   is soon rather than never; but mDNS publishes a snapshot, and a peer
+    ///   that has already cached the old name keeps it until it expires.
+    ///
+    /// Devices already paired hold the name in their own catalog and take the
+    /// new one on their next contact.
+    pub fn set_device_name(&self, name: String) -> Result<(), EngineError> {
+        let trimmed = name.trim();
+
+        // Checked before anything is written. A name that cannot be announced
+        // would otherwise be saved, and then fail on every start afterwards -
+        // the length cap is here because an mDNS TXT entry has one, and finding
+        // that out after the rename was persisted is the wrong order.
+        let unusable = trimmed.is_empty()
+            || trimmed.chars().count() > MAX_DEVICE_NAME_CHARS
+            || trimmed.chars().any(char::is_control);
+        if unusable {
+            return Err(EngineError::InvalidName { name });
+        }
+
+        self.identity
+            .set_device_name(trimmed)
+            .map_err(EngineError::internal)?;
+
+        // Only if something is currently announcing. While stopped there is no
+        // record to correct, and the next `start` publishes the new name as a
+        // matter of course.
+        let daemon = self.mdns_daemon.lock().unwrap();
+        let port = *self.announced_port.lock().unwrap();
+        if let (Some(daemon), Some(port)) = (daemon.as_ref(), port) {
+            discovery::announce(daemon, &self.identity.device_id, trimmed, port)
+                .map_err(EngineError::internal)?;
+        }
+
+        Ok(())
     }
 
     pub fn device_platform(&self) -> String {
@@ -441,7 +508,7 @@ impl Engine {
     fn own_device_info(&self) -> pairing::DeviceInfo {
         pairing::DeviceInfo {
             device_id: self.identity.device_id.clone(),
-            name: self.identity.device_name.clone(),
+            name: self.identity.device_name(),
             platform: crypto::platform_name().to_string(),
             cert_pem: self.identity.cert_pem.clone(),
         }
@@ -1359,7 +1426,7 @@ impl Engine {
         let server_trust = self.trust.clone();
         let server_pairing = self.pairing.clone();
         let server_indexer = self.indexer();
-        let server_device_name = self.identity.device_name.clone();
+        let server_device_name = self.identity.device_name_handle();
         // Renewed here so a restarted engine addresses its new sync task
         // rather than the one `stop` aborted.
         let (nudge_tx, nudge_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1392,7 +1459,7 @@ impl Engine {
 
         let disc_tx = self.event_tx.clone();
         let disc_device_id = self.identity.device_id.clone();
-        let disc_device_name = self.identity.device_name.clone();
+        let disc_device_name = self.identity.device_name();
         let disc_peers = self.known_peers.clone();
 
         let daemon = discovery::start_discovery(
@@ -1405,6 +1472,7 @@ impl Engine {
         ).map_err(EngineError::internal)?;
 
         *self.mdns_daemon.lock().unwrap() = Some(daemon);
+        *self.announced_port.lock().unwrap() = Some(port);
 
         let sync_task = self.spawn_catalog_sync(nudge_rx);
         if let Some(previous) = self.catalog_sync_task.lock().unwrap().replace(sync_task) {
@@ -1464,6 +1532,7 @@ impl Engine {
         if let Some(d) = self.mdns_daemon.lock().unwrap().take() {
             let _ = d.shutdown();
         }
+        *self.announced_port.lock().unwrap() = None;
         if let Some(t) = self.server_task.lock().unwrap().take() {
             t.abort();
         }
@@ -1524,6 +1593,12 @@ impl Engine {
     #[uniffi::method(name = "device_name")]
     pub fn ffi_device_name(&self) -> String {
         self.device_name()
+    }
+
+    /// The platform almost always knows a better name than the engine does.
+    #[uniffi::method(name = "set_device_name")]
+    pub fn ffi_set_device_name(&self, name: String) -> Result<(), EngineError> {
+        self.set_device_name(name)
     }
 
     #[uniffi::method(name = "device_platform")]

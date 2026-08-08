@@ -47,6 +47,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _importing = MutableStateFlow(false)
     val importing = _importing.asStateFlow()
 
+    private val _renaming = MutableStateFlow<RenameDraft?>(null)
+    val renaming = _renaming.asStateFlow()
+
     init {
         // The device that shows the code never presses anything to finish:
         // pairing completes when the *other* device enters it, and arrives here
@@ -196,6 +199,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repository.unpair(deviceId) }
     }
 
+    // -- This device --------------------------------------------------------
+
+    fun beginRename() {
+        _renaming.value = RenameDraft(state.value.thisDevice.name)
+    }
+
+    fun typeName(text: String) {
+        _renaming.update { draft -> draft?.copy(text = text.take(MAX_NAME_CHARS)) }
+    }
+
+    /**
+     * The engine is the authority on whether a name is usable, not this.
+     *
+     * The field is capped at the same length the engine accepts so that the
+     * common rejection cannot happen at all, but everything else - a name of
+     * only spaces, a stray newline from a paste - is left to `set_device_name`
+     * to refuse and to say why.
+     */
+    fun submitRename() {
+        val draft = _renaming.value ?: return
+        _renaming.value = draft.copy(busy = true)
+        viewModelScope.launch {
+            val renamed = repository.rename(draft.text)
+            _renaming.value = if (renamed) null else draft.copy(busy = false)
+        }
+    }
+
+    fun dismissRename() {
+        _renaming.value = null
+    }
+
     private fun sanitizedName(uri: Uri): String {
         val fromProvider = getApplication<Application>().contentResolver
             .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
@@ -219,8 +253,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         const val CODE_LENGTH = 6
         const val FALLBACK_NAME = "Imported file"
+
+        /** What the engine accepts, so the field cannot offer what it will refuse. */
+        const val MAX_NAME_CHARS = 64
     }
 }
+
+/** What is being typed into the rename dialog. */
+data class RenameDraft(val text: String, val busy: Boolean = false)
 
 /** Which part of pairing, if any, is on screen. */
 sealed interface PairingFlow {

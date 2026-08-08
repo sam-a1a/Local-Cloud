@@ -50,6 +50,7 @@ fun DevicesScreen(
     onPair: (DiscoveredDevice) -> Unit,
     onOpenOffer: (PairingOffer) -> Unit,
     onUnpair: (String) -> Unit,
+    onRename: () -> Unit,
     contentPadding: PaddingValues,
     modifier: Modifier = Modifier,
 ) {
@@ -67,7 +68,7 @@ fun DevicesScreen(
         contentPadding = contentPadding,
     ) {
         item(key = "this-device") {
-            ThisDeviceCard(state)
+            ThisDeviceCard(state, onRename)
         }
 
         if (state.offers.isNotEmpty()) {
@@ -164,7 +165,7 @@ fun DevicesScreen(
 }
 
 @Composable
-private fun ThisDeviceCard(state: MeshState) {
+private fun ThisDeviceCard(state: MeshState, onRename: () -> Unit) {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -178,11 +179,19 @@ private fun ThisDeviceCard(state: MeshState) {
                 text = "THIS DEVICE",
                 style = MaterialTheme.typography.labelMedium,
             )
-            Text(
-                text = state.thisDevice.name.ifBlank { "Unnamed device" },
-                style = MaterialTheme.typography.headlineSmall,
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.padding(top = 4.dp),
-            )
+            ) {
+                Text(
+                    text = state.thisDevice.name.ifBlank { "Unnamed device" },
+                    style = MaterialTheme.typography.headlineSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                TextButton(onClick = onRename) { Text("Rename") }
+            }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),

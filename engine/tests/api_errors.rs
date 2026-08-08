@@ -196,3 +196,34 @@ fn importing_a_file_puts_it_in_the_shared_folder_and_the_catalog() {
     assert_eq!(second.path, "notes 1.txt");
     assert_ne!(second.id, item.id);
 }
+
+#[test]
+fn renaming_this_device_to_something_that_is_not_a_name() {
+    let dir = TempDir::new().expect("temp dir");
+    let engine = engine(&dir);
+    let before = engine.device_name();
+
+    let too_long = "x".repeat(65);
+    let unusable = ["", "   ", "a\nb", too_long.as_str()];
+
+    for name in unusable {
+        assert!(
+            matches!(
+                engine.set_device_name(name.to_string()),
+                Err(EngineError::InvalidName { .. })
+            ),
+            "{name:?} was accepted as a device name",
+        );
+    }
+
+    assert_eq!(
+        engine.device_name(),
+        before,
+        "a refused rename must leave the device called what it was",
+    );
+
+    // The contrast, so this test fails if renaming stops working altogether
+    // rather than only when the validation stops working.
+    engine.set_device_name("Sam's Pixel".into()).expect("rename");
+    assert_eq!(engine.device_name(), "Sam's Pixel");
+}

@@ -89,7 +89,7 @@ impl Device {
         tokio::spawn(server::start_server(
             listener,
             identity.device_id.clone(),
-            name.to_string(),
+            Arc::new(Mutex::new(name.to_string())),
             identity.cert_pem.clone(),
             identity.key_pem.clone(),
             db.clone(),

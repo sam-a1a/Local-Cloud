@@ -2,6 +2,8 @@ package com.ghazaleh.localcloud.engine
 
 import android.content.Context
 import android.net.wifi.WifiManager
+import android.os.Build
+import android.provider.Settings
 import uniffi.localcloud.Engine
 import uniffi.localcloud.EventListener
 import java.io.File
@@ -58,8 +60,51 @@ class EngineHost(context: Context) {
      * process, for the life of the process.
      */
     val engine: Engine by lazy {
-        Engine(baseDir.absolutePath, syncDir.absolutePath)
+        Engine(baseDir.absolutePath, syncDir.absolutePath).also(::nameOnFirstRun)
     }
+
+    /**
+     * Tells the engine what this phone is called, once.
+     *
+     * The engine has to guess a name from inside Rust, and on Android there is
+     * nothing good to guess from - `whoami` reports "Unknown". Android does know:
+     * the user may have named the device in Settings, and failing that there is
+     * always a model. So the platform supplies it.
+     *
+     * Once, and only once. After the first run the name belongs to whoever last
+     * set it, and re-applying the model on every launch would quietly undo a
+     * rename every time the app restarted.
+     */
+    private fun nameOnFirstRun(engine: Engine) {
+        if (preferences.getBoolean(KEY_NAMED, false)) return
+        runCatching { engine.setDeviceName(platformDeviceName()) }
+            .onSuccess { preferences.edit().putBoolean(KEY_NAMED, true).apply() }
+    }
+
+    /**
+     * The best name Android can offer: the one the owner chose, or the model.
+     */
+    private fun platformDeviceName(): String {
+        val chosen = Settings.Global.getString(
+            appContext.contentResolver,
+            Settings.Global.DEVICE_NAME,
+        )
+        if (!chosen.isNullOrBlank()) return chosen.trim()
+
+        val manufacturer = Build.MANUFACTURER.orEmpty().trim()
+        val model = Build.MODEL.orEmpty().trim()
+        return when {
+            model.isBlank() -> "Android device"
+            manufacturer.isBlank() -> model
+            // "Google Pixel 7", but not "Samsung Samsung Galaxy S24".
+            model.startsWith(manufacturer, ignoreCase = true) -> model
+            else -> "$manufacturer $model"
+        }
+    }
+
+    /** Records that the engine has been given a name, so it is not given one again. */
+    private val preferences =
+        appContext.getSharedPreferences("localcloud", Context.MODE_PRIVATE)
 
     val syncDirPath: String get() = syncDir.absolutePath
 
@@ -110,5 +155,6 @@ class EngineHost(context: Context) {
 
     private companion object {
         const val MULTICAST_LOCK_TAG = "localcloud-mdns"
+        const val KEY_NAMED = "device-named"
     }
 }

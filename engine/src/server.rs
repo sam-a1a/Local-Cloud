@@ -25,7 +25,10 @@ pub struct AppState {
     pub storage_dir: String,
     pub sync_dir: String,
     pub device_id: String,
-    pub device_name: String,
+    /// Shared with the identity rather than copied from it, so that renaming
+    /// the device reaches the running server. A peer that pairs a second after
+    /// a rename is told the new name.
+    pub device_name: Arc<Mutex<String>>,
     pub cert_pem: String,
     pub ignore_set: IgnoreSet,
     pub trust: TrustStore,
@@ -42,7 +45,7 @@ impl AppState {
     fn own_info(&self) -> DeviceInfo {
         DeviceInfo {
             device_id: self.device_id.clone(),
-            name: self.device_name.clone(),
+            name: self.device_name.lock().unwrap().clone(),
             platform: crate::crypto::platform_name().to_string(),
             cert_pem: self.cert_pem.clone(),
         }
@@ -149,7 +152,7 @@ async fn require_paired_peer(
 pub async fn start_server(
     listener: TcpListener,
     device_id: String,
-    device_name: String,
+    device_name: Arc<Mutex<String>>,
     cert_pem: String,
     key_pem: String,
     db: Arc<Mutex<Database>>,

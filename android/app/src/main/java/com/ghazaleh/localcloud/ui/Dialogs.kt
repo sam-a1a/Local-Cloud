@@ -233,3 +233,49 @@ fun CollisionDialog(
         },
     )
 }
+
+/**
+ * Renaming this device.
+ *
+ * Worth having a screen for, rather than leaving the name to whatever the
+ * platform reported: it is the only thing about this device that other people
+ * see, and on a mesh of three phones "Pixel 7" twice is not a name at all.
+ */
+@Composable
+fun RenameDialog(
+    draft: RenameDraft,
+    onType: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Name this device") },
+        text = {
+            Column {
+                Text(
+                    text = "This is what other devices call it, when they see it on the " +
+                        "network and when they list who holds a file.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                OutlinedTextField(
+                    value = draft.text,
+                    onValueChange = onType,
+                    singleLine = true,
+                    enabled = !draft.busy,
+                    label = { Text("Name") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 16.dp),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onSubmit,
+                enabled = draft.text.isNotBlank() && !draft.busy,
+            ) { Text("Rename") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}

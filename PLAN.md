@@ -17,18 +17,19 @@ on one Wi-Fi, finding each other.
 | `engine/` | 6,760 lines. The whole model, the server, discovery, storage, FFI. |
 | `cli/` | 372 lines. A prompt for driving one device — the test harness. |
 | `android/` | The app. Compose, three screens, every one of them the engine's own idea. |
-| tests | 115 across 6 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. |
+| tests | 121 across 7 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. |
 | dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
 
 Test suites, and what each is for:
 
-- **`localcloud` (52)** — units: chunking, hashing, the database and its
-  migrations, pairing proofs, collision tie-breaks, address ranking.
+- **`localcloud` (57)** — units: chunking, hashing, the database and its
+  migrations, pairing proofs, collision tie-breaks, address ranking, and what a
+  device is allowed to call itself.
 - **`indexing` (27)** — the `Indexer` driven directly: collisions, renames on
   disk, deletion, trash and its retention.
 - **`sync_e2e` (10)** — two live devices over real mutually authenticated TLS,
   exchanging catalogs.
-- **`api_errors` (10)** — which misuse produces which typed error. The contract
+- **`api_errors` (11)** — which misuse produces which typed error. The contract
   an app binds against.
 - **`pairing_e2e` (9)** — the 6-digit exchange over a real listener, plus what a
   paired device is still not allowed to do.
@@ -56,6 +57,12 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
 - **A CLI that can pair**, which is what makes the device test possible at all.
 - **An Android app**, in `android/`, which is the first thing to consume those
   bindings — and the first proof the engine runs anywhere but a desktop.
+- **A device can be named.** `set_device_name` crosses the FFI, so a platform
+  that knows better than Rust does can say so. The name is the one mutable part
+  of an identity, so it is the one part behind a lock: the running server shares
+  it rather than holding a copy, and renaming re-announces over mDNS instead of
+  waiting for a restart. Renaming does not mint a new identity, which is what
+  the test asserts.
 
 Bugs found and fixed along the way, each by a test written for something else:
 
@@ -125,14 +132,11 @@ What the first consumer found, which is what a first consumer is for:
   Kotlin as `deviceId=7f3a…` rather than as "That device is not visible on the
   network". The variants were the point and they survive; the app supplies the
   English. Worth knowing before writing the iOS one.
-- **An Android device is called "Unknown".** `whoami::devicename()` does not
-  fail there, it succeeds with that literal string, so the "Unnamed Android"
-  fallback never fires. `DeviceIdentity::set_device_name` exists and is not
-  exposed, and exposing it is not a one-liner: `identity` is a plain field on
-  `Engine`, read by `start`, pairing and discovery, so making it settable means
-  putting it behind a lock. The alternative is for the engine to read
-  `ro.product.model` itself. **Undecided, and it blocks nothing but reads badly
-  on the one screen where devices are named.**
+- **An Android device called itself "Unknown".** `whoami::devicename()` does not
+  fail there — it succeeds, with that literal string, so the "Unnamed Android"
+  fallback never fired. Fixed on both sides: placeholder names are now treated
+  as the absence they are, and `set_device_name` is exposed, so the app hands
+  the engine the name Android actually knows. See below.
 
 Still app-side rather than engine-side: an iOS Files provider extension, the iOS
 multicast entitlement, and a foreground service if Android is ever to sync while

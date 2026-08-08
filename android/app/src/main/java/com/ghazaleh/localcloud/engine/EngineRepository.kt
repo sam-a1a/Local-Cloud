@@ -252,6 +252,9 @@ class EngineRepository(
         attempt { it.unpair(deviceId) }
     }
 
+    suspend fun rename(name: String): Boolean =
+        attempt { it.setDeviceName(name) } != null
+
     suspend fun restore(fileId: String) {
         attempt { it.restoreFile(fileId) }
     }
