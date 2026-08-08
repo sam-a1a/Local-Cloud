@@ -1,10 +1,13 @@
 # Where we are
 
-The engine is done, and it now has a consumer. An Android app drives it through
-the Kotlin bindings, builds the engine and those bindings as part of an ordinary
-Gradle build, and runs — the engine starts on a phone, mints an identity, and
-reports itself discoverable. What is left is the network: two physical devices
-on one Wi-Fi, finding each other.
+The engine is done and it has a consumer. An Android app drives it through the
+Kotlin bindings, builds the engine and those bindings as part of an ordinary
+Gradle build, pairs, transfers, and keeps syncing with the screen off. All of it
+has been run on a phone.
+
+**None of it has been run on two phones.** Every figure and every claim about
+discovery still comes from processes talking to each other on one machine over
+loopback. That is the next thing, and it has been the next thing for a while.
 
 `DESIGN.md` is the design and the reasoning. This is the status.
 
@@ -14,9 +17,9 @@ on one Wi-Fi, finding each other.
 
 | | |
 |---|---|
-| `engine/` | 6,760 lines. The whole model, the server, discovery, storage, FFI. |
+| `engine/` | 6,999 lines. The whole model, the server, discovery, storage, FFI. |
 | `cli/` | 372 lines. A prompt for driving one device — the test harness. |
-| `android/` | The app. Compose, three screens, every one of them the engine's own idea. |
+| `android/` | 3,541 lines of Kotlin. Compose, three screens, a foreground service. |
 | tests | 121 Rust across 7 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. 7 Kotlin, on the line the background notification shows. |
 | dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
 
@@ -81,38 +84,81 @@ Bugs found and fixed along the way, each by a test written for something else:
 
 ---
 
-## Next: two physical devices
+## What to do next
 
-Nothing blocks this. Build the CLI on two machines on the same network, point
-each at its own directory, and:
+In order. The first one is not optional and everything below it is worth less
+until it is done.
+
+### 1. Two devices on one Wi-Fi
+
+The Mac running `cli`, the phone running the app. Nothing blocks it and no code
+is needed.
 
 ```
-> devices                     # each should see the other
+# on the Mac
+cargo run -p cli
+> devices                     # the phone should appear
 > pair <id>                   # shows a 6-digit code
-> accept <id> <code>          # on the other machine
+# on the phone: Devices → Pair → type the code
 > import ~/some/video.mp4
 > share video.mp4 <id>        # watch the progress lines
 > ls                          # both devices listed as holders
 ```
 
-Then compare checksums. This is exactly the flow already driven between two
-instances on one machine, so what is being tested is the network, not the logic.
+Then compare checksums, and repeat it with the phone locked and background
+syncing on — that path is the one nothing has ever exercised across a network.
 
-**What it is there to find**, all of it currently unproven:
+**What it is there to find**, all of it still unproven:
 
-1. **Discovery across machines.** It has only ever run as two processes on one
-   host. This is the single highest-risk assumption in the project.
-2. **Real-network throughput.** Every figure so far is loopback, which has no
-   round-trip latency — the exact thing the block size and concurrency address.
-3. **Whether a 30s catalog delay is tolerable** in practice, or wants the
-   notification described in §14.
+1. **Discovery across machines.** mDNS has only ever run as two processes on one
+   host. Still the single highest-risk assumption in the project, and the one
+   that has already produced one bug — advertising on the wrong interface.
+2. **Real-network throughput.** Every figure in this file is loopback, which has
+   no round-trip latency. Latency is the exact thing 1 MiB blocks and eight in
+   flight exist to hide, so these numbers are the ones that have never been
+   tested against the problem they solve.
+3. **Whether 30 seconds is tolerable** in practice, or whether the change
+   notification in §14 stops being optional.
 
-One of the two can now be the phone, and it no longer has to be sitting there
-unlocked with the app open: the multicast lock is held whenever the engine runs,
-and a foreground service can keep it running with the screen off. The Android
-half of "mobile discovery is a separate question" has been answered as far as it
-can be without a second machine. iOS still needs its entitlement, and still has
-no app.
+### 2. Let a file back out of the app
+
+The app can receive a file and then do nothing with it. Received files land in
+app-private storage, and there is no open, no export, no share sheet out — so a
+photo sent from the Mac arrives on the phone and cannot be looked at.
+
+This is the largest hole in the app and it is not an engine problem. It wants a
+`FileProvider`, an `ACTION_VIEW` for opening and an `ACTION_SEND` for passing a
+file on.
+
+### 3. Accept a file from the share sheet
+
+§8 of DESIGN.md says an item is added on mobile by "share sheet or Add button".
+Only the button exists. `import_file` was written for exactly this — its doc
+comment says so — and the app declares no `ACTION_SEND` filter to receive one.
+
+Together, 2 and 3 are what make the app usable by someone who is not testing it.
+
+### 4. iOS
+
+The Swift bindings have existed since `1152c24` and nothing has ever compiled
+against them. Android was the first consumer and found three things in an
+afternoon; the second will find more.
+
+Start the multicast entitlement early — `com.apple.developer.networking.multicast`
+is granted by Apple on request, not by ticking a box, and without it iOS
+discovery finds nothing in exactly the way Android did without its lock.
+
+### 5. Before anyone else runs this
+
+Not needed to keep building, needed before it leaves your own network:
+
+- **SPAKE2 pairing.** Six digits are brute-forceable offline from a captured
+  proof. Fine at home, not on a shared network.
+- **Blocks encrypted at rest**, and a certificate rotation path — there is still
+  none, and the remedy for an exposed key is still to unpair everything.
+- **Release build.** `optimization { enable = false }`, no signing config, and a
+  48 MB debug APK carrying two ABIs. An app bundle and per-ABI splits are the
+  fix, and none of it matters until 1 is done.
 
 ---
 
@@ -170,8 +216,10 @@ Three limits worth knowing before relying on it:
   service to be started from `BOOT_COMPLETED`, so the switch stays on and the
   service comes back the next time the app is opened. Deliberate, not missing.
 
-Still app-side and still undone: an iOS Files provider extension and the iOS
-multicast entitlement. iOS has no app at all yet.
+What the app still cannot do, in its own words: open a file it has received,
+accept one from the share sheet, or survive a reboot with background syncing
+still on. The first two are items 2 and 3 above; the third is Android's rule,
+not an omission.
 
 ---
 
