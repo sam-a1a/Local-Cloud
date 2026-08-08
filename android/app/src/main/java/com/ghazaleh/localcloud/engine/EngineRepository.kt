@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import uniffi.localcloud.CollisionResolution
 import uniffi.localcloud.Engine
@@ -106,8 +108,45 @@ class EngineRepository(
         }
     }
 
-    /** Foreground: discovery, the server, and replication all come up. */
-    suspend fun resume() {
+    /**
+     * Why the engine is running, if it is.
+     *
+     * There is more than one answer now, and they overlap: a screen is open, or
+     * a foreground service is holding the device on the mesh, or both at once
+     * while someone watches a transfer and then locks the phone. Counting the
+     * reasons rather than tracking a single "running" flag is what stops the
+     * common sequence - service starts, app is backgrounded a moment later -
+     * from stopping an engine that something else still needs.
+     */
+    enum class RunReason { Foreground, BackgroundService }
+
+    private val reasons = HashSet<RunReason>()
+
+    /**
+     * Serialises the transitions, not just the set.
+     *
+     * `host.start()` binds a listener and registers with mDNS, and `stop()`
+     * tears both down; two of those interleaving would leave the engine
+     * half-started. The lock is held across the whole transition so a start and
+     * a stop can never overlap.
+     */
+    private val lifecycle = Mutex()
+
+    /** Something needs the engine running. Starts it if nothing else did. */
+    suspend fun engineNeededBy(reason: RunReason) {
+        lifecycle.withLock {
+            if (reasons.add(reason) && reasons.size == 1) startEngine()
+        }
+    }
+
+    /** Something no longer does. Stops it if it was the last reason. */
+    suspend fun engineNoLongerNeededBy(reason: RunReason) {
+        lifecycle.withLock {
+            if (reasons.remove(reason) && reasons.isEmpty()) stopEngine()
+        }
+    }
+
+    private suspend fun startEngine() {
         withContext(Dispatchers.IO) {
             try {
                 host.start()
@@ -120,8 +159,7 @@ class EngineRepository(
         }
     }
 
-    /** Background: stop, and give the multicast lock back. */
-    suspend fun pause() {
+    private suspend fun stopEngine() {
         withContext(Dispatchers.IO) {
             polling = false
             runCatching { host.stop() }

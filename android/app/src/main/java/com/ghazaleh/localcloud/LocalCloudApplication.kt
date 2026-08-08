@@ -19,13 +19,11 @@ import kotlinx.coroutines.launch
  * block store and a tokio runtime, and rebuilding all of that because the phone
  * was rotated would be absurd. One per process, created here.
  *
- * **The engine runs while the app is in the foreground and not otherwise.** It
- * is bound to the process lifecycle, so it comes up when any screen is visible
- * and goes down when the last one leaves. That is a real limitation and worth
- * being clear about: with the app closed, this device is invisible to the mesh
- * and nothing arrives. A foreground service would change that, and is the next
- * decision rather than an oversight - the app is deliberately being proven on
- * real hardware first, where discovery working at all is still an assumption.
+ * **The engine runs while anything needs it to.** An open screen is one such
+ * reason and is registered here; a foreground service is the other. They
+ * overlap constantly - watching a transfer and then locking the phone - so the
+ * repository counts reasons rather than being told to start and stop, and the
+ * engine only goes down when the last one is withdrawn.
  */
 class LocalCloudApplication : Application() {
 
@@ -50,14 +48,20 @@ class LocalCloudApplication : Application() {
         repository = EngineRepository(EngineHost(this), engineScope)
         repository.begin()
 
+        // An open screen is one reason to run the engine. It is no longer the
+        // only one, so this says so rather than starting and stopping outright.
         ProcessLifecycleOwner.get().lifecycle.addObserver(
             object : DefaultLifecycleObserver {
                 override fun onStart(owner: LifecycleOwner) {
-                    engineScope.launch { repository.resume() }
+                    engineScope.launch {
+                        repository.engineNeededBy(EngineRepository.RunReason.Foreground)
+                    }
                 }
 
                 override fun onStop(owner: LifecycleOwner) {
-                    engineScope.launch { repository.pause() }
+                    engineScope.launch {
+                        repository.engineNoLongerNeededBy(EngineRepository.RunReason.Foreground)
+                    }
                 }
             }
         )
