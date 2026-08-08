@@ -106,6 +106,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * The catalog said this device holds it and the disk disagreed.
+     *
+     * Rare, and worth a sentence rather than silence: it means the copy went
+     * away without the engine being told, which is not something the app can
+     * fix but is something a person should know before they go looking.
+     */
+    fun reportFileUnavailable(name: String) {
+        repository.report("“$name” is not on this device any more.", failure = true)
+    }
+
     fun beginSharing(item: Item) {
         _sharing.value = item
     }

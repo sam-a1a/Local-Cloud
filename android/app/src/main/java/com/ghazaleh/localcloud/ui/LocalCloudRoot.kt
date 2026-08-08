@@ -1,6 +1,8 @@
 package com.ghazaleh.localcloud.ui
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -42,6 +44,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.ghazaleh.localcloud.engine.Item
+import com.ghazaleh.localcloud.files.OutgoingFiles
 import com.ghazaleh.localcloud.service.SyncService
 import com.ghazaleh.localcloud.ui.components.EmptyState
 import com.ghazaleh.localcloud.ui.components.StatusDot
@@ -49,6 +53,7 @@ import com.ghazaleh.localcloud.ui.devices.DevicesScreen
 import com.ghazaleh.localcloud.ui.files.FilesScreen
 import com.ghazaleh.localcloud.ui.icons.LocalCloudIcons
 import com.ghazaleh.localcloud.ui.trash.TrashScreen
+import java.io.File
 
 private enum class Tab(val label: String, val icon: ImageVector) {
     Files("Files", LocalCloudIcons.Files),
@@ -208,6 +213,7 @@ fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
                     Tab.Files -> FilesScreen(
                         state = state,
                         transfers = transfers,
+                        onOpen = openWith(context, viewModel, OutgoingFiles::viewIntent, "Open"),
                         onShare = viewModel::beginSharing,
                         onPull = viewModel::pull,
                         onDeleteHere = viewModel::deleteHere,
@@ -308,3 +314,30 @@ private fun NavigationIcon(
 
 /** Room for the floating button at the bottom of every list. */
 private val ContentInset = PaddingValues(top = 8.dp, bottom = 96.dp)
+
+/**
+ * Hands a file to another app, whatever "hand" means for the intent given.
+ *
+ * Always through a chooser. This app has no business deciding which viewer or
+ * which destination is the right one, and a chooser is also what makes the
+ * no-app-can-do-this case a sentence on screen rather than an exception.
+ */
+private fun openWith(
+    context: Context,
+    viewModel: MainViewModel,
+    intentFor: (Context, File) -> Intent,
+    title: String,
+): (Item) -> Unit = { item ->
+    val path = item.localPath
+    if (path == null) {
+        viewModel.reportFileUnavailable(item.name)
+    } else {
+        runCatching {
+            val file = File(path)
+            check(file.exists()) { "the file is no longer on this device" }
+            context.startActivity(
+                Intent.createChooser(intentFor(context, file), "$title ${item.name}")
+            )
+        }.onFailure { viewModel.reportFileUnavailable(item.name) }
+    }
+}

@@ -52,6 +52,7 @@ import uniffi.localcloud.PendingCollision
 fun FilesScreen(
     state: MeshState,
     transfers: Map<String, Transfer>,
+    onOpen: (Item) -> Unit,
     onShare: (Item) -> Unit,
     onPull: (String) -> Unit,
     onDeleteHere: (String) -> Unit,
@@ -117,6 +118,7 @@ fun FilesScreen(
                     expanded = expandedId == item.id,
                     canSend = canSend,
                     onToggle = { expandedId = if (expandedId == item.id) null else item.id },
+                    onOpen = { onOpen(item) },
                     onShare = { onShare(item) },
                     onPull = { onPull(item.id) },
                     onDeleteHere = { onDeleteHere(item.id) },
@@ -136,6 +138,7 @@ private fun ItemRow(
     expanded: Boolean,
     canSend: Boolean,
     onToggle: () -> Unit,
+    onOpen: () -> Unit,
     onShare: () -> Unit,
     onPull: () -> Unit,
     onDeleteHere: () -> Unit,
@@ -245,6 +248,12 @@ private fun ItemRow(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         if (item.heldHere) {
+                            // First, because it is what a person came for. The
+                            // rest of this row is about moving the file around;
+                            // this is about the file.
+                            TextButton(onClick = onOpen, enabled = item.localPath != null) {
+                                Text("Open")
+                            }
                             TextButton(onClick = onShare, enabled = canSend) {
                                 Text("Send to a device")
                             }
