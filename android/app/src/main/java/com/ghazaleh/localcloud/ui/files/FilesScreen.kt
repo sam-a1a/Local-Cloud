@@ -155,6 +155,11 @@ private fun ItemRow(
 
     Card(
         modifier = modifier
+            // A Card sizes to its content, and the content here is a filename.
+            // Without this the whole row is as wide as the name it holds, which
+            // makes the holder chips look like a caption rather than a row and
+            // leaves most of the card unclickable.
+            .fillMaxWidth()
             .clickable(onClick = onToggle)
             .animateContentSize(),
         shape = RoundedCornerShape(16.dp),
