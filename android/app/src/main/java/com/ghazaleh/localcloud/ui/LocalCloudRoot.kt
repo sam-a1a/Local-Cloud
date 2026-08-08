@@ -214,6 +214,12 @@ fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
                         state = state,
                         transfers = transfers,
                         onOpen = openWith(context, viewModel, OutgoingFiles::viewIntent, "Open"),
+                        onSendElsewhere = openWith(
+                            context,
+                            viewModel,
+                            OutgoingFiles::sendIntent,
+                            "Send",
+                        ),
                         onShare = viewModel::beginSharing,
                         onPull = viewModel::pull,
                         onDeleteHere = viewModel::deleteHere,

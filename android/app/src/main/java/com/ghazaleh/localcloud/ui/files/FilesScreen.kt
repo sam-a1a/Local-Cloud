@@ -5,6 +5,8 @@ import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -53,6 +55,7 @@ fun FilesScreen(
     state: MeshState,
     transfers: Map<String, Transfer>,
     onOpen: (Item) -> Unit,
+    onSendElsewhere: (Item) -> Unit,
     onShare: (Item) -> Unit,
     onPull: (String) -> Unit,
     onDeleteHere: (String) -> Unit,
@@ -119,6 +122,7 @@ fun FilesScreen(
                     canSend = canSend,
                     onToggle = { expandedId = if (expandedId == item.id) null else item.id },
                     onOpen = { onOpen(item) },
+                    onSendElsewhere = { onSendElsewhere(item) },
                     onShare = { onShare(item) },
                     onPull = { onPull(item.id) },
                     onDeleteHere = { onDeleteHere(item.id) },
@@ -130,6 +134,7 @@ fun FilesScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ItemRow(
     item: Item,
@@ -139,6 +144,7 @@ private fun ItemRow(
     canSend: Boolean,
     onToggle: () -> Unit,
     onOpen: () -> Unit,
+    onSendElsewhere: () -> Unit,
     onShare: () -> Unit,
     onPull: () -> Unit,
     onDeleteHere: () -> Unit,
@@ -243,7 +249,10 @@ private fun ItemRow(
                         }
                     }
 
-                    Row(
+                    // Wraps rather than clips. Three actions do not fit on one
+                    // line on a narrow phone, and a button half off the edge of
+                    // a card is worse than a button on the next line.
+                    FlowRow(
                         modifier = Modifier.padding(top = 4.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
@@ -256,6 +265,17 @@ private fun ItemRow(
                             }
                             TextButton(onClick = onShare, enabled = canSend) {
                                 Text("Send to a device")
+                            }
+                            // Deliberately worded to contrast with the line
+                            // above. One sends a copy into the mesh, where it
+                            // is still tracked; this hands it to something
+                            // outside, after which it is not this app's any
+                            // more.
+                            TextButton(
+                                onClick = onSendElsewhere,
+                                enabled = item.localPath != null,
+                            ) {
+                                Text("Send to an app")
                             }
                         } else {
                             TextButton(
