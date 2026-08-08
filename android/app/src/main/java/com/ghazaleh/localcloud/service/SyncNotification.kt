@@ -29,6 +29,9 @@ object SyncNotification {
     /** Stable, because updating the notification means posting this id again. */
     const val ID = 1
 
+    /** A separate id, so this outlives the ongoing one it replaces. */
+    const val ID_STOPPED = 2
+
     fun ensureChannel(context: Context) {
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -69,6 +72,25 @@ object SyncNotification {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setShowWhen(false)
+            .build()
+
+    /**
+     * Said once, when background syncing stops without being asked to.
+     *
+     * Dismissable and not ongoing, unlike the one above: the service it would
+     * belong to is gone. It exists because the alternative is a device that
+     * quietly stopped syncing hours ago and gave no sign of it.
+     */
+    fun buildStopped(context: Context, text: String): Notification =
+        NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_localcloud)
+            .setContentTitle("Background syncing stopped")
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setContentIntent(openTheApp(context))
+            .setAutoCancel(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
     /**

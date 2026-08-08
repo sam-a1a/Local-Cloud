@@ -97,6 +97,39 @@ class SyncService : Service() {
             .launchIn(scope)
     }
 
+    /**
+     * Android 15 caps a `dataSync` service at six hours in any twenty-four, and
+     * this is how it says the six hours are up.
+     *
+     * Not optional and not survivable: the system gives a short grace period and
+     * then treats a service that has not stopped as misbehaving. So this stops,
+     * and turns the setting off - leaving it on would show a switch claiming a
+     * device is syncing that the system will not let sync until tomorrow.
+     *
+     * Both overloads exist because the platform added the second one later and
+     * calls whichever it has. `minSdk` is 34, where neither is ever called.
+     */
+    override fun onTimeout(startId: Int) = standDown(EXHAUSTED)
+
+    override fun onTimeout(startId: Int, fgsType: Int) = standDown(EXHAUSTED)
+
+    /**
+     * Stops for a reason that was not a person asking, and says so.
+     *
+     * A snackbar would be no use here - the app is closed, which is the whole
+     * point of the service - so this leaves a notification behind instead.
+     */
+    private fun standDown(reason: String) {
+        app().preferences.setBackgroundSync(false)
+
+        val manager = NotificationManagerCompat.from(this)
+        if (manager.areNotificationsEnabled()) {
+            runCatching { manager.notify(SyncNotification.ID_STOPPED, SyncNotification.buildStopped(this, reason)) }
+        }
+        Log.i(TAG, "Standing down: $reason")
+        stopSelf()
+    }
+
     override fun onDestroy() {
         scope.cancel()
         // Handed to the application's scope rather than one of the service's
@@ -131,6 +164,10 @@ class SyncService : Service() {
         }
 
         const val ACTION_STOP = "com.ghazaleh.localcloud.STOP_BACKGROUND_SYNC"
+
+        private const val EXHAUSTED =
+            "Android allows about six hours of background syncing a day, and today's is used up. " +
+                "Open LocalCloud to keep syncing, or switch it back on tomorrow."
 
         private const val TAG = "SyncService"
     }
