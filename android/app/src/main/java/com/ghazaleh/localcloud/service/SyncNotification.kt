@@ -52,6 +52,16 @@ object SyncNotification {
             .setContentTitle("LocalCloud")
             .setContentText(text)
             .setContentIntent(openTheApp(context))
+            // Switching this off has to be possible from where it is visible.
+            // Sending someone into the app to find a switch, in order to stop
+            // something they can already see, is a poor answer.
+            .addAction(
+                NotificationCompat.Action.Builder(
+                    R.drawable.ic_stat_localcloud,
+                    "Stop",
+                    stopSyncing(context),
+                ).build()
+            )
             // Ongoing and low priority: it cannot be swiped away while the
             // service runs, and it sorts below anything that wants attention.
             .setOngoing(true)
@@ -60,6 +70,23 @@ object SyncNotification {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setShowWhen(false)
             .build()
+
+    /**
+     * Turns the setting off, rather than only killing the service.
+     *
+     * Stopping the service alone would leave a switch that says background
+     * syncing is on and a device that is not doing it, and the next time the
+     * app opened it would start again — which is not what "Stop" means.
+     */
+    private fun stopSyncing(context: Context): PendingIntent {
+        val intent = Intent(context, SyncService::class.java).setAction(SyncService.ACTION_STOP)
+        return PendingIntent.getService(
+            context,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
 
     private fun openTheApp(context: Context): PendingIntent {
         val intent = Intent(context, MainActivity::class.java)
