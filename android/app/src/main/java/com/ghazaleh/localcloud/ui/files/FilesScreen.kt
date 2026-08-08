@@ -2,7 +2,6 @@ package com.ghazaleh.localcloud.ui.files
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -153,14 +152,19 @@ private fun ItemRow(
 ) {
     val size = rememberFormattedSize(item.size)
 
+    // `onClick` on the Card rather than `Modifier.clickable` on its modifier.
+    // A Material Surface installs its own pointer handler to stop taps falling
+    // through to whatever is behind it, and that handler sits inside the
+    // modifier passed in - so it consumes the tap before an outer `clickable`
+    // ever sees it, and the row silently does nothing. This overload is the
+    // reason the clickable variant exists.
     Card(
+        onClick = onToggle,
         modifier = modifier
             // A Card sizes to its content, and the content here is a filename.
             // Without this the whole row is as wide as the name it holds, which
-            // makes the holder chips look like a caption rather than a row and
-            // leaves most of the card unclickable.
+            // makes the holder chips look like a caption rather than a row.
             .fillMaxWidth()
-            .clickable(onClick = onToggle)
             .animateContentSize(),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
