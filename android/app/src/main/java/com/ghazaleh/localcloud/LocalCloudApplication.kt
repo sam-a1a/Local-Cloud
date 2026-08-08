@@ -53,17 +53,29 @@ class LocalCloudApplication : Application() {
         ProcessLifecycleOwner.get().lifecycle.addObserver(
             object : DefaultLifecycleObserver {
                 override fun onStart(owner: LifecycleOwner) {
-                    engineScope.launch {
-                        repository.engineNeededBy(EngineRepository.RunReason.Foreground)
-                    }
+                    engineNeededBy(EngineRepository.RunReason.Foreground)
                 }
 
                 override fun onStop(owner: LifecycleOwner) {
-                    engineScope.launch {
-                        repository.engineNoLongerNeededBy(EngineRepository.RunReason.Foreground)
-                    }
+                    engineNoLongerNeededBy(EngineRepository.RunReason.Foreground)
                 }
             }
         )
+    }
+
+    /**
+     * Registers a reason on the application's scope.
+     *
+     * Exposed because the foreground service is the other caller, and its own
+     * lifetime is exactly what must not bound this work: a scope cancelled in
+     * `Service.onDestroy` would cancel the call that releases the engine, and
+     * the engine would stay running with nothing left wanting it to.
+     */
+    fun engineNeededBy(reason: EngineRepository.RunReason) {
+        engineScope.launch { repository.engineNeededBy(reason) }
+    }
+
+    fun engineNoLongerNeededBy(reason: EngineRepository.RunReason) {
+        engineScope.launch { repository.engineNoLongerNeededBy(reason) }
     }
 }

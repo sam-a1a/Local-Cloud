@@ -55,6 +55,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            Not exported and not bindable. Being started is the whole
+            instruction, so there is no interface to offer and nothing outside
+            this app has any business starting it.
+        -->
+        <service
+            android:name=".service.SyncService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>
