@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghazaleh.localcloud.LocalCloudApplication
 import com.ghazaleh.localcloud.engine.Item
+import com.ghazaleh.localcloud.engine.describeForUser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -81,28 +82,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * copies again, into the sync folder, which is why the temporary file is
      * deleted immediately afterwards rather than left for the cache to reap.
      */
-    fun importFrom(uri: Uri) {
+    fun importFrom(uri: Uri) = importAll(listOf(uri))
+
+    /**
+     * Brings in everything that arrived at once.
+     *
+     * The share sheet can hand over several files in one go, and importing them
+     * one at a time with a spinner flickering between each would be a poorer
+     * report of the same work. Failures are per file - one unreadable item does
+     * not abandon the rest - and the engine has already said why for each.
+     */
+    fun importAll(uris: List<Uri>) {
+        if (uris.isEmpty()) return
         viewModelScope.launch {
             _importing.value = true
             try {
-                val context = getApplication<Application>()
-                val name = sanitizedName(uri)
-                val staged = withContext(Dispatchers.IO) {
-                    val temporary = File.createTempFile("import", null, context.cacheDir)
-                    context.contentResolver.openInputStream(uri).use { input ->
-                        requireNotNull(input) { "That file could not be opened." }
-                        temporary.outputStream().use(input::copyTo)
-                    }
-                    temporary
-                }
-                try {
-                    repository.importFile(staged.absolutePath, name)
-                } finally {
-                    withContext(Dispatchers.IO) { staged.delete() }
+                val added = uris.count { importOne(it) }
+                if (uris.size > 1) {
+                    repository.report("Added $added of ${uris.size} files.")
                 }
             } finally {
                 _importing.value = false
             }
+        }
+    }
+
+    private suspend fun importOne(uri: Uri): Boolean {
+        val context = getApplication<Application>()
+        val staged = try {
+            withContext(Dispatchers.IO) {
+                val temporary = File.createTempFile("import", null, context.cacheDir)
+                context.contentResolver.openInputStream(uri).use { input ->
+                    requireNotNull(input) { "That file could not be opened." }
+                    temporary.outputStream().use(input::copyTo)
+                }
+                temporary
+            }
+        } catch (t: Throwable) {
+            repository.report(t.describeForUser(), failure = true)
+            return false
+        }
+
+        return try {
+            repository.importFile(staged.absolutePath, sanitizedName(uri))
+        } finally {
+            withContext(Dispatchers.IO) { staged.delete() }
         }
     }
 

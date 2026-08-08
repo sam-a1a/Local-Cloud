@@ -47,12 +47,32 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.LocalCloud"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                §8 of DESIGN.md: on mobile an item is added by the share sheet
+                or the Add button. This is the share sheet, and it is what
+                `import_file` was written for - its doc comment says so.
+
+                `*/*` because the engine has no opinion about formats. It stores
+                bytes and a name, so anything a person can share is something
+                this can hold, and narrowing the filter would only refuse files
+                for no reason.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
 

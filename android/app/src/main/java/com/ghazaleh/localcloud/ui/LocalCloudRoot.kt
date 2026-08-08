@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -72,7 +73,11 @@ private enum class Tab(val label: String, val icon: ImageVector) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
+fun LocalCloudRoot(
+    incoming: List<Uri> = emptyList(),
+    onIncomingTaken: () -> Unit = {},
+    viewModel: MainViewModel = viewModel(),
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val transfers by viewModel.transfers.collectAsStateWithLifecycle()
     val pairing by viewModel.pairing.collectAsStateWithLifecycle()
@@ -124,6 +129,18 @@ fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri -> uri?.let(viewModel::importFrom) }
+
+    // Files handed over by another app. Taken once, and the screen moves to
+    // where they landed - a share that appeared to do nothing because the app
+    // opened on a different tab would be indistinguishable from one that
+    // failed.
+    LaunchedEffect(incoming) {
+        if (incoming.isNotEmpty()) {
+            viewModel.importAll(incoming)
+            tab = Tab.Files
+            onIncomingTaken()
+        }
+    }
 
     Scaffold(
         topBar = {
