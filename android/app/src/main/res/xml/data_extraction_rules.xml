@@ -1,19 +1,15 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    API 31 and above. See backup_rules.xml for the reasoning; it applies to
+    both, and to device-to-device transfer for the same reason it applies to
+    cloud backup - a phone that receives these files without the catalog that
+    records them is holding bytes nothing claims.
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="file" path="sync" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="file" path="sync" />
     </device-transfer>
-    -->
 </data-extraction-rules>

@@ -45,11 +45,28 @@ class EngineHost(
     /**
      * What this device holds, as files.
      *
-     * App-private, so no storage permission is involved and nothing else on the
-     * phone can read the contents of the mesh. Files arrive here by import,
-     * from the share sheet, or by being pushed or pulled from another device.
+     * Still app-private - no storage permission, nothing else on the phone can
+     * read the contents of the mesh - but under `filesDir` rather than beside
+     * the engine's state in `noBackupFilesDir`, and that difference is the
+     * whole reason a received file can be opened at all.
+     *
+     * A `FileProvider` can only grant access to a directory it has been
+     * configured with, and its vocabulary is `files-path`, `cache-path` and the
+     * external ones. There is no tag for `no_backup`. The alternatives were
+     * naming the private data path literally, which differs per user and work
+     * profile, or copying every file to the cache before handing it out, which
+     * for a video means duplicating gigabytes to open one. Moving the directory
+     * costs nothing and both problems disappear.
+     *
+     * Backup is then handled explicitly rather than by location: see
+     * `backup_rules.xml`. The identity and the database stay in
+     * `noBackupFilesDir` regardless, because those must never be restored onto
+     * a second device.
      */
-    private val syncDir = File(appContext.noBackupFilesDir, "sync")
+    private val syncDir = File(appContext.filesDir, "sync")
+
+    /** Where it used to be, for installs that predate the move. */
+    private val formerSyncDir = File(appContext.noBackupFilesDir, "sync")
 
     private val wifiManager: WifiManager? =
         appContext.getSystemService(WifiManager::class.java)
@@ -64,7 +81,28 @@ class EngineHost(
      * process, for the life of the process.
      */
     val engine: Engine by lazy {
+        moveAnyFilesLeftInTheOldPlace()
         Engine(baseDir.absolutePath, syncDir.absolutePath).also(::nameOnFirstRun)
+    }
+
+    /**
+     * Carries files over from the directory this app used to use.
+     *
+     * Before the engine is constructed, so the catalog it reads and the files
+     * on disk describe the same thing. The catalog stores paths relative to the
+     * sync folder, so moving the folder is invisible to it - but only if the
+     * files arrive before it looks.
+     */
+    private fun moveAnyFilesLeftInTheOldPlace() {
+        if (!formerSyncDir.isDirectory) return
+        runCatching {
+            syncDir.mkdirs()
+            formerSyncDir.listFiles()?.forEach { file ->
+                val destination = File(syncDir, file.name)
+                if (!destination.exists()) file.renameTo(destination)
+            }
+            formerSyncDir.delete()
+        }
     }
 
     /**
