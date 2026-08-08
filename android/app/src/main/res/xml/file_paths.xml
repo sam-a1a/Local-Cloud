@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Everything this app is willing to hand to another app, and nothing else.
+
+    One directory: the files this device holds. Not the engine's state, which
+    lives in `no_backup` and is unreachable from here by construction - a
+    FileProvider can only serve paths it is configured with, and this one is
+    configured with a single subdirectory of `files`. The device's private key
+    could not be handed out through this provider even by a bug, because there
+    is no rule that would match it.
+
+    Access is granted per file and per launch, by flag on the Intent. Nothing
+    here is readable by another app until this one names a file and hands it
+    over.
+-->
+<paths>
+    <files-path
+        name="sync"
+        path="sync/" />
+</paths>

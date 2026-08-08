@@ -21,6 +21,7 @@ import uniffi.localcloud.CollisionResolution
 import uniffi.localcloud.Engine
 import uniffi.localcloud.EngineEvent
 import uniffi.localcloud.EventListener
+import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -204,17 +205,22 @@ class EngineRepository(
                 // in the same place on every row.
                 .sortedWith(compareByDescending<Holder> { it.isThisDevice }.thenBy { it.name })
 
+        // The engine's own answer, not the app's guess at it.
+        val syncDir = engine.syncDir()
+
         val items = catalog.items
             .filter { it.trashedAt == 0L }
             .map { meta ->
                 val holders = holdersFor(meta.id)
+                val heldHere = holders.any { it.isThisDevice }
                 Item(
                     id = meta.id,
                     name = displayName(meta.path),
                     size = meta.size,
-                    heldHere = holders.any { it.isThisDevice },
+                    heldHere = heldHere,
                     holders = holders,
                     modifiedTime = meta.modifiedTime,
+                    localPath = if (heldHere) File(syncDir, meta.path).path else null,
                 )
             }
             .sortedByDescending { it.modifiedTime }

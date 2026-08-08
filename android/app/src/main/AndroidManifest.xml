@@ -65,6 +65,23 @@
             android:name=".service.SyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!--
+            The one way a file leaves this app.
+
+            Not exported: no other app may query it. Access happens only when
+            this app puts a URI in an Intent with a read grant, one file and one
+            launch at a time, and only for paths named in file_paths.xml.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

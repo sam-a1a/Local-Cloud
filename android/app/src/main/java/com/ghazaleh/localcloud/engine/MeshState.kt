@@ -60,6 +60,15 @@ data class Item(
     val heldHere: Boolean,
     val holders: List<Holder>,
     val modifiedTime: Long,
+    /**
+     * Where the bytes are on this device, or null when they are not.
+     *
+     * Resolved once, here, rather than by every screen that wants to open a
+     * file: the sync folder is the engine's to name, and a composable should
+     * not be joining a directory to a relative path to find out whether it can
+     * offer an Open button.
+     */
+    val localPath: String? = null,
 ) {
     val holderCount: Int get() = holders.size
 
