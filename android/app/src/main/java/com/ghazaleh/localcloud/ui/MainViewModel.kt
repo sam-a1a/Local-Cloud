@@ -30,6 +30,10 @@ import java.io.File
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = (application as LocalCloudApplication).repository
+    private val preferences = (application as LocalCloudApplication).preferences
+
+    /** Whether the person has asked this device to keep syncing with the app closed. */
+    val backgroundSync = preferences.backgroundSync
 
     val state = repository.state
     val transfers = repository.transfers
@@ -200,6 +204,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // -- This device --------------------------------------------------------
+
+    /**
+     * Records the choice. Starting and stopping the service follows from it.
+     *
+     * The setting is what is stored, not the fact of a running service: the
+     * system may kill and restart the service on its own, and the switch should
+     * keep reporting what was asked for rather than flickering with it.
+     */
+    fun setBackgroundSync(enabled: Boolean) {
+        preferences.setBackgroundSync(enabled)
+    }
+
+    /**
+     * The switch stays off if the notification was refused.
+     *
+     * The service would run either way — Android does not require the
+     * notification to be *visible*, only posted — and that is exactly the
+     * outcome to refuse: a device syncing with the screen off and nothing
+     * anywhere saying it is.
+     */
+    fun reportNotificationsRefused() {
+        repository.report(
+            "Background syncing needs a notification, so you can see when this device is on the mesh.",
+            failure = true,
+        )
+    }
 
     fun beginRename() {
         _renaming.value = RenameDraft(state.value.thisDevice.name)

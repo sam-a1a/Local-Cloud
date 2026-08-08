@@ -1,5 +1,7 @@
 package com.ghazaleh.localcloud.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -35,9 +37,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.ghazaleh.localcloud.service.SyncService
 import com.ghazaleh.localcloud.ui.components.EmptyState
 import com.ghazaleh.localcloud.ui.components.StatusDot
 import com.ghazaleh.localcloud.ui.devices.DevicesScreen
@@ -70,9 +75,40 @@ fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
     val collision by viewModel.collision.collectAsStateWithLifecycle()
     val importing by viewModel.importing.collectAsStateWithLifecycle()
     val renaming by viewModel.renaming.collectAsStateWithLifecycle()
+    val backgroundSync by viewModel.backgroundSync.collectAsStateWithLifecycle()
 
     var tab by rememberSaveable { mutableStateOf(Tab.Files) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val context = LocalContext.current
+
+    // The service is kept to match the setting rather than being toggled
+    // alongside it. Driving it from here also means it is only ever started
+    // with a screen present, which is the one condition Android imposes on
+    // starting a foreground service at all.
+    LaunchedEffect(backgroundSync) {
+        if (backgroundSync) SyncService.start(context) else SyncService.stop(context)
+    }
+
+    val askToNotify = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.setBackgroundSync(true) else viewModel.reportNotificationsRefused()
+    }
+
+    val onBackgroundSyncChange: (Boolean) -> Unit = { wanted ->
+        val allowed = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+
+        when {
+            !wanted -> viewModel.setBackgroundSync(false)
+            allowed -> viewModel.setBackgroundSync(true)
+            // Asked before anything starts, so the switch never lands on a
+            // device that is syncing invisibly.
+            else -> askToNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     LaunchedEffect(Unit) {
         viewModel.notices.collect { notice ->
@@ -186,6 +222,8 @@ fun LocalCloudRoot(viewModel: MainViewModel = viewModel()) {
                         onOpenOffer = viewModel::openOffer,
                         onUnpair = viewModel::unpair,
                         onRename = viewModel::beginRename,
+                        backgroundSync = backgroundSync,
+                        onBackgroundSyncChange = onBackgroundSyncChange,
                         contentPadding = ContentInset,
                     )
 

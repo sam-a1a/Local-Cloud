@@ -408,6 +408,17 @@ class EngineRepository(
         _transfers.update { it - Transfer.key(fileId, peerId) }
     }
 
+    /**
+     * For the app to say something in the same place the engine does.
+     *
+     * Not everything worth telling a person comes from the engine — a denied
+     * notification permission is the app's own news — and it should not arrive
+     * somewhere different from everything else.
+     */
+    fun report(text: String, failure: Boolean = false) {
+        announce(text, if (failure) Notice.Kind.Failure else Notice.Kind.Info)
+    }
+
     private fun announce(text: String, kind: Notice.Kind = Notice.Kind.Info) {
         _notices.tryEmit(Notice(text, kind, noticeIds.incrementAndGet()))
     }

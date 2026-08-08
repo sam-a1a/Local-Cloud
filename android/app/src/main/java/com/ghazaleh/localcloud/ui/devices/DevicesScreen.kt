@@ -13,8 +13,10 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -51,6 +53,8 @@ fun DevicesScreen(
     onOpenOffer: (PairingOffer) -> Unit,
     onUnpair: (String) -> Unit,
     onRename: () -> Unit,
+    backgroundSync: Boolean,
+    onBackgroundSyncChange: (Boolean) -> Unit,
     contentPadding: PaddingValues,
     modifier: Modifier = Modifier,
 ) {
@@ -68,7 +72,7 @@ fun DevicesScreen(
         contentPadding = contentPadding,
     ) {
         item(key = "this-device") {
-            ThisDeviceCard(state, onRename)
+            ThisDeviceCard(state, onRename, backgroundSync, onBackgroundSyncChange)
         }
 
         if (state.offers.isNotEmpty()) {
@@ -165,7 +169,12 @@ fun DevicesScreen(
 }
 
 @Composable
-private fun ThisDeviceCard(state: MeshState, onRename: () -> Unit) {
+private fun ThisDeviceCard(
+    state: MeshState,
+    onRename: () -> Unit,
+    backgroundSync: Boolean,
+    onBackgroundSyncChange: (Boolean) -> Unit,
+) {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -212,6 +221,35 @@ private fun ThisDeviceCard(state: MeshState, onRename: () -> Unit) {
                 style = IdentifierStyle,
                 modifier = Modifier.padding(top = 8.dp),
             )
+
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 16.dp),
+                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f),
+            )
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Keep syncing with the app closed",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        text = if (backgroundSync) {
+                            "This device stays on the mesh and can receive files. " +
+                                "It shows a notification while it does."
+                        } else {
+                            "This device is only on the mesh while this app is open."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+                Switch(
+                    checked = backgroundSync,
+                    onCheckedChange = onBackgroundSyncChange,
+                    modifier = Modifier.padding(start = 12.dp),
+                )
+            }
         }
     }
 }

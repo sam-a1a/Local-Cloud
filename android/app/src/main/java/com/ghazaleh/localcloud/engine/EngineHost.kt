@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.provider.Settings
+import com.ghazaleh.localcloud.Preferences
 import uniffi.localcloud.Engine
 import uniffi.localcloud.EventListener
 import java.io.File
@@ -20,7 +21,10 @@ import java.io.File
  * returns nothing, forever, on a network where every other device can see each
  * other. It is the single most likely reason for "no devices found".
  */
-class EngineHost(context: Context) {
+class EngineHost(
+    context: Context,
+    private val preferences: Preferences,
+) {
 
     private val appContext = context.applicationContext
 
@@ -76,9 +80,9 @@ class EngineHost(context: Context) {
      * rename every time the app restarted.
      */
     private fun nameOnFirstRun(engine: Engine) {
-        if (preferences.getBoolean(KEY_NAMED, false)) return
+        if (preferences.deviceHasBeenNamed) return
         runCatching { engine.setDeviceName(platformDeviceName()) }
-            .onSuccess { preferences.edit().putBoolean(KEY_NAMED, true).apply() }
+            .onSuccess { preferences.deviceHasBeenNamed = true }
     }
 
     /**
@@ -101,10 +105,6 @@ class EngineHost(context: Context) {
             else -> "$manufacturer $model"
         }
     }
-
-    /** Records that the engine has been given a name, so it is not given one again. */
-    private val preferences =
-        appContext.getSharedPreferences("localcloud", Context.MODE_PRIVATE)
 
     val syncDirPath: String get() = syncDir.absolutePath
 
@@ -155,6 +155,5 @@ class EngineHost(context: Context) {
 
     private companion object {
         const val MULTICAST_LOCK_TAG = "localcloud-mdns"
-        const val KEY_NAMED = "device-named"
     }
 }

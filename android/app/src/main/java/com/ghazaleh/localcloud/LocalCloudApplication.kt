@@ -37,15 +37,20 @@ class LocalCloudApplication : Application() {
     lateinit var repository: EngineRepository
         private set
 
+    lateinit var preferences: Preferences
+        private set
+
     override fun onCreate() {
         super.onCreate()
+
+        preferences = Preferences(this)
 
         // Registered once, for the life of the install. Creating a channel that
         // already exists updates it rather than duplicating it, so this is also
         // how its wording stays current.
         SyncNotification.ensureChannel(this)
 
-        repository = EngineRepository(EngineHost(this), engineScope)
+        repository = EngineRepository(EngineHost(this, preferences), engineScope)
         repository.begin()
 
         // An open screen is one reason to run the engine. It is no longer the
