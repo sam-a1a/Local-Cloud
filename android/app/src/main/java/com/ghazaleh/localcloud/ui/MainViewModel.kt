@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.ghazaleh.localcloud.LocalCloudApplication
 import com.ghazaleh.localcloud.engine.Item
 import com.ghazaleh.localcloud.engine.describeForUser
+import com.ghazaleh.localcloud.files.sanitiseFileName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -295,6 +296,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _renaming.value = null
     }
 
+    /**
+     * What the file should be called, asked of the provider that supplied it.
+     *
+     * The display name is what the sending app calls the file; the last path
+     * segment is the fallback for providers that offer no name at all. Cleaning
+     * it is [sanitiseFileName]'s job and is tested separately.
+     */
     private fun sanitizedName(uri: Uri): String {
         val fromProvider = getApplication<Application>().contentResolver
             .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
@@ -302,22 +310,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
             }
 
-        // The engine refuses a name that is empty, hidden, or a path in
-        // disguise, and it is right to - but a rejected import is a poor way to
-        // find that out, so the few characters it objects to are dealt with
-        // here instead.
-        val candidate = (fromProvider ?: uri.lastPathSegment.orEmpty())
-            .substringAfterLast('/')
-            .substringAfterLast('\\')
-            .trim()
-            .trimStart('.')
-
-        return candidate.ifBlank { FALLBACK_NAME }
+        return sanitiseFileName(fromProvider ?: uri.lastPathSegment)
     }
 
     private companion object {
         const val CODE_LENGTH = 6
-        const val FALLBACK_NAME = "Imported file"
 
         /** What the engine accepts, so the field cannot offer what it will refuse. */
         const val MAX_NAME_CHARS = 64
