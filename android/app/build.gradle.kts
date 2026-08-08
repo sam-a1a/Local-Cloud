@@ -188,4 +188,6 @@ dependencies {
     // libjnidispatch.so for each Android ABI, without which the generated
     // bindings cannot reach the engine at all.
     implementation(variantOf(libs.jna) { artifactType("aar") })
+
+    testImplementation(libs.junit)
 }

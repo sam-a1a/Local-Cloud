@@ -200,7 +200,7 @@ class SyncService : Service() {
  * Deliberately about the mesh rather than about the app. "On the mesh with 2
  * devices" is a reason for this to be running; "Running" is not.
  */
-private fun summarise(state: MeshState, transfers: Map<String, Transfer>): String {
+internal fun summarise(state: MeshState, transfers: Map<String, Transfer>): String {
     val sending = transfers.values.count { it.direction == Transfer.Direction.Sending }
     val receiving = transfers.values.count { it.direction == Transfer.Direction.Receiving }
     val nearby = state.reachable.size
