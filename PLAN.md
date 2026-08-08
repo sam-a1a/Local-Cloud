@@ -20,7 +20,7 @@ loopback. That is the next thing, and it has been the next thing for a while.
 | `engine/` | 6,999 lines. The whole model, the server, discovery, storage, FFI. |
 | `cli/` | 372 lines. A prompt for driving one device — the test harness. |
 | `android/` | 3,541 lines of Kotlin. Compose, three screens, a foreground service. |
-| tests | 121 Rust across 7 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. 7 Kotlin, on the line the background notification shows. |
+| tests | 121 Rust across 7 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. 14 Kotlin: the background notification's line, and names arriving from other apps. |
 | dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
 
 Test suites, and what each is for:
@@ -60,6 +60,9 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
 - **A CLI that can pair**, which is what makes the device test possible at all.
 - **An Android app**, in `android/`, which is the first thing to consume those
   bindings — and the first proof the engine runs anywhere but a desktop.
+- **Files go both ways.** Open a received file, pass it to another app, or
+  accept one from the share sheet — §8's "share sheet or Add button", which
+  until now was only the button.
 - **Syncing with the app closed**, behind a switch that is off until asked for.
   A foreground service holds the engine up with no screen on, and the engine
   runs while anything needs it rather than while a screen is open.
@@ -120,25 +123,7 @@ syncing on — that path is the one nothing has ever exercised across a network.
 3. **Whether 30 seconds is tolerable** in practice, or whether the change
    notification in §14 stops being optional.
 
-### 2. Let a file back out of the app
-
-The app can receive a file and then do nothing with it. Received files land in
-app-private storage, and there is no open, no export, no share sheet out — so a
-photo sent from the Mac arrives on the phone and cannot be looked at.
-
-This is the largest hole in the app and it is not an engine problem. It wants a
-`FileProvider`, an `ACTION_VIEW` for opening and an `ACTION_SEND` for passing a
-file on.
-
-### 3. Accept a file from the share sheet
-
-§8 of DESIGN.md says an item is added on mobile by "share sheet or Add button".
-Only the button exists. `import_file` was written for exactly this — its doc
-comment says so — and the app declares no `ACTION_SEND` filter to receive one.
-
-Together, 2 and 3 are what make the app usable by someone who is not testing it.
-
-### 4. iOS
+### 2. iOS
 
 The Swift bindings have existed since `1152c24` and nothing has ever compiled
 against them. Android was the first consumer and found three things in an
@@ -148,7 +133,7 @@ Start the multicast entitlement early — `com.apple.developer.networking.multic
 is granted by Apple on request, not by ticking a box, and without it iOS
 discovery finds nothing in exactly the way Android did without its lock.
 
-### 5. Before anyone else runs this
+### 3. Before anyone else runs this
 
 Not needed to keep building, needed before it leaves your own network:
 
@@ -216,10 +201,29 @@ Three limits worth knowing before relying on it:
   service to be started from `BOOT_COMPLETED`, so the switch stays on and the
   service comes back the next time the app is opened. Deliberate, not missing.
 
-What the app still cannot do, in its own words: open a file it has received,
-accept one from the share sheet, or survive a reboot with background syncing
-still on. The first two are items 2 and 3 above; the third is Android's rule,
-not an omission.
+### Files go both ways now
+
+A file can be opened, passed to another app, and accepted from the share sheet —
+so the app is usable by someone who is not testing it. Verified on an emulator
+by importing a PNG, opening it in Google Photos, sharing it back into LocalCloud
+from the system share sheet, and watching the engine number the second copy
+`mesh-test 1.png` under the §7 collision rule.
+
+Received files moved from `noBackupFilesDir` to `filesDir/sync` to make that
+possible: a `FileProvider` has no vocabulary for `no_backup`, and the
+alternatives were naming the private data path literally or copying every file
+to the cache before handing it out. Backup exclusion is now a rule rather than a
+side effect of location, which is better because the reasoning is written down.
+
+Running it found two things a build never would. The catalog rows were as wide
+as their filenames, because a Card sizes to its content and every screenshot
+until then had been of an empty catalog. And no row had ever expanded, because
+`Modifier.clickable` on a Card is swallowed by the Surface's own pointer handler
+— silently, with no error, which is why it survived being written, reviewed and
+shipped.
+
+Still not possible: surviving a reboot with background syncing on. That is
+Android's rule, not an omission.
 
 ---
 
