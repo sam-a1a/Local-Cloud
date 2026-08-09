@@ -21,3 +21,8 @@ DerivedData/
 # The engine, built for the Mac, and the Swift generated from it. Build output
 # of the Rust, same as android/'s - see macos/build-engine.sh.
 macos/Generated/
+
+# The page's dependencies and its build output. `npm install && npm run build`
+# in web/ui produces both, and the server reads dist/ at startup.
+node_modules/
+web/ui/dist/

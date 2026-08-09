@@ -1,0 +1,25 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine = { path = "../engine" }
+
+# Already the engine's own HTTP stack, so hosting a second server costs nothing
+# that was not being paid for.
+axum = "0.8.9"
+
+# Deliberately not `full`. This process has one runtime and a short list of
+# things to do with it.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync", "time"] }
+
+# `ReaderStream`, so downloading a file does not mean holding it in memory.
+tokio-util = { version = "0.7.19", features = ["io"] }
+
+# `unfold`, for turning a broadcast receiver into the stream SSE wants.
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+anyhow = "1.0.104"

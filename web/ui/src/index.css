@@ -1,0 +1,84 @@
+@import "tailwindcss";
+
+/*
+ * Two palettes, one set of names.
+ *
+ * The tokens are plain CSS variables so the theme switches on the media query
+ * alone - no class on <html>, no script that has to run before the first paint,
+ * and nothing to flash. `@theme inline` makes Tailwind's utilities reference
+ * the variable rather than copy its value, which is what makes that work.
+ */
+:root {
+  --surface: #fbfbfd;
+  --panel: #ffffff;
+  --line: #e7e7ee;
+  --ink: #14141b;
+  --muted: #6c6c7d;
+  --accent: #5b53e0;
+  --accent-soft: #ecebfd;
+  --here: #5b53e0;
+  --here-soft: #ecebfd;
+  --away: #b45309;
+  --away-soft: #fdf1e3;
+  --live: #17a34a;
+  --danger: #d4342c;
+
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #0b0b10;
+    --panel: #14141c;
+    --line: #24242f;
+    --ink: #e9e9f1;
+    --muted: #9494a6;
+    --accent: #8b86f5;
+    --accent-soft: #211f3d;
+    --here: #8b86f5;
+    --here-soft: #211f3d;
+    --away: #f0a13a;
+    --away-soft: #2e2416;
+    --live: #35c46b;
+    --danger: #f5675e;
+  }
+}
+
+@theme inline {
+  --color-surface: var(--surface);
+  --color-panel: var(--panel);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-here: var(--here);
+  --color-here-soft: var(--here-soft);
+  --color-away: var(--away);
+  --color-away-soft: var(--away-soft);
+  --color-live: var(--live);
+  --color-danger: var(--danger);
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* A scrollbar that does not repaint the page's colour scheme in the wrong one. */
+* {
+  scrollbar-color: var(--line) transparent;
+  scrollbar-width: thin;
+}
