@@ -1,6 +1,6 @@
 # Where we are
 
-The engine is done and it has a consumer.
+The engine is done and it has two consumers.
 
 An Android app drives it through the Kotlin bindings. It pairs with a six-digit
 code, names itself what the phone is called, brings files in from the picker or
@@ -9,10 +9,18 @@ devices hold what, and keeps syncing with the screen off behind a foreground
 service. The engine and the bindings are built by an ordinary `./gradlew
 assembleDebug`, and every part of that has been run on a phone.
 
-**None of it has been run on two phones.** Every throughput figure and every
+A Mac app drives it through the Swift ones. Same three screens, built by an
+ordinary Cmd-B, and it found in an afternoon what the first consumer could not:
+**the engine's TLS server had never worked outside a test.** Every suite and the
+CLI installed a rustls crypto provider by hand, an app binding through the FFI
+has no way to, and without one the server panicked on a background thread while
+the engine went on reporting itself running. Fixed, and the workaround is gone
+from everywhere, so the tests now exercise the path an app takes.
+
+**None of it has been run on two machines.** Every throughput figure and every
 claim about discovery in this file still comes from processes talking to each
-other on one machine over loopback. That is the next thing, it needs no code,
-and it has been the next thing for a while.
+other on one host. That is the next thing, it needs no code, and it has been the
+next thing for a while — with one bug fewer waiting at the end of it.
 
 `DESIGN.md` is the design and the reasoning. This is the status.
 
@@ -22,18 +30,19 @@ and it has been the next thing for a while.
 
 | | |
 |---|---|
-| `engine/` | 6,999 lines. The whole model, the server, discovery, storage, FFI. |
-| `cli/` | 372 lines. A prompt for driving one device — the test harness. |
+| `engine/` | 7,037 lines. The whole model, the server, discovery, storage, FFI. |
+| `cli/` | 370 lines. A prompt for driving one device — the test harness. |
 | `android/` | 3,868 lines of Kotlin across 22 files. Compose, three screens, a foreground service. |
-| tests | 121 Rust across 7 suites, ~3s. One `#[ignore]`d because it waits out a 30s interval. 14 Kotlin: the background notification's line, and names arriving from other apps. |
-| dependencies | 304, all on current stable releases. Toolchain pinned to 1.97.1. |
+| `macos/` | 1,590 lines of Swift across 11 files. SwiftUI, the same three screens. |
+| tests | 123 Rust across 7 suites, ~4s. One `#[ignore]`d because it waits out a 30s interval. 14 Kotlin: the background notification's line, and names arriving from other apps. |
+| dependencies | one fewer provider than it had. Toolchain pinned to 1.97.1. |
 
 Test suites, and what each is for:
 
 - **`localcloud` (57)** — units: chunking, hashing, the database and its
   migrations, pairing proofs, collision tie-breaks, address ranking, and what a
   device is allowed to call itself.
-- **`indexing` (27)** — the `Indexer` driven directly: collisions, renames on
+- **`indexing` (28)** — the `Indexer` driven directly: collisions, renames on
   disk, deletion, trash and its retention.
 - **`sync_e2e` (10)** — two live devices over real mutually authenticated TLS,
   exchanging catalogs.
@@ -42,8 +51,9 @@ Test suites, and what each is for:
 - **`pairing_e2e` (9)** — the 6-digit exchange over a real listener, plus what a
   paired device is still not allowed to do.
 - **`events` (5)** — how events reach an application.
-- **`mesh_e2e` (2 + 1 ignored)** — two whole engines: mDNS, pairing, a catalog
-  converging with nobody calling sync.
+- **`mesh_e2e` (3 + 1 ignored)** — two whole engines: mDNS, pairing, a catalog
+  converging with nobody calling sync — and that an engine arranges its own TLS
+  before its server needs it, which for a long time it did not.
 
 ---
 
@@ -71,6 +81,8 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
 - **Syncing with the app closed**, behind a switch that is off until asked for.
   A foreground service holds the engine up with no screen on, and the engine
   runs while anything needs it rather than while a screen is open.
+- **A Mac app**, in `macos/`, the second consumer and the first on Apple's side
+  of the FFI. It found the TLS bug above on its first run.
 - **A device can be named.** `set_device_name` crosses the FFI, so a platform
   that knows better than Rust does can say so. The name is the one mutable part
   of an identity, so it is the one part behind a lock: the running server shares
@@ -78,7 +90,8 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
   waiting for a restart. Renaming does not mint a new identity, which is what
   the test asserts.
 
-Bugs in the engine, every one found by a test written for something else:
+Bugs in the engine. Every one until the last two was found by a test written for
+something else; those two were found by an app, which is what apps are for:
 
 - A file whose blocks repeated **arrived corrupt** — `file_blocks` was keyed on
   the block rather than its position, so a 3 MB file with a run of zeros became
@@ -89,6 +102,20 @@ Bugs in the engine, every one found by a test written for something else:
 - **`Engine::start` panicked outside a tokio runtime**, which is precisely how an
   FFI binding calls it.
 - **A restarted engine stopped syncing** — the normal path on mobile.
+- **The TLS server never started, anywhere but a test.** rustls will not choose
+  between two crypto providers and panics rather than guess; asking for `ring`
+  while leaving default features on quietly enabled aws-lc-rs as well. The panic
+  landed on a tokio worker inside `start`, where nothing was waiting on the
+  result, so the engine reported itself running with no server behind it — and a
+  device advertising itself perfectly well would have failed every transfer.
+  Every test suite and the CLI had installed a provider by hand, and an app
+  binding through the FFI cannot: `rustls::crypto::ring` does not cross into
+  Swift or Kotlin. The engine does it itself now, the manual calls are gone, and
+  only one provider is compiled in at all.
+- **Opening the sync folder put `.DS_Store` in the catalog.** `import_file` has
+  refused a name beginning with a dot since it was written; the folder had no
+  such rule, and on a desktop the folder is the way in. It would have replicated
+  to the phones, which have no idea what it is.
 
 ---
 
@@ -99,13 +126,14 @@ until it is done.
 
 ### 1. Two devices on one Wi-Fi
 
-The Mac running `cli`, the phone running the app. Nothing blocks it and no code
-is needed.
+The Mac running the app, the phone running the app. Nothing blocks it and no
+code is needed. `cli` is still there and still useful — it prints every event as
+it arrives, which a window does not — so the honest first run is three:
 
 ```
-# on the Mac
-cargo run -p cli
-> devices                     # the phone should appear
+# on the Mac, beside the app, as a third device that narrates
+cargo run -p cli ~/some/scratch/dir
+> devices                     # the phone and the Mac app should both appear
 > pair <id>                   # shows a 6-digit code
 # on the phone: Devices → Pair → type the code
 > import ~/some/video.mp4
@@ -118,9 +146,11 @@ syncing on — that path is the one nothing has ever exercised across a network.
 
 **What it is there to find**, all of it still unproven:
 
-1. **Discovery across machines.** mDNS has only ever run as two processes on one
+1. **Discovery across machines.** mDNS has only ever run as processes on one
    host. Still the single highest-risk assumption in the project, and the one
-   that has already produced one bug — advertising on the wrong interface.
+   that has already produced one bug — advertising on the wrong interface. The
+   Mac app is at least advertising on the Wi-Fi address rather than only on
+   loopback, which `cli` beside it can see; that is one host still.
 2. **Real-network throughput.** Every figure in this file is loopback, which has
    no round-trip latency. Latency is the exact thing 1 MiB blocks and eight in
    flight exist to hide, so these numbers are the ones that have never been
@@ -130,9 +160,11 @@ syncing on — that path is the one nothing has ever exercised across a network.
 
 ### 2. iOS
 
-The Swift bindings have existed since `1152c24` and nothing has ever compiled
-against them. Android was the first consumer and found three things in an
-afternoon; the second will find more.
+The Swift bindings now have a consumer, so the language is proven and the shape
+of an app around it is written down in `macos/`. What iOS adds is a second
+platform for the same Swift: a different sandbox, no folder to watch, no window
+that can be left open, and a discovery story that is Apple's rather than the
+engine's.
 
 Start the multicast entitlement early — `com.apple.developer.networking.multicast`
 is granted by Apple on request, not by ticking a box, and without it iOS
@@ -239,6 +271,61 @@ them could have been:
 The lesson is cheap to state and was expensive to learn twice: a compiling
 Compose screen is not a working one, and a screenshot of the state you already
 had proves nothing about the state you have not reached.
+
+---
+
+## The Mac app
+
+`macos/` exists and runs. The same three screens the phone has, in SwiftUI, and
+no fourth one — the engine did not grow an opinion by being called from a
+different language.
+
+`build-engine.sh` runs as a build phase: it cross-compiles the engine for
+whatever architectures Xcode asked for, `lipo`s them into one static library,
+and generates the Swift from the library it just built. Neither is checked in,
+for the same reason neither is on Android. The integration is one rename —
+uniffi writes `localcloudFFI.modulemap` and Clang only looks for
+`module.modulemap` — so there is no bridging header and the C stays in its own
+module.
+
+Verified by running it, sandboxed: the engine constructs, mints an identity,
+opens its database, binds its TLS server and answers `/ping`, and a `cli`
+instance beside it discovers "Sam's MacBook Air" over mDNS at the Wi-Fi address
+rather than only at loopback.
+
+What the second consumer found:
+
+- **The TLS server had never started outside a test**, which is the entry above
+  and the whole argument for writing a second consumer.
+- **`.DS_Store` in the catalog**, likewise.
+- **Xcode 26's `MainActor` default isolation applies to the generated
+  bindings.** So the compiler decides `Engine.start()` belongs on the main actor
+  and then warns about the one place that correctly refuses to put it there — an
+  app that believed it would block the thread drawing its own window on every
+  import. The target sets `SWIFT_DEFAULT_ACTOR_ISOLATION` to `nonisolated` and
+  the app's own types say `@MainActor` where they mean it. Worth knowing before
+  writing the iOS one.
+- **The typed errors lose their sentences here too, and more bluntly.** uniffi
+  generates `errorDescription` as `String(reflecting: self)`, so `NotVisible`
+  arrives as `localcloud.EngineError.NotVisible(deviceId: "7f3a…")`. Same
+  remedy: match the variant, supply the English.
+
+Two things the Mac gets that the phone did not:
+
+- **It knows its own name.** `whoami` reads the computer name through
+  SystemConfiguration, so nothing has to tell the engine what this device is
+  called — the opposite of Android, which insisted it was "Unknown". It also
+  means the app links SystemConfiguration, which is the one thing the Mac needed
+  at the link line that Android did not.
+- **The sync folder is a real folder.** `#[cfg(desktop)]` means the engine
+  watches it, so a file put there in Finder is indexed and offered to the mesh
+  with the app not involved at all. Dropping a file on the window is the Mac's
+  share sheet and reaches the same `import_file` the button does.
+
+Still not possible: syncing with the window closed. Android earned that with a
+foreground service and a notification; the Mac's version is a menu bar item, and
+until there is one, closing the window quits — because a window that closed into
+nothing would be a device that quietly stopped syncing and never said.
 
 ---
 
