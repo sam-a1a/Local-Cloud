@@ -22,10 +22,12 @@ engine of its own and puts a loopback-only API in front of it. The page is a
 view of that device rather than a peer, and nothing about the protocol had to
 move to allow it.
 
-**None of it has been run on two machines.** Every throughput figure and every
-claim about discovery in this file still comes from processes talking to each
-other on one host. That is the next thing, it needs no code, and it has been the
-next thing for a while — with two bugs fewer waiting at the end of it.
+**Two machines have now found each other.** A phone on Wi-Fi and this Mac
+discovered each other over mDNS and the Mac reached the phone's TLS server
+across the network — so the oldest open question in this file is answered, and
+answered yes. What remains unproven is everything after the handshake: every
+throughput figure here is still loopback, and no file has yet crossed a real
+network.
 
 `DESIGN.md` is the design and the reasoning. This is the status.
 
@@ -132,14 +134,10 @@ until it is done.
 
 ### 1. Two devices on one Wi-Fi
 
-The phone running the Android app, the Mac running the browser. Nothing blocks
-it and no code is needed — but **rebuild and reinstall the Android app first**.
-The APK on the phone predates the crypto provider fix, so its TLS server is
-dead in exactly the way the Mac's was.
+The phone running the Android app, the Mac running the browser. The rebuilt APK
+is on the phone and the two can see each other; what is left is a transfer.
 
 ```
-cd android && ./gradlew assembleDebug     # then reinstall on the phone
-
 cd web/ui && npm install && npm run build
 cargo run --release -p web
 open http://127.0.0.1:7777
@@ -156,11 +154,15 @@ event as it arrives, which neither a window nor a page does.
 
 **What it is there to find**, all of it still unproven:
 
-1. **Discovery across machines.** mDNS has only ever run as processes on one
-   host. Still the single highest-risk assumption in the project, and the one
-   that has already produced one bug — advertising on the wrong interface. The
-   Mac app is at least advertising on the Wi-Fi address rather than only on
-   loopback, which `cli` beside it can see; that is one host still.
+1. ~~**Discovery across machines.**~~ **Done, and it works.** A Galaxy S24 on
+   Wi-Fi and this Mac found each other over mDNS on the first try — the phone
+   advertising `https://192.168.1.8:41151`, the Mac seeing it as "Sam S25 Plus ·
+   Android" within seconds, and the phone's TLS server answering `/ping` from
+   the Mac across the network. That was the single highest-risk assumption in
+   the project and it is no longer an assumption. It is also the first proof
+   that the crypto fix was the thing standing between here and a working mesh:
+   the same phone, before the rebuild, would have advertised itself perfectly
+   and answered nothing.
 2. **Real-network throughput.** Every figure in this file is loopback, which has
    no round-trip latency. Latency is the exact thing 1 MiB blocks and eight in
    flight exist to hide, so these numbers are the ones that have never been
