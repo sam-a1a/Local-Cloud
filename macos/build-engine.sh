@@ -51,12 +51,17 @@ for target in "${targets[@]}"; do
     fi
 done
 
-# Xcode exports its own SDK and deployment target into the environment, and the
-# `cc` crate reads both. Harmless when building for macOS, wrong the moment this
-# is asked to build for anything else, and either way not something the engine
-# should be inheriting by accident: it has a toolchain file and a deployment
-# target of its own.
-unset SDKROOT MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET CPATH LIBRARY_PATH
+# Two of the engine's dependencies compile C - sqlite and ring - so whatever
+# Xcode exported into the environment reaches a C compiler. Pinned to the macOS
+# SDK rather than inherited, because the app target's SDK is only the right one
+# by coincidence, and taken from `xcrun` so this is also correct when run from a
+# terminal where nothing set it at all. Unsetting it instead is what a first
+# draft did, and it fails with "stdio.h not found".
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+
+# These two are Xcode's search paths for the app, and have no business reaching
+# a Rust dependency's C compiler.
+unset CPATH LIBRARY_PATH
 
 # Always `--release`, including for a Debug build of the app. A debug build of
 # the engine is not a slower version of the same thing: chunking and hashing a
