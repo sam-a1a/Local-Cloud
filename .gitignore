@@ -12,3 +12,12 @@ storage_*/
 trusted_peers/
 sync_folder/
 bindings/
+
+# Xcode: whose window was open where, and what it built. Not the project.
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# The engine, built for the Mac, and the Swift generated from it. Build output
+# of the Rust, same as android/'s - see macos/build-engine.sh.
+macos/Generated/
