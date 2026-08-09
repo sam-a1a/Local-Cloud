@@ -31,8 +31,12 @@ anyhow = "1.0.104"
 thiserror = "2.0.19"
 
 # Encryption & Security
-rustls = { version = "0.23.43", features = ["ring"] }
-tokio-rustls = "0.26.4"
+# `ring`, and only ring. Asking for it while leaving the default features on
+# pulled aws-lc-rs in as well, and rustls will not choose between two providers -
+# it panics rather than guess. Both were being compiled into every build,
+# including both Android ABIs and the Mac.
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 rcgen = "0.14.8"
 sha2 = "0.11"

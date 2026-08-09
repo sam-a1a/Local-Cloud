@@ -14,11 +14,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-fn install_crypto_provider() {
-    // Harmless if another test got here first.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 struct TestDevice {
     info: DeviceInfo,
     key_pem: String,
@@ -125,7 +120,6 @@ impl TestDevice {
 
 #[tokio::test]
 async fn unpaired_device_reaches_pairing_but_nothing_else() {
-    install_crypto_provider();
     let device = TestDevice::start().await;
     let anon = pairing::build_pairing_client().expect("client");
 
@@ -161,7 +155,6 @@ async fn unpaired_device_reaches_pairing_but_nothing_else() {
 
 #[tokio::test]
 async fn correct_code_pairs_and_grants_access() {
-    install_crypto_provider();
     let initiator = TestDevice::start().await;
     let target = TestDevice::start().await;
     let anon = pairing::build_pairing_client().expect("client");
@@ -205,7 +198,6 @@ async fn correct_code_pairs_and_grants_access() {
 
 #[tokio::test]
 async fn wrong_code_is_refused_and_grants_nothing() {
-    install_crypto_provider();
     let initiator = TestDevice::start().await;
     let target = TestDevice::start().await;
     let anon = pairing::build_pairing_client().expect("client");
@@ -230,7 +222,6 @@ async fn wrong_code_is_refused_and_grants_nothing() {
 
 #[tokio::test]
 async fn device_not_selected_cannot_pair_itself() {
-    install_crypto_provider();
     let initiator = TestDevice::start().await;
     let selected = TestDevice::start().await;
     let intruder = TestDevice::start().await;
@@ -275,7 +266,6 @@ async fn pair(initiator: &TestDevice, target: &TestDevice) -> reqwest::Client {
 /// Pairing grants access to block storage, not to the filesystem around it.
 #[tokio::test]
 async fn a_paired_device_cannot_push_outside_block_storage() {
-    install_crypto_provider();
     let initiator = TestDevice::start().await;
     let target = TestDevice::start().await;
     let client = pair(&initiator, &target).await;
@@ -315,7 +305,6 @@ async fn a_paired_device_cannot_push_outside_block_storage() {
 /// The same check the pull path makes, on the pushing side.
 #[tokio::test]
 async fn a_paired_device_cannot_push_contents_that_belie_their_id() {
-    install_crypto_provider();
     let initiator = TestDevice::start().await;
     let target = TestDevice::start().await;
     let client = pair(&initiator, &target).await;
@@ -343,7 +332,6 @@ async fn a_paired_device_cannot_push_contents_that_belie_their_id() {
 /// ever appeared on the device that received it.
 #[tokio::test]
 async fn a_file_whose_blocks_repeat_arrives_whole() {
-    install_crypto_provider();
     let receiver = TestDevice::start().await;
     let sender = TestDevice::start().await;
     let client = pair(&receiver, &sender).await;
@@ -420,7 +408,6 @@ async fn a_file_whose_blocks_repeat_arrives_whole() {
 /// is exactly when a person is watching for something to appear.
 #[tokio::test]
 async fn pairing_asks_for_a_catalog_sync_straight_away() {
-    install_crypto_provider();
     let initiator = TestDevice::start().await;
     let target = TestDevice::start().await;
 
@@ -445,7 +432,6 @@ async fn pairing_asks_for_a_catalog_sync_straight_away() {
 /// re-sending a large file that barely changed costs as much as the first send.
 #[tokio::test]
 async fn a_peer_is_sent_only_what_it_is_missing() {
-    install_crypto_provider();
     let receiver = TestDevice::start().await;
     let sender = TestDevice::start().await;
     let client = pair(&receiver, &sender).await;

@@ -39,9 +39,36 @@ fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
+/// The engine chooses its own cryptography, without being told.
+///
+/// rustls will not pick between two providers - it panics rather than guess -
+/// and it did so on a worker thread inside `start`, where nothing was waiting
+/// on the result. The engine went on to report itself running with no server
+/// behind it, and every transfer would have failed against a device that was
+/// advertising itself perfectly well.
+///
+/// It went unnoticed because every suite in this directory, and the CLI,
+/// installed a provider by hand before touching an engine. An application
+/// binding through the FFI cannot: `rustls::crypto::ring` is a Rust type and
+/// does not cross into Swift or Kotlin. The first thing to start the engine
+/// without a test harness around it hit this on its first run.
+///
+/// Those manual installs are gone now, so every test here exercises the real
+/// path. This one says so out loud.
+#[test]
+fn an_engine_arranges_its_own_tls_before_the_server_needs_it() {
+    let dir = TempDir::new().expect("temp dir");
+    let base = dir.path().to_string_lossy().to_string();
+    let _engine = Engine::new(base.clone(), format!("{}/sync", base)).expect("engine");
+
+    assert!(
+        rustls::crypto::CryptoProvider::get_default().is_some(),
+        "constructing an engine must leave rustls able to build a config",
+    );
+}
+
 #[test]
 fn two_engines_discover_pair_and_converge_on_their_own() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let alice_dir = TempDir::new().expect("temp dir");
     let bob_dir = TempDir::new().expect("temp dir");
@@ -140,7 +167,6 @@ fn two_engines_discover_pair_and_converge_on_their_own() {
 #[test]
 #[ignore]
 fn converges_on_a_change_made_after_pairing() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let alice_dir = TempDir::new().expect("temp dir");
     let bob_dir = TempDir::new().expect("temp dir");
@@ -202,7 +228,6 @@ fn converges_on_a_change_made_after_pairing() {
 /// around that. Anything `start` sets up has to survive being torn down once.
 #[test]
 fn an_engine_restarted_still_syncs() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let alice_dir = TempDir::new().expect("temp dir");
     let bob_dir = TempDir::new().expect("temp dir");

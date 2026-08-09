@@ -21,10 +21,6 @@ use std::sync::{mpsc, Arc, Mutex};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 struct Device {
     info: DeviceInfo,
     key_pem: String,
@@ -202,7 +198,6 @@ impl Device {
 /// without its bytes moving.
 #[tokio::test]
 async fn a_peers_catalog_arrives_without_its_data() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     alice.pair_with(&bob);
@@ -225,7 +220,6 @@ async fn a_peers_catalog_arrives_without_its_data() {
 /// Trust comes from pairing and nowhere else.
 #[tokio::test]
 async fn an_unpaired_peer_is_not_synced_with() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let stranger = Device::start("stranger").await;
     // Deliberately no pairing.
@@ -243,7 +237,6 @@ async fn an_unpaired_peer_is_not_synced_with() {
 /// wholesale - that is how a copy it deleted stops being listed.
 #[tokio::test]
 async fn a_copy_the_peer_deleted_stops_being_listed() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     alice.pair_with(&bob);
@@ -283,7 +276,6 @@ async fn a_copy_the_peer_deleted_stops_being_listed() {
 /// currently unreachable is discovered.
 #[tokio::test]
 async fn a_third_devices_copy_is_learned_through_a_peer() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     let carol = Device::start("carol").await;
@@ -305,7 +297,6 @@ async fn a_third_devices_copy_is_learned_through_a_peer() {
 /// What a peer says about *us* is never authoritative.
 #[tokio::test]
 async fn a_peer_cannot_rewrite_what_we_know_about_our_own_copies() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     alice.pair_with(&bob);
@@ -346,7 +337,6 @@ async fn a_peer_cannot_rewrite_what_we_know_about_our_own_copies() {
 /// back on the next sync.
 #[tokio::test]
 async fn a_destroyed_item_is_not_reintroduced_by_a_stale_peer() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     alice.pair_with(&bob);
@@ -379,7 +369,6 @@ async fn a_destroyed_item_is_not_reintroduced_by_a_stale_peer() {
 /// catalog and is carried out whenever the target next syncs.
 #[tokio::test]
 async fn a_delete_request_aimed_at_us_is_carried_out_on_sync() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     alice.pair_with(&bob);
@@ -430,7 +419,6 @@ async fn a_delete_request_aimed_at_us_is_carried_out_on_sync() {
 /// and the folder has to follow the catalog.
 #[tokio::test]
 async fn a_name_claimed_on_both_devices_is_settled_and_renamed_on_disk() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     alice.pair_with(&bob);
@@ -497,7 +485,6 @@ async fn a_name_claimed_on_both_devices_is_settled_and_renamed_on_disk() {
 /// Syncing is also how a device records that a peer is currently around.
 #[tokio::test]
 async fn syncing_records_the_peer_as_seen() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     alice.pair_with(&bob);
@@ -523,7 +510,6 @@ async fn syncing_records_the_peer_as_seen() {
 /// spinner for the minutes a large file takes.
 #[tokio::test]
 async fn a_transfer_reports_how_far_along_it_is() {
-    install_crypto_provider();
     let alice = Device::start("alice").await;
     let bob = Device::start("bob").await;
     alice.pair_with(&bob);

@@ -374,8 +374,32 @@ pub struct Engine {
     collisions: CollisionQueue,
 }
 
+/// Chooses the cryptography rustls will use, once per process.
+///
+/// rustls will not guess. Ask it for a `ServerConfig` without a provider
+/// installed and it panics - and it panicked on a tokio worker inside `start`,
+/// where nothing was waiting on the result, so the engine went on to report
+/// itself running with no server behind it.
+///
+/// This belongs to the engine rather than to whoever calls it. Every test suite
+/// and the CLI used to do it themselves, which is why it was never noticed: an
+/// application binding through the FFI has no way to, because
+/// `rustls::crypto::ring` is a Rust type and does not cross into Swift or
+/// Kotlin. The first thing to try starting the engine without a test harness
+/// around it found this immediately.
+///
+/// Ignoring the error is the point. A second call means somebody already chose,
+/// and their choice is as good as this one.
+fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl Engine {
     pub fn new(base_dir: String, sync_dir_path: String) -> Result<Self, EngineError> {
+        install_crypto_provider();
         std::fs::create_dir_all(&base_dir).map_err(EngineError::internal)?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()

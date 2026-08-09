@@ -37,8 +37,6 @@ impl Recorder {
 }
 
 fn engine(dir: &TempDir) -> Engine {
-    // The engine brings up a TLS server, which needs a process-wide provider.
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let base = dir.path().to_string_lossy().to_string();
     Engine::new(base.clone(), format!("{}/sync", base)).expect("engine")
 }

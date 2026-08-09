@@ -14,8 +14,6 @@ use std::io::{BufRead, Write};
 use std::sync::Arc;
 
 fn main() -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     // A device's whole state lives under one directory, so pointing two
     // instances at different ones is all it takes to run both on one machine.
     let base = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
