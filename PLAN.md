@@ -1,6 +1,6 @@
 # Where we are
 
-The engine is done and it has two consumers.
+The engine is done and it has three consumers.
 
 An Android app drives it through the Kotlin bindings. It pairs with a six-digit
 code, names itself what the phone is called, brings files in from the picker or
@@ -17,10 +17,15 @@ has no way to, and without one the server panicked on a background thread while
 the engine went on reporting itself running. Fixed, and the workaround is gone
 from everywhere, so the tests now exercise the path an app takes.
 
+A web app drives it from a browser, which cannot join a mesh — so `web/` runs an
+engine of its own and puts a loopback-only API in front of it. The page is a
+view of that device rather than a peer, and nothing about the protocol had to
+move to allow it.
+
 **None of it has been run on two machines.** Every throughput figure and every
 claim about discovery in this file still comes from processes talking to each
 other on one host. That is the next thing, it needs no code, and it has been the
-next thing for a while — with one bug fewer waiting at the end of it.
+next thing for a while — with two bugs fewer waiting at the end of it.
 
 `DESIGN.md` is the design and the reasoning. This is the status.
 
@@ -34,6 +39,7 @@ next thing for a while — with one bug fewer waiting at the end of it.
 | `cli/` | 370 lines. A prompt for driving one device — the test harness. |
 | `android/` | 3,868 lines of Kotlin across 22 files. Compose, three screens, a foreground service. |
 | `macos/` | 1,590 lines of Swift across 11 files. SwiftUI, the same three screens. |
+| `web/` | 1,217 lines of Rust — an engine host and a loopback API — and 968 of TypeScript. Solid, Tailwind, the same three screens. |
 | tests | 123 Rust across 7 suites, ~4s. One `#[ignore]`d because it waits out a 30s interval. 14 Kotlin: the background notification's line, and names arriving from other apps. |
 | dependencies | one fewer provider than it had. Toolchain pinned to 1.97.1. |
 
@@ -126,23 +132,27 @@ until it is done.
 
 ### 1. Two devices on one Wi-Fi
 
-The Mac running the app, the phone running the app. Nothing blocks it and no
-code is needed. `cli` is still there and still useful — it prints every event as
-it arrives, which a window does not — so the honest first run is three:
+The phone running the Android app, the Mac running the browser. Nothing blocks
+it and no code is needed — but **rebuild and reinstall the Android app first**.
+The APK on the phone predates the crypto provider fix, so its TLS server is
+dead in exactly the way the Mac's was.
 
 ```
-# on the Mac, beside the app, as a third device that narrates
-cargo run -p cli ~/some/scratch/dir
-> devices                     # the phone and the Mac app should both appear
-> pair <id>                   # shows a 6-digit code
-# on the phone: Devices → Pair → type the code
-> import ~/some/video.mp4
-> share video.mp4 <id>        # watch the progress lines
-> ls                          # both devices listed as holders
+cd android && ./gradlew assembleDebug     # then reinstall on the phone
+
+cd web/ui && npm install && npm run build
+cargo run --release -p web
+open http://127.0.0.1:7777
 ```
 
-Then compare checksums, and repeat it with the phone locked and background
-syncing on — that path is the one nothing has ever exercised across a network.
+Then, in the browser: Devices → the phone should appear under "On the network"
+→ Pair → type the six digits on the phone. Add a file, send it to the phone,
+and watch the holder chips. Compare checksums. Then repeat it with the phone
+locked and background syncing on — that path is the one nothing has ever
+exercised across a network.
+
+`cli` is still the better instrument when something goes wrong: it prints every
+event as it arrives, which neither a window nor a page does.
 
 **What it is there to find**, all of it still unproven:
 
@@ -326,6 +336,51 @@ Still not possible: syncing with the window closed. Android earned that with a
 foreground service and a notification; the Mac's version is a menu bar item, and
 until there is one, closing the window quits — because a window that closed into
 nothing would be a device that quietly stopped syncing and never said.
+
+---
+
+## The web app
+
+`web/` exists and runs, and it is the one consumer that had to answer a question
+the other two did not: a browser cannot join the mesh. Mutual TLS against
+certificates pinned by pairing, on a port found over mDNS, is three things a
+browser will not do — and each of them is the point of the protocol rather than
+an obstacle in it.
+
+So the process is the mesh member and the page is a view of it. `web/src` runs a
+whole engine and serves a loopback-only API beside it; `web/ui` is Solid,
+TypeScript and Tailwind, built by Vite and read into memory once at startup.
+Closing the tab does not stop the device; closing the terminal does. That is
+the first consumer where those are different things, and it is also, by
+accident, the first one that syncs with nothing on screen.
+
+Loopback is the security boundary. The API unpairs devices, deletes copies off
+other machines and hands back the contents of any file in the catalog, with no
+authentication at all — it is safe because the operating system will not route
+it off this machine, and for no other reason. Exposing it would mean designing
+authentication, which is a project rather than a flag.
+
+What it costs, since a page is the easiest place to be wasteful:
+
+- **One `EventSource`, no polling.** The server compares each snapshot to the
+  last one it sent and says nothing when nothing changed, so a quiet mesh is a
+  silent socket.
+- **Block progress never touches the catalog.** A gigabyte produces a thousand
+  progress events and not one of them changes an item, so they go straight to
+  the bar.
+- **`reconcile` rather than replace.** A whole snapshot arriving updates the
+  signals that differ and leaves the rest of the DOM alone.
+- **Nothing buffers a file.** Uploads stream from the browser to a temporary
+  file to `import_file`; downloads stream off disk.
+- 16 kB of JavaScript and 5 kB of CSS, gzipped.
+
+Verified against a second engine on the same machine: paired over the real mDNS
+and mTLS path, sent a 3 MB file, and the checksum on the far side matches — as
+does the byte-for-byte round trip back out through the download route.
+
+Not verified: how the page looks in a browser. Every request it makes has been
+exercised with `curl`, and the bundle typechecks and builds, but nothing here
+has rendered it. The Compose lesson above applies unchanged.
 
 ---
 
