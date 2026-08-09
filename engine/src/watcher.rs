@@ -183,6 +183,20 @@ impl Indexer {
             return skip("outside the sync folder");
         };
 
+        // Hidden files are the desktop's own bookkeeping rather than anybody's
+        // documents. `.DS_Store` appears the moment a Finder window is opened
+        // on the sync folder, and without this it is indexed, replicated, and
+        // listed as an item on every device in the mesh - including the phones,
+        // which have no idea what it is.
+        //
+        // `import_file` has refused a name beginning with a dot since it was
+        // written. The folder had no such rule, and on a desktop the folder is
+        // the way in: the watcher is recursive, so this checks every component
+        // rather than just the name.
+        if requested_path.split('/').any(|part| part.starts_with('.')) {
+            return skip("hidden");
+        }
+
         let metadata = match std::fs::metadata(absolute_path) {
             Ok(m) => m,
             Err(e) => return skip(&e.to_string()),

@@ -120,6 +120,32 @@ async fn a_new_file_becomes_an_item_this_device_holds() {
     assert_eq!(db.holder_count(&file_id).unwrap(), 1);
 }
 
+/// What a Finder window leaves behind is not a document.
+///
+/// The sync folder on a desktop is a folder a person opens, and opening it
+/// writes `.DS_Store`. Indexed, that becomes an item replicated to every device
+/// in the mesh - phones included, which have no idea what it is. `import_file`
+/// has always refused a name beginning with a dot; this is the same rule
+/// applied to the other way in.
+#[tokio::test]
+async fn a_hidden_file_is_not_an_item() {
+    let device = Device::new("mac");
+
+    for path in [".DS_Store", "photos/.DS_Store", ".git/config"] {
+        let absolute = device.write(path, "desktop bookkeeping");
+        let outcome = device.indexer.index(&absolute);
+        assert!(
+            matches!(outcome, IndexOutcome::Skipped { .. }),
+            "{} should not be indexed, got {:?}",
+            path,
+            outcome,
+        );
+    }
+
+    let db = device.db.lock().unwrap();
+    assert!(db.get_all_files().expect("list").is_empty());
+}
+
 #[tokio::test]
 async fn rewriting_identical_content_is_not_a_change() {
     let device = Device::new("android");
