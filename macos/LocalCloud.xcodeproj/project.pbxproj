@@ -6,8 +6,14 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		AA10C10D0000000000000003 /* localcloud.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA10C10D0000000000000001 /* localcloud.swift */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		22EBF86E30248FEE00687602 /* LocalCloud.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LocalCloud.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA10C10D0000000000000001 /* localcloud.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = localcloud.swift; sourceTree = "<group>"; };
+		AA10C10D0000000000000005 /* build-engine.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "build-engine.sh"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -33,8 +39,18 @@
 			isa = PBXGroup;
 			children = (
 				22EBF87030248FEE00687602 /* LocalCloud */,
+				AA10C10D0000000000000002 /* Generated */,
+				AA10C10D0000000000000005 /* build-engine.sh */,
 				22EBF86F30248FEE00687602 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		AA10C10D0000000000000002 /* Generated */ = {
+			isa = PBXGroup;
+			children = (
+				AA10C10D0000000000000001 /* localcloud.swift */,
+			);
+			path = Generated;
 			sourceTree = "<group>";
 		};
 		22EBF86F30248FEE00687602 /* Products */ = {
@@ -52,6 +68,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 22EBF87930248FEF00687602 /* Build configuration list for PBXNativeTarget "LocalCloud" */;
 			buildPhases = (
+				AA10C10D0000000000000004 /* Build the engine */,
 				22EBF86A30248FEE00687602 /* Sources */,
 				22EBF86B30248FEE00687602 /* Frameworks */,
 				22EBF86C30248FEE00687602 /* Resources */,
@@ -114,11 +131,33 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		AA10C10D0000000000000004 /* Build the engine */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Build the engine";
+			outputPaths = (
+				"$(SRCROOT)/Generated/liblocalcloud.a",
+				"$(SRCROOT)/Generated/localcloud.swift",
+				"$(SRCROOT)/Generated/module.modulemap",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "\"$SRCROOT/build-engine.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		22EBF86A30248FEE00687602 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA10C10D0000000000000003 /* localcloud.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -162,7 +201,7 @@
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -225,7 +264,7 @@
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -252,15 +291,24 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "LocalCloud finds your other devices on this network, and moves files between them without going through anyone else's servers.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/Generated";
 				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-llocalcloud",
+					"-framework",
+					SystemConfiguration,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = ghazaleh.LocalCloud;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -268,6 +316,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Generated";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -282,15 +331,24 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "LocalCloud finds your other devices on this network, and moves files between them without going through anyone else's servers.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/Generated";
 				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-llocalcloud",
+					"-framework",
+					SystemConfiguration,
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = ghazaleh.LocalCloud;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -298,6 +356,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/Generated";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
