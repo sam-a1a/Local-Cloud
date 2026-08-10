@@ -32,7 +32,39 @@ That leaves the things that only show up at size. Every throughput figure here
 is still loopback, the largest thing to cross the network so far is 124 kB, and
 the locked-phone path has never been exercised across one.
 
+Since that run, the web app also stopped deciding where files go: you choose the
+folder, the files come with you, and whatever was already in it joins the mesh.
+Neither of the other two consumers can do that yet.
+
 `DESIGN.md` is the design and the reasoning. This is the status.
+
+---
+
+## Running it
+
+```
+# the browser, and the engine it drives — the usual way in
+cd web/ui && npm install && npm run build
+cargo run --release -p web            # ~/.localcloud, ~/LocalCloud, 127.0.0.1:7777
+
+# the phone
+cd android && ./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+# the Mac app
+open macos/LocalCloud.xcodeproj       # then Cmd-R
+
+# a device that narrates every event, which is what to reach for when
+# something goes wrong
+cargo run --release -p cli ~/some/scratch/dir
+```
+
+`--release` is not optional for anything that moves a file. Chunking and
+hashing is the work, and unoptimised SHA-256 turns a transfer that should take
+seconds into one that takes minutes.
+
+Three devices can run on one machine at once — `web`, `cli` and the Mac app all
+keep separate state — which is how most of what is written here was tested.
 
 ---
 
@@ -40,11 +72,11 @@ the locked-phone path has never been exercised across one.
 
 | | |
 |---|---|
-| `engine/` | 7,037 lines. The whole model, the server, discovery, storage, FFI. |
+| `engine/` | 7,135 lines. The whole model, the server, discovery, storage, FFI. |
 | `cli/` | 370 lines. A prompt for driving one device — the test harness. |
 | `android/` | 3,868 lines of Kotlin across 22 files. Compose, three screens, a foreground service. |
 | `macos/` | 1,590 lines of Swift across 11 files. SwiftUI, the same three screens. |
-| `web/` | 1,217 lines of Rust — an engine host and a loopback API — and 968 of TypeScript. Solid, Tailwind, the same three screens. |
+| `web/` | 1,582 lines of Rust — an engine host and a loopback API — and 1,194 of TypeScript. Solid, Tailwind, the same three screens. |
 | tests | 125 Rust across 7 suites, ~4s. One `#[ignore]`d because it waits out a 30s interval. 14 Kotlin: the background notification's line, and names arriving from other apps. |
 | dependencies | one fewer provider than it had. Toolchain pinned to 1.97.1. |
 
@@ -144,7 +176,8 @@ something else; those two were found by an app, which is what apps are for:
 ## What to do next
 
 The one that gated everything else is done. What is left is what it did not
-reach: size, sleep, and everything in §3 before this leaves your own network.
+reach — size and sleep — then catching the other two consumers up, then iOS,
+then everything that has to be true before this leaves your own network.
 
 ### ~~1. Two devices on one Wi-Fi~~ — done
 
@@ -177,7 +210,26 @@ What the run did *not* settle, because a 124 kB photo does not ask the question:
 3. **The locked phone.** Background syncing has been watched on an emulator with
    the screen off, never across a network with a real device asleep.
 
-### 2. iOS
+### 2. The other two consumers are behind
+
+The web app is where the last two days of work went, and neither of the others
+has caught up. Both are small and neither is urgent:
+
+- **The Mac app cannot choose a folder.** It is fixed to its sandbox container's
+  `Documents`, which is a real folder but an obscure one. It also does not call
+  `scan_sync_folder`, so anything already in that folder is invisible to it —
+  the same gap the web app had before the picker existed. An `NSOpenPanel` and a
+  security-scoped bookmark are the Mac's version of what `web/folders.rs` does.
+- **The phone cannot choose one either, and should not.** Android's answer is
+  the Storage Access Framework, which hands back a content URI rather than a
+  path — and the engine indexes a directory, watches it, and opens files inside
+  it by path. Nothing about that maps. The app-private folder is the right
+  answer on Android; the difference is worth stating rather than fixing.
+
+Everything else the three share is in step: all of them pair, hold, send, pull,
+delete and restore, and all of them show the same three screens.
+
+### 3. iOS
 
 The Swift bindings now have a consumer, so the language is proven and the shape
 of an app around it is written down in `macos/`. What iOS adds is a second
@@ -189,7 +241,7 @@ Start the multicast entitlement early — `com.apple.developer.networking.multic
 is granted by Apple on request, not by ticking a box, and without it iOS
 discovery finds nothing in exactly the way Android did without its lock.
 
-### 3. Before anyone else runs this
+### 4. Before anyone else runs this
 
 Not needed to keep building, needed before it leaves your own network:
 
@@ -197,9 +249,14 @@ Not needed to keep building, needed before it leaves your own network:
   proof. Fine at home, not on a shared network.
 - **Blocks encrypted at rest**, and a certificate rotation path — there is still
   none, and the remedy for an exposed key is still to unpair everything.
-- **Release build.** `optimization { enable = false }`, no signing config, and a
-  48 MB debug APK carrying two ABIs. An app bundle and per-ABI splits are the
-  fix, and none of it matters until 1 is done.
+- **The web API has no authentication.** It unpairs devices, deletes copies off
+  other machines and hands back the contents of any file in the catalog. It is
+  bound to `127.0.0.1` and that is the entire defence — which is enough for a
+  tool you run on your own machine and nothing at all for a tool anyone else
+  runs. Anything that moves it off loopback has to design authentication first.
+- **Release builds.** `optimization { enable = false }`, no signing config, and
+  a 61 MB debug APK carrying two ABIs; the Mac app has no signing team either.
+  An app bundle and per-ABI splits are the fix on Android.
 
 ---
 
@@ -381,7 +438,7 @@ What it costs, since a page is the easiest place to be wasteful:
   signals that differ and leaves the rest of the DOM alone.
 - **Nothing buffers a file.** Uploads stream from the browser to a temporary
   file to `import_file`; downloads stream off disk.
-- 16 kB of JavaScript and 5 kB of CSS, gzipped.
+- 17 kB of JavaScript and 5 kB of CSS, gzipped.
 
 It is also where the sync folder stopped being a decision the process made. The
 page browses this machine and chooses one; the engine is stopped, the files are
@@ -398,11 +455,11 @@ folder change is verified the same way: a file carried across, one already at
 the destination adopted into the catalog, one name clash left alone, every guard
 refused, and the choice still in force after a restart.
 
-Not verified: how the page looks in a browser. Every request it makes has been
-exercised with `curl`, and the bundle typechecks and builds, but nothing here
-has rendered it — Chrome headless would not cooperate on this machine. You have
-since used it, so this is now the weakest sentence in the file rather than a
-real gap; the Compose lesson above is the reason it is still here at all.
+The page itself has been used, which is how the phone and the Mac came to be
+paired at all. The folder picker has not: it went in after that run, and every
+part of it below the fetch has been exercised by `curl` and by nothing else. The
+Compose lesson two sections up is exactly about the gap between those two
+statements.
 
 ---
 
