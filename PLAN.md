@@ -22,12 +22,15 @@ engine of its own and puts a loopback-only API in front of it. The page is a
 view of that device rather than a peer, and nothing about the protocol had to
 move to allow it.
 
-**Two machines have now found each other.** A phone on Wi-Fi and this Mac
-discovered each other over mDNS and the Mac reached the phone's TLS server
-across the network — so the oldest open question in this file is answered, and
-answered yes. What remains unproven is everything after the handshake: every
-throughput figure here is still loopback, and no file has yet crossed a real
-network.
+**It works between two real devices.** A Galaxy S24 on Wi-Fi and this Mac
+found each other over mDNS, paired with a six-digit code, and a photo taken on
+the phone is now held by both — the phone that created it and the Mac that
+asked for a copy, over the network rather than over loopback. The oldest open
+question in this file is answered, and answered yes.
+
+That leaves the things that only show up at size. Every throughput figure here
+is still loopback, the largest thing to cross the network so far is 124 kB, and
+the locked-phone path has never been exercised across one.
 
 `DESIGN.md` is the design and the reasoning. This is the status.
 
@@ -91,6 +94,9 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
   runs while anything needs it rather than while a screen is open.
 - **A Mac app**, in `macos/`, the second consumer and the first on Apple's side
   of the FFI. It found the TLS bug above on its first run.
+- **A web consumer**, in `web/`, which is a process running an engine with a
+  loopback API in front of it, because a browser cannot join a mesh. It is the
+  consumer the phone was finally tested against.
 - **A device can be named.** `set_device_name` crosses the FFI, so a platform
   that knows better than Rust does can say so. The name is the one mutable part
   of an identity, so it is the one part behind a lock: the running server shares
@@ -129,46 +135,39 @@ something else; those two were found by an app, which is what apps are for:
 
 ## What to do next
 
-In order. The first one is not optional and everything below it is worth less
-until it is done.
+The one that gated everything else is done. What is left is what it did not
+reach: size, sleep, and everything in §3 before this leaves your own network.
 
-### 1. Two devices on one Wi-Fi
+### ~~1. Two devices on one Wi-Fi~~ — done
 
-The phone running the Android app, the Mac running the browser. The rebuilt APK
-is on the phone and the two can see each other; what is left is a transfer.
+A Galaxy S24 running the Android app and this Mac running the browser. They
+found each other over mDNS on the first try, paired with the six digits, and a
+photo the phone had made was afterwards held by both devices. Three things that
+had never happened before happened at once:
 
-```
-cd web/ui && npm install && npm run build
-cargo run --release -p web
-open http://127.0.0.1:7777
-```
+- **Discovery across machines.** The phone advertised
+  `https://192.168.1.8:41151`, the Mac saw it as "Sam S25 Plus · Android" within
+  seconds, and the phone's TLS server answered `/ping` from the Mac. That was
+  the single highest-risk assumption in the project and it is no longer an
+  assumption.
+- **Pairing across machines**, over a real network rather than a loopback
+  listener.
+- **A file crossing between two devices** rather than two processes.
 
-Then, in the browser: Devices → the phone should appear under "On the network"
-→ Pair → type the six digits on the phone. Add a file, send it to the phone,
-and watch the holder chips. Compare checksums. Then repeat it with the phone
-locked and background syncing on — that path is the one nothing has ever
-exercised across a network.
+It is also the proof that the crypto fix was exactly what stood between here and
+a working mesh: the same phone, before the rebuild, advertised itself perfectly
+and answered nothing.
 
-`cli` is still the better instrument when something goes wrong: it prints every
-event as it arrives, which neither a window nor a page does.
+What the run did *not* settle, because a 124 kB photo does not ask the question:
 
-**What it is there to find**, all of it still unproven:
-
-1. ~~**Discovery across machines.**~~ **Done, and it works.** A Galaxy S24 on
-   Wi-Fi and this Mac found each other over mDNS on the first try — the phone
-   advertising `https://192.168.1.8:41151`, the Mac seeing it as "Sam S25 Plus ·
-   Android" within seconds, and the phone's TLS server answering `/ping` from
-   the Mac across the network. That was the single highest-risk assumption in
-   the project and it is no longer an assumption. It is also the first proof
-   that the crypto fix was the thing standing between here and a working mesh:
-   the same phone, before the rebuild, would have advertised itself perfectly
-   and answered nothing.
-2. **Real-network throughput.** Every figure in this file is loopback, which has
+1. **Real-network throughput.** Every figure in this file is loopback, which has
    no round-trip latency. Latency is the exact thing 1 MiB blocks and eight in
-   flight exist to hide, so these numbers are the ones that have never been
-   tested against the problem they solve.
-3. **Whether 30 seconds is tolerable** in practice, or whether the change
+   flight exist to hide, so these numbers are still the ones that have never been
+   tested against the problem they solve. Send a video next.
+2. **Whether 30 seconds is tolerable** in practice, or whether the change
    notification in §14 stops being optional.
+3. **The locked phone.** Background syncing has been watched on an emulator with
+   the screen off, never across a network with a real device asleep.
 
 ### 2. iOS
 
