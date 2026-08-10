@@ -235,7 +235,7 @@ pub async fn stream(
     // sent, which is what keeps a quiet mesh quiet - but it means a tab opening
     // into that quiet would draw nothing at all until it stopped being quiet.
     // Quiet is the normal state of a mesh.
-    let engine = app.engine.clone();
+    let engine = app.engine();
     let current = tokio::task::spawn_blocking(move || {
         serde_json::to_string(&crate::snapshot::read(&engine)).unwrap_or_default()
     })

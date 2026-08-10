@@ -897,3 +897,38 @@ async fn a_file_that_repeats_a_block_keeps_every_occurrence() {
         "a copy must be the whole file"
     );
 }
+
+/// Pointing the engine at a folder that already has things in it.
+///
+/// The watcher only hears about changes, so everything already there is
+/// invisible until something touches it - which is exactly what happens when a
+/// person chooses an existing folder as the sync folder. `scan` is the one call
+/// that looks.
+#[tokio::test]
+async fn a_scan_finds_what_was_already_in_the_folder() {
+    let device = Device::new("mac");
+    device.write("holiday.txt", "already here");
+    device.write("photos/beach.txt", "in a subfolder");
+    device.write(".DS_Store", "not a document");
+
+    assert_eq!(device.indexer.scan(), 2);
+
+    let db = device.db.lock().unwrap();
+    let mut paths: Vec<String> = db.get_all_files().expect("list").into_iter().map(|f| f.path).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["holiday.txt", "photos/beach.txt"]);
+}
+
+/// A second scan is nearly free, and says so by finding nothing.
+///
+/// Indexing re-reads and re-hashes whatever it is handed, so a folder that was
+/// moved wholesale - every file already in the catalog at the same path - must
+/// not be hashed from end to end to learn that nothing changed.
+#[tokio::test]
+async fn a_scan_leaves_alone_what_the_catalog_already_describes() {
+    let device = Device::new("mac");
+    device.write("holiday.txt", "already here");
+
+    assert_eq!(device.indexer.scan(), 1);
+    assert_eq!(device.indexer.scan(), 0);
+}

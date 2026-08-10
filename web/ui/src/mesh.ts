@@ -1,6 +1,15 @@
 import { createSignal } from 'solid-js'
 import { createStore, produce, reconcile } from 'solid-js/store'
-import type { Collision, Item, Notice, Progress, Snapshot, TrashItem } from './types'
+import type {
+  ChooseOutcome,
+  Collision,
+  Item,
+  Listing,
+  Notice,
+  Progress,
+  Snapshot,
+  TrashItem,
+} from './types'
 
 /**
  * Everything the page knows, and every way it can change it.
@@ -183,3 +192,48 @@ export const destroy = (item: TrashItem) => post('/api/trash/destroy', { fileId:
 
 export const resolveCollision = (collision: Collision, keepBoth: boolean) =>
   post('/api/collision', { collisionId: collision.id, keepBoth })
+
+// -- Choosing a folder -------------------------------------------------------
+
+/**
+ * A browser cannot hand a server a directory, so the browsing happens on the
+ * other side and this only asks what is in one.
+ */
+export async function browseFolders(path?: string): Promise<Listing | null> {
+  try {
+    const response = await fetch(`/api/folders${path ? `?path=${encodeURIComponent(path)}` : ''}`)
+    const payload = await response.json().catch(() => null)
+    if (!response.ok) {
+      say(payload?.error ?? 'That folder could not be opened.', true)
+      return null
+    }
+    return payload as Listing
+  } catch {
+    say('The engine is not answering.', true)
+    return null
+  }
+}
+
+export const createFolder = (parent: string, name: string) =>
+  post<Listing>('/api/folders/new', { parent, name })
+
+/**
+ * Moves this device to another folder.
+ *
+ * The engine stops, the files come across, and an engine starts on the new
+ * folder — so this is slower than it looks and the outcome is worth saying out
+ * loud rather than leaving to the next snapshot.
+ */
+export async function chooseFolder(path: string): Promise<ChooseOutcome | null> {
+  const outcome = await post<ChooseOutcome>('/api/folders/choose', { path })
+  if (!outcome) return null
+
+  const parts: string[] = []
+  if (outcome.moved) parts.push(`${outcome.moved} moved across`)
+  if (outcome.adopted) parts.push(`${outcome.adopted} already there joined the mesh`)
+  if (outcome.leftBehind) {
+    parts.push(`${outcome.leftBehind} left behind — something of that name was already there`)
+  }
+  say(parts.length ? `Now using ${outcome.syncDir}. ${parts.join(', ')}.` : `Now using ${outcome.syncDir}.`)
+  return outcome
+}

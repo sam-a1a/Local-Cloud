@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 /// A failure, as something the page can put beside the row that caused it.
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -49,7 +49,7 @@ impl From<std::io::Error> for ApiError {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub type ApiResult<T> = Result<T, ApiError>;
 
 /// Runs one engine call somewhere that is allowed to block.
 async fn blocking<T, F>(app: &Shared, work: F) -> ApiResult<T>
@@ -57,7 +57,7 @@ where
     T: Send + 'static,
     F: FnOnce(&Engine) -> Result<T, localcloud::EngineError> + Send + 'static,
 {
-    let engine = app.engine.clone();
+    let engine = app.engine();
     let result = tokio::task::spawn_blocking(move || work(&engine))
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -84,7 +84,7 @@ fn done() -> Json<impl Serialize> {
 /// Afterwards it arrives over `/api/events` instead, and only when it differs
 /// from what was last sent.
 pub async fn state(State(app): State<Shared>) -> ApiResult<Json<snapshot::Snapshot>> {
-    let engine = app.engine.clone();
+    let engine = app.engine();
     let snapshot = tokio::task::spawn_blocking(move || snapshot::read(&engine))
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -96,7 +96,7 @@ pub async fn state(State(app): State<Shared>) -> ApiResult<Json<snapshot::Snapsh
 /// Streamed from disk rather than read into memory: a copy that arrived here is
 /// a whole file, and some of them are films.
 pub async fn download(State(app): State<Shared>, Path(id): Path<String>) -> ApiResult<Response> {
-    let engine = app.engine.clone();
+    let engine = app.engine();
     let wanted = id.clone();
     let found = tokio::task::spawn_blocking(move || {
         engine

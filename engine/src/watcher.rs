@@ -173,6 +173,82 @@ impl Indexer {
         );
     }
 
+    /// Indexes everything in the sync folder the catalog does not already know
+    /// about, and returns how many that was.
+    ///
+    /// The watcher only ever hears about *changes*. A file that was put in the
+    /// folder while the engine was not running, or that was sitting there
+    /// before the folder was chosen, produces no event and is invisible to the
+    /// mesh for as long as nobody touches it. This is the one call that looks.
+    ///
+    /// Anything the catalog already records at that path, held by this device,
+    /// at the same size and modification time, is left alone. [`index`] re-reads
+    /// and re-hashes whatever it is given, so without that check pointing at a
+    /// folder of files already in the mesh would hash all of them to learn
+    /// nothing.
+    ///
+    /// [`index`]: Indexer::index
+    pub fn scan(&self) -> usize {
+        let mut found = 0;
+        let mut directories = vec![std::path::PathBuf::from(&self.sync_dir)];
+
+        while let Some(directory) = directories.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                let Some(absolute) = path.to_str() else {
+                    continue;
+                };
+                if self.already_current(absolute) {
+                    continue;
+                }
+                if matches!(
+                    self.index(absolute),
+                    IndexOutcome::Indexed { .. } | IndexOutcome::KeptBoth { .. }
+                ) {
+                    found += 1;
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether the catalog already describes this exact file.
+    ///
+    /// Size and modification time rather than content, deliberately. Reading
+    /// the file is the expensive half of indexing and this exists to avoid it;
+    /// anything that changes a file's contents without changing either is
+    /// something the watcher would have seen happen.
+    fn already_current(&self, absolute_path: &str) -> bool {
+        let Some(relative) = self.relative(absolute_path) else {
+            return false;
+        };
+        let Ok(metadata) = std::fs::metadata(absolute_path) else {
+            return false;
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+
+        let db = self.db.lock().unwrap();
+        match db.get_file_by_path(&relative) {
+            Ok(Some(existing)) => {
+                existing.size == metadata.len() as i64
+                    && Some(existing.modified_time) == modified
+                    && db.is_holder(&existing.id, &self.device_id).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
     /// Records a file in the sync folder as an item this device holds.
     pub fn index(&self, absolute_path: &str) -> IndexOutcome {
         let skip = |reason: &str| IndexOutcome::Skipped {

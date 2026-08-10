@@ -82,3 +82,22 @@ export type Notice = {
    *  one's timer without clearing itself. */
   id: number
 }
+
+/** A directory on the machine the engine is on, for choosing a sync folder. */
+export type Folder = { name: string; path: string }
+
+export type Listing = {
+  path: string
+  /** Absent at the root, which is the only place with nowhere above it. */
+  parent: string | null
+  folders: Folder[]
+  /** Files already here. Choosing this folder puts them in the mesh. */
+  files: number
+}
+
+export type ChooseOutcome = {
+  syncDir: string
+  moved: number
+  leftBehind: number
+  adopted: number
+}

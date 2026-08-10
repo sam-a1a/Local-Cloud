@@ -11,6 +11,7 @@ import {
   transfers,
 } from './mesh'
 import { Button, Empty, HolderChip, Panel, fileSize } from './ui'
+import { FolderPicker } from './FolderPicker'
 
 /**
  * The shared catalog: every item in the mesh, and which devices hold it.
@@ -21,6 +22,7 @@ import { Button, Empty, HolderChip, Panel, fileSize } from './ui'
  */
 export function Files() {
   const [dragging, setDragging] = createSignal(false)
+  const [choosingFolder, setChoosingFolder] = createSignal(false)
   let picker!: HTMLInputElement
 
   const onDrop = (event: DragEvent) => {
@@ -78,9 +80,16 @@ export function Files() {
               event.currentTarget.value = ''
             }}
           />
-          <span class="text-xs text-muted">
+          <span class="min-w-0 text-xs text-muted">
             or drop them anywhere — anything put in{' '}
-            <code class="font-mono">{state.device.syncDir}</code> is picked up on its own
+            <button
+              class="font-mono underline decoration-dotted underline-offset-2 hover:text-accent"
+              title="Choose another folder"
+              onClick={() => setChoosingFolder(true)}
+            >
+              {state.device.syncDir}
+            </button>{' '}
+            is picked up on its own
           </span>
         </div>
 
@@ -98,6 +107,10 @@ export function Files() {
 
       <Show when={dragging()}>
         <div class="pointer-events-none fixed inset-3 rounded-2xl border-2 border-dashed border-accent" />
+      </Show>
+
+      <Show when={choosingFolder()}>
+        <FolderPicker close={() => setChoosingFolder(false)} />
       </Show>
     </div>
   )

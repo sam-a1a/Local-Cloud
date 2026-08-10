@@ -257,7 +257,7 @@ pub async fn broadcast_changes(app: Shared) {
     let mut last: Option<String> = None;
 
     loop {
-        let engine = app.engine.clone();
+        let engine = app.engine();
         let Ok(json) = tokio::task::spawn_blocking(move || {
             serde_json::to_string(&read(&engine)).unwrap_or_default()
         })

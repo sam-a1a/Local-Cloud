@@ -897,6 +897,23 @@ impl Engine {
         )
     }
 
+    /// Indexes whatever is already sitting in the sync folder, and returns how
+    /// many items that added.
+    ///
+    /// The folder is watched, not scanned: the engine hears about changes and
+    /// nothing else, so files that were there before it started - or before
+    /// this folder was chosen as the sync folder at all - are invisible to the
+    /// mesh until something touches them. An application that lets a person
+    /// point the engine at an existing folder has to call this, or the folder
+    /// will look empty for no reason a person could guess.
+    ///
+    /// Not called by `start`. It reads and hashes everything it does not
+    /// already know, which is the right price to pay once, when a folder is
+    /// chosen, and the wrong one to pay on every launch.
+    pub fn scan_sync_folder(&self) -> u32 {
+        self.indexer().scan() as u32
+    }
+
     // ---- Name collisions ----
 
     /// Conflicts kept both ways for safety, still awaiting a decision.
@@ -1677,6 +1694,11 @@ impl Engine {
     #[uniffi::method(name = "catalog")]
     pub fn ffi_catalog(&self) -> Catalog {
         self.catalog()
+    }
+
+    #[uniffi::method(name = "scan_sync_folder")]
+    pub fn ffi_scan_sync_folder(&self) -> u32 {
+        self.scan_sync_folder()
     }
 
     #[uniffi::method(name = "local_files")]

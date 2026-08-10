@@ -18,14 +18,16 @@
 mod api;
 mod assets;
 mod events;
+mod folders;
+mod settings;
 mod snapshot;
 
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::routing::{get, post};
 use localcloud::Engine;
-use std::sync::Arc;
-use tokio::sync::{Notify, broadcast};
+use std::sync::{Arc, RwLock};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 /// Loopback, always.
 ///
@@ -37,33 +39,87 @@ use tokio::sync::{Notify, broadcast};
 const BIND: &str = "127.0.0.1:7777";
 
 pub struct App {
-    engine: Arc<Engine>,
+    /// Replaced rather than mutated when the sync folder changes: the folder is
+    /// a constructor argument, so choosing another one means another engine
+    /// over the same identity and the same catalog.
+    engine: RwLock<Arc<Engine>>,
+    /// Where the identity, the database and the blocks live. Unlike the sync
+    /// folder, this never moves.
+    base_dir: String,
     /// Serialised once, fanned out to whatever tabs are open.
     updates: broadcast::Sender<Arc<events::Message>>,
     /// Rung when something happened that a snapshot would show.
     changed: Arc<Notify>,
+    /// Held across a folder change, so two of them cannot interleave.
+    switching: Mutex<()>,
     assets: assets::Assets,
 }
 
 pub type Shared = Arc<App>;
 
+impl App {
+    /// The engine as it is right now.
+    ///
+    /// Cloned out rather than borrowed, so no request holds the lock while it
+    /// works and a folder change never waits on one that is reading a catalog.
+    pub fn engine(&self) -> Arc<Engine> {
+        self.engine.read().unwrap().clone()
+    }
+
+    /// Points an engine at this app's event stream.
+    fn wire(&self, engine: &Engine) {
+        engine.set_event_listener(Arc::new(events::Bridge::new(
+            self.updates.clone(),
+            self.changed.clone(),
+        )));
+    }
+
+    /// Builds an engine over this device's state, points it at `sync_dir`,
+    /// starts it, and makes it the one everything else will get.
+    fn open(&self, sync_dir: &str) -> Result<Arc<Engine>, String> {
+        let engine = Arc::new(
+            Engine::new(self.base_dir.clone(), sync_dir.to_string())
+                .map_err(|e| e.to_string())?,
+        );
+        self.wire(&engine);
+        engine.start().map_err(|e| e.to_string())?;
+        *self.engine.write().unwrap() = engine.clone();
+        Ok(engine)
+    }
+}
+
 fn main() -> Result<()> {
-    // The engine builds a runtime of its own and starts before this one exists,
-    // which is also the order the bindings use: construct, listen, start.
-    let (base_dir, sync_dir) = directories()?;
+    let (base_dir, default_sync_dir) = directories()?;
+    std::fs::create_dir_all(&base_dir).context("making the state directory")?;
+
+    // Whatever was chosen last time, or the default until something is.
+    let sync_dir = settings::load(&base_dir)
+        .sync_dir
+        .unwrap_or(default_sync_dir);
+
+    let (updates, _) = broadcast::channel(64);
+    let changed = Arc::new(Notify::new());
+
+    // Built before the app, because the app is the thing that holds it, and
+    // wired afterwards, because wiring it needs the app's event stream. Every
+    // later engine - one per folder change - goes through `App::open` instead,
+    // which does all three in one place.
     let engine = Arc::new(
         Engine::new(base_dir.clone(), sync_dir.clone())
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("starting the engine")?,
     );
 
-    let (updates, _) = broadcast::channel(64);
-    let changed = Arc::new(Notify::new());
+    let app = Arc::new(App {
+        engine: RwLock::new(engine.clone()),
+        base_dir: base_dir.clone(),
+        updates,
+        changed,
+        switching: Mutex::new(()),
+        assets: assets::load()?,
+    });
 
-    engine.set_event_listener(Arc::new(events::Bridge::new(
-        updates.clone(),
-        changed.clone(),
-    )));
+    app.wire(&engine);
     engine.start().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!(
@@ -72,15 +128,8 @@ fn main() -> Result<()> {
         engine.device_platform(),
         &engine.device_id()[..8],
         base_dir,
-        sync_dir,
+        engine.sync_dir(),
     );
-
-    let app = Arc::new(App {
-        engine,
-        updates,
-        changed,
-        assets: assets::load()?,
-    });
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -108,6 +157,9 @@ async fn serve(app: Shared) -> Result<()> {
         .route("/api/trash/restore", post(api::restore))
         .route("/api/trash/destroy", post(api::destroy))
         .route("/api/collision", post(api::resolve_collision))
+        .route("/api/folders", get(folders::browse))
+        .route("/api/folders/new", post(folders::create))
+        .route("/api/folders/choose", post(folders::choose))
         .fallback(assets::serve)
         .with_state(app.clone());
 
@@ -125,7 +177,7 @@ async fn serve(app: Shared) -> Result<()> {
         .with_graceful_shutdown(shutdown)
         .await?;
 
-    app.engine.stop();
+    app.engine().stop();
     Ok(())
 }
 
