@@ -45,7 +45,7 @@ the locked-phone path has never been exercised across one.
 | `android/` | 3,868 lines of Kotlin across 22 files. Compose, three screens, a foreground service. |
 | `macos/` | 1,590 lines of Swift across 11 files. SwiftUI, the same three screens. |
 | `web/` | 1,217 lines of Rust — an engine host and a loopback API — and 968 of TypeScript. Solid, Tailwind, the same three screens. |
-| tests | 123 Rust across 7 suites, ~4s. One `#[ignore]`d because it waits out a 30s interval. 14 Kotlin: the background notification's line, and names arriving from other apps. |
+| tests | 125 Rust across 7 suites, ~4s. One `#[ignore]`d because it waits out a 30s interval. 14 Kotlin: the background notification's line, and names arriving from other apps. |
 | dependencies | one fewer provider than it had. Toolchain pinned to 1.97.1. |
 
 Test suites, and what each is for:
@@ -53,8 +53,9 @@ Test suites, and what each is for:
 - **`localcloud` (57)** — units: chunking, hashing, the database and its
   migrations, pairing proofs, collision tie-breaks, address ranking, and what a
   device is allowed to call itself.
-- **`indexing` (28)** — the `Indexer` driven directly: collisions, renames on
-  disk, deletion, trash and its retention.
+- **`indexing` (30)** — the `Indexer` driven directly: collisions, renames on
+  disk, deletion, trash and its retention, and what a scan of an existing
+  folder finds.
 - **`sync_e2e` (10)** — two live devices over real mutually authenticated TLS,
   exchanging catalogs.
 - **`api_errors` (11)** — which misuse produces which typed error. The contract
@@ -97,6 +98,13 @@ Everything in §13. Pairing, holder sets, push, pull, delete, trash — and sinc
 - **A web consumer**, in `web/`, which is a process running an engine with a
   loopback API in front of it, because a browser cannot join a mesh. It is the
   consumer the phone was finally tested against.
+- **A folder you choose.** The sync folder used to be wherever the process
+  decided. The page now browses this machine a directory at a time and sends
+  back the one it settled on — and because the catalog records paths relative to
+  that folder, changing it is one operation rather than a setting: the engine
+  stops, the files come across, a new engine opens on the new folder, and the
+  choice is written down for the next run. `Engine::scan_sync_folder` goes with
+  it, because a folder that already has things in it must not look empty.
 - **A device can be named.** `set_device_name` crosses the FFI, so a platform
   that knows better than Rust does can say so. The name is the one mutable part
   of an identity, so it is the one part behind a lock: the running server shares
@@ -375,13 +383,26 @@ What it costs, since a page is the easiest place to be wasteful:
   file to `import_file`; downloads stream off disk.
 - 16 kB of JavaScript and 5 kB of CSS, gzipped.
 
+It is also where the sync folder stopped being a decision the process made. The
+page browses this machine and chooses one; the engine is stopped, the files are
+carried across, and a new engine opens on the other side of the move. Two things
+are said on screen before the button is, because clicking again does not undo
+either: files already in the chosen folder join the mesh, and files in the
+current one come with you. Nothing at the destination is overwritten — a name
+already taken leaves that file where it was and says how many.
+
 Verified against a second engine on the same machine: paired over the real mDNS
 and mTLS path, sent a 3 MB file, and the checksum on the far side matches — as
-does the byte-for-byte round trip back out through the download route.
+does the byte-for-byte round trip back out through the download route. The
+folder change is verified the same way: a file carried across, one already at
+the destination adopted into the catalog, one name clash left alone, every guard
+refused, and the choice still in force after a restart.
 
 Not verified: how the page looks in a browser. Every request it makes has been
 exercised with `curl`, and the bundle typechecks and builds, but nothing here
-has rendered it. The Compose lesson above applies unchanged.
+has rendered it — Chrome headless would not cooperate on this machine. You have
+since used it, so this is now the weakest sentence in the file rather than a
+real gap; the Compose lesson above is the reason it is still here at all.
 
 ---
 
